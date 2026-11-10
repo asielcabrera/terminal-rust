@@ -59,28 +59,119 @@ fn load_face(db: &Database, id: ID, px: f32) -> Option<Font> {
     })?
 }
 
-/// Fuente de reserva que se carga la primera vez que hace falta: las de CJK pesan decenas de MB
-/// y fontdue procesa todos sus glifos al cargarlas.
+/// Fuente de reserva. Las de CJK pesan decenas de MB y fontdue procesa todos sus glifos al
+/// cargarlas, así que primero se mira si la fuente tiene el carácter (leyendo solo su tabla `cmap`,
+/// sobre el archivo mapeado en memoria) y solo se carga entera la primera vez que hace falta de
+/// verdad.
 struct LazyFont {
     family: String,
+    /// Es una Nerd Font: para los iconos (área de uso privado) tiene prioridad sobre las demás
+    nerd: bool,
+    face: Option<Option<ID>>,
     font: Option<Option<Font>>,
 }
 
 impl LazyFont {
+    fn new(family: String) -> Self {
+        Self {
+            nerd: family.contains("Nerd Font"),
+            family,
+            face: None,
+            font: None,
+        }
+    }
+
+    fn face(&mut self, db: &Database) -> Option<ID> {
+        *self
+            .face
+            .get_or_insert_with(|| find_face(db, &self.family, false, false))
+    }
+
+    /// ¿Tiene esta fuente un glifo para `ch`? No carga la fuente.
+    fn covers(&mut self, db: &Database, ch: char) -> bool {
+        let Some(id) = self.face(db) else {
+            return false;
+        };
+        db.with_face_data(id, |data, index| {
+            ttf_parser::Face::parse(data, index)
+                .ok()
+                .and_then(|face| face.glyph_index(ch))
+                .is_some()
+        })
+        .unwrap_or(false)
+    }
+
     fn get(&mut self, db: &Database, px: f32) -> Option<&Font> {
+        let id = self.face(db);
         self.font
-            .get_or_insert_with(|| {
-                find_face(db, &self.family, false, false).and_then(|id| load_face(db, id, px))
-            })
+            .get_or_insert_with(|| id.and_then(|id| load_face(db, id, px)))
             .as_ref()
     }
 }
 
+/// Una Nerd Font instalada para usar como último recurso con los iconos (Powerline, Font Awesome,
+/// Devicons...) cuando ni la fuente principal ni las de la configuración los tienen. Prefiere las
+/// de solo símbolos y luego las variantes `Mono`; a igualdad, el orden alfabético para que la
+/// elección sea siempre la misma.
+fn detect_nerd_font(db: &Database) -> Option<String> {
+    let mut best: Option<(u8, String)> = None;
+    for face in db.faces() {
+        for (name, _language) in &face.families {
+            if !name.contains("Nerd Font") {
+                continue;
+            }
+            let rank = if name.starts_with("Symbols") {
+                0
+            } else if name.ends_with("Nerd Font Mono") {
+                1
+            } else if face.monospaced {
+                2
+            } else {
+                3
+            };
+            let candidate = (rank, name.clone());
+            if best.as_ref().is_none_or(|current| candidate < *current) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// Una variante de la fuente principal (negrita, cursiva...) que se carga cuando hace falta. Una
+/// Nerd Font pesa unos 2,5 MB con miles de glifos y fontdue los procesa todos al cargarla: con las
+/// cuatro variantes eso eran varios segundos de arranque.
+struct StyledFace {
+    id: Option<ID>,
+    font: Option<Option<Font>>,
+}
+
+impl StyledFace {
+    fn new(db: &Database, family: &str, bold: bool, italic: bool) -> Self {
+        Self {
+            id: find_face(db, family, bold, italic),
+            font: None,
+        }
+    }
+
+    fn get(&mut self, db: &Database, px: f32) -> Option<&Font> {
+        let id = self.id;
+        self.font
+            .get_or_insert_with(|| id.and_then(|id| load_face(db, id, px)))
+            .as_ref()
+    }
+}
+
+/// Área de uso privado (BMP y suplementaria A), donde las Nerd Fonts ponen sus iconos
+fn is_private_use(ch: char) -> bool {
+    matches!(ch, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}')
+}
+
 struct Fonts {
     regular: Font,
-    bold: Option<Font>,
-    italic: Option<Font>,
-    bold_italic: Option<Font>,
+    bold: StyledFace,
+    italic: StyledFace,
+    bold_italic: StyledFace,
     fallbacks: Vec<LazyFont>,
     px: f32,
 }
@@ -88,24 +179,25 @@ struct Fonts {
 impl Fonts {
     fn load(db: &Database, config: &FontConfig, scale_factor: f64) -> Result<Self, String> {
         let px = config.size * scale_factor as f32;
-        let face = |bold, italic| {
-            find_face(db, &config.family, bold, italic).and_then(|id| load_face(db, id, px))
-        };
-        let regular = face(false, false)
+        let regular = find_face(db, &config.family, false, false)
+            .and_then(|id| load_face(db, id, px))
             .ok_or_else(|| format!("no se encontró la fuente \"{}\" en el sistema", config.family))?;
+
+        let mut fallbacks: Vec<LazyFont> = config.fallback.iter().cloned().map(LazyFont::new).collect();
+        // Última red: cualquier Nerd Font instalada, solo para lo que nadie más tiene
+        if let Some(nerd) = detect_nerd_font(db)
+            && nerd != config.family
+            && !config.fallback.contains(&nerd)
+        {
+            fallbacks.push(LazyFont::new(nerd));
+        }
+
         Ok(Self {
             regular,
-            bold: face(true, false),
-            italic: face(false, true),
-            bold_italic: face(true, true),
-            fallbacks: config
-                .fallback
-                .iter()
-                .map(|family| LazyFont {
-                    family: family.clone(),
-                    font: None,
-                })
-                .collect(),
+            bold: StyledFace::new(db, &config.family, true, false),
+            italic: StyledFace::new(db, &config.family, false, true),
+            bold_italic: StyledFace::new(db, &config.family, true, true),
+            fallbacks,
             px,
         })
     }
@@ -114,9 +206,9 @@ impl Fonts {
         let px = self.px;
         let styled = match (key.bold, key.italic) {
             (false, false) => None,
-            (true, false) => self.bold.as_ref(),
-            (false, true) => self.italic.as_ref(),
-            (true, true) => self.bold_italic.as_ref(),
+            (true, false) => self.bold.get(db, px),
+            (false, true) => self.italic.get(db, px),
+            (true, true) => self.bold_italic.get(db, px),
         };
         if let Some(font) = styled
             && font.has_glyph(key.ch)
@@ -126,11 +218,22 @@ impl Fonts {
         if self.regular.has_glyph(key.ch) {
             return self.regular.rasterize(key.ch, px);
         }
-        // Powerline y Nerd Fonts viven en el área de uso privado y no están en las fuentes del
-        // sistema: no vale la pena cargar las de reserva para no encontrarlas
-        if !('\u{E000}'..='\u{F8FF}').contains(&key.ch) {
+
+        // Las de reserva, en orden. En el área de uso privado las fuentes de CJK y de símbolos del
+        // sistema traen glifos antiguos que no tienen nada que ver con los iconos de Nerd Fonts,
+        // así que ahí las Nerd Fonts van primero. `covers` es barato y evita cargar una fuente
+        // enorme solo para descubrir que no tiene el carácter.
+        let private_use = is_private_use(key.ch);
+        for nerd_pass in [true, false] {
+            if nerd_pass && !private_use {
+                continue;
+            }
             for slot in &mut self.fallbacks {
-                if let Some(font) = slot.get(db, px)
+                if nerd_pass && !slot.nerd {
+                    continue;
+                }
+                if slot.covers(db, key.ch)
+                    && let Some(font) = slot.get(db, px)
                     && font.has_glyph(key.ch)
                 {
                     return font.rasterize(key.ch, px);
@@ -341,5 +444,199 @@ impl GlyphCache {
         self.next_x += width;
         self.row_height = self.row_height.max(height);
         Some(position)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Powerline (separador) e icono de casa de Font Awesome, ambos en el área de uso privado
+    const POWERLINE: char = '\u{E0B0}';
+    const HOME_ICON: char = '\u{F015}';
+    // Material Design de Nerd Fonts v3, en el área de uso privado suplementaria
+    const MATERIAL_ICON: char = '\u{F0001}';
+
+    fn database() -> Database {
+        let mut db = Database::new();
+        db.load_system_fonts();
+        db
+    }
+
+    fn has_family(db: &Database, name: &str) -> bool {
+        find_face(db, name, false, false).is_some()
+    }
+
+    fn config(family: &str) -> FontConfig {
+        FontConfig {
+            family: family.to_string(),
+            ..FontConfig::default()
+        }
+    }
+
+    fn plain(ch: char) -> GlyphKey {
+        GlyphKey {
+            ch,
+            bold: false,
+            italic: false,
+        }
+    }
+
+    /// El glifo se dibujó de verdad: tiene bitmap y no es el cuadrito .notdef de la fuente principal
+    fn assert_drawn(fonts: &mut Fonts, db: &Database, ch: char) {
+        let (metrics, bitmap) = fonts.rasterize(db, plain(ch));
+        let (notdef_metrics, notdef_bitmap) = fonts.regular.rasterize_indexed(0, fonts.px);
+        assert!(
+            metrics.width > 0 && bitmap.iter().any(|&b| b > 0),
+            "{ch:?} salió vacío"
+        );
+        let is_notdef = metrics.width == notdef_metrics.width
+            && metrics.height == notdef_metrics.height
+            && bitmap == notdef_bitmap;
+        assert!(!is_notdef, "{ch:?} salió como .notdef");
+    }
+
+    #[test]
+    fn a_nerd_font_as_the_primary_font_draws_icons() {
+        let db = database();
+        let family = "JetBrainsMono Nerd Font Mono";
+        if !has_family(&db, family) {
+            eprintln!("saltada: {family} no está instalada");
+            return;
+        }
+        let mut fonts = Fonts::load(&db, &config(family), 1.0).unwrap();
+        for ch in [POWERLINE, HOME_ICON, MATERIAL_ICON] {
+            assert_drawn(&mut fonts, &db, ch);
+        }
+    }
+
+    #[test]
+    fn icons_are_found_in_an_installed_nerd_font_when_the_primary_font_lacks_them() {
+        // Consolas no trae iconos; el último recurso es cualquier Nerd Font instalada
+        let db = database();
+        if !has_family(&db, "Consolas") || detect_nerd_font(&db).is_none() {
+            eprintln!("saltada: hace falta Consolas y alguna Nerd Font");
+            return;
+        }
+        let mut fonts = Fonts::load(&db, &config("Consolas"), 1.0).unwrap();
+        for ch in [POWERLINE, HOME_ICON, MATERIAL_ICON] {
+            assert_drawn(&mut fonts, &db, ch);
+        }
+    }
+
+    #[test]
+    fn a_configured_fallback_is_used_for_private_use_icons_too() {
+        let db = database();
+        let nerd = "JetBrainsMono Nerd Font Mono";
+        if !has_family(&db, "Consolas") || !has_family(&db, nerd) {
+            eprintln!("saltada: hace falta Consolas y {nerd}");
+            return;
+        }
+        // Con la Nerd Font en la lista de reserva explícita (antes se saltaban para estos códigos)
+        let settings = FontConfig {
+            family: "Consolas".to_string(),
+            fallback: vec![nerd.to_string()],
+            ..FontConfig::default()
+        };
+        let mut fonts = Fonts::load(&db, &settings, 1.0).unwrap();
+        assert_drawn(&mut fonts, &db, POWERLINE);
+    }
+
+    #[test]
+    fn coverage_is_checked_without_loading_the_font() {
+        let db = database();
+        if !has_family(&db, "Microsoft YaHei") {
+            eprintln!("saltada: Microsoft YaHei no está instalada");
+            return;
+        }
+        let mut slot = LazyFont::new("Microsoft YaHei".to_string());
+        assert!(slot.covers(&db, '日'));
+        assert!(!slot.covers(&db, POWERLINE));
+        assert!(slot.font.is_none(), "covers no debe cargar la fuente (pesa decenas de MB)");
+        assert!(slot.get(&db, 16.0).is_some());
+        assert!(slot.font.is_some());
+    }
+
+    #[test]
+    fn nerd_fonts_win_over_system_fonts_for_private_use_icons() {
+        // Malgun Gothic, YaHei y Segoe UI Symbol traen glifos antiguos en el área de uso privado:
+        // aunque estén en la lista de reserva, un icono tiene que salir de la Nerd Font
+        let db = database();
+        let Some(nerd) = detect_nerd_font(&db) else {
+            eprintln!("saltada: no hay ninguna Nerd Font instalada");
+            return;
+        };
+        if !has_family(&db, "Consolas") || !has_family(&db, "Malgun Gothic") {
+            eprintln!("saltada: hace falta Consolas y Malgun Gothic");
+            return;
+        }
+        let with_system_fonts_first = FontConfig {
+            family: "Consolas".to_string(),
+            fallback: vec!["Malgun Gothic".to_string(), "Microsoft YaHei".to_string()],
+            ..FontConfig::default()
+        };
+        let mut fonts = Fonts::load(&db, &with_system_fonts_first, 1.0).unwrap();
+        let mut reference = Fonts::load(&db, &config(&nerd), 1.0).unwrap();
+        for ch in [POWERLINE, HOME_ICON, MATERIAL_ICON] {
+            let (metrics, bitmap) = fonts.rasterize(&db, plain(ch));
+            let (expected_metrics, expected) = reference.rasterize(&db, plain(ch));
+            assert_eq!((metrics.width, metrics.height), (expected_metrics.width, expected_metrics.height), "{ch:?}");
+            assert_eq!(bitmap, expected, "{ch:?} no salió de {nerd}");
+        }
+    }
+
+    #[test]
+    fn bold_and_italic_faces_are_loaded_only_when_needed() {
+        let db = database();
+        if !has_family(&db, "Consolas") {
+            eprintln!("saltada: Consolas no está instalada");
+            return;
+        }
+        let mut fonts = Fonts::load(&db, &config("Consolas"), 1.0).unwrap();
+        assert!(fonts.bold.font.is_none() && fonts.italic.font.is_none() && fonts.bold_italic.font.is_none());
+
+        fonts.rasterize(&db, plain('a'));
+        assert!(fonts.bold.font.is_none(), "una letra normal no debe cargar la negrita");
+
+        fonts.rasterize(&db, GlyphKey { ch: 'a', bold: true, italic: false });
+        assert!(fonts.bold.font.is_some(), "la negrita se carga al usarla");
+        assert!(fonts.italic.font.is_none() && fonts.bold_italic.font.is_none());
+    }
+
+    #[test]
+    fn private_use_ranges_are_recognized() {
+        assert!(is_private_use('\u{E0B0}') && is_private_use('\u{F8FF}') && is_private_use('\u{F0001}'));
+        assert!(!is_private_use('a') && !is_private_use('日') && !is_private_use('\u{1F600}'));
+    }
+
+    #[test]
+    fn a_missing_family_covers_nothing() {
+        let db = database();
+        let mut slot = LazyFont::new("Fuente Que No Existe".to_string());
+        assert!(!slot.covers(&db, 'a'));
+        assert!(slot.get(&db, 16.0).is_none());
+    }
+
+    #[test]
+    fn the_automatic_nerd_font_is_deterministic_and_prefers_mono_variants() {
+        let db = database();
+        let Some(chosen) = detect_nerd_font(&db) else {
+            eprintln!("saltada: no hay ninguna Nerd Font instalada");
+            return;
+        };
+        assert_eq!(detect_nerd_font(&db), Some(chosen.clone()), "debe elegir siempre la misma");
+        assert!(chosen.contains("Nerd Font"), "{chosen}");
+        let any_symbols = db
+            .faces()
+            .any(|f| f.families.iter().any(|(n, _)| n.starts_with("Symbols") && n.contains("Nerd Font")));
+        let any_mono = db
+            .faces()
+            .any(|f| f.families.iter().any(|(n, _)| n.ends_with("Nerd Font Mono")));
+        if any_symbols {
+            assert!(chosen.starts_with("Symbols"), "{chosen}");
+        } else if any_mono {
+            assert!(chosen.ends_with("Nerd Font Mono"), "{chosen}");
+        }
     }
 }

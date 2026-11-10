@@ -2,6 +2,7 @@
 //! (fondos, subrayados, cursor) y por cada glifo, todo en un único render pass.
 
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -13,6 +14,7 @@ use winit::window::Window;
 
 use crate::config::Config;
 use crate::glyphs::{GlyphCache, GlyphKey};
+use crate::layout::Rect;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -41,13 +43,24 @@ struct GlyphInstance {
     color: [u8; 4],
 }
 
-/// Instancias de un frame, en el orden en que se dibujan: fondos, glifos y encima las
-/// decoraciones. Los vectores se reutilizan entre frames para no reservar memoria cada vez.
+/// Las instancias de un panel dentro del frame: sus rangos en los tres vectores y el área a la
+/// que se recortan. Cada panel se dibuja entero (fondos, glifos y decoraciones) antes del
+/// siguiente, así lo que está encima tapa por completo a lo que hay debajo.
+#[derive(Clone)]
+struct Batch {
+    scissor: Rect,
+    backgrounds: Range<u32>,
+    glyphs: Range<u32>,
+    overlays: Range<u32>,
+}
+
+/// Instancias de un frame. Los vectores se reutilizan entre frames para no reservar memoria cada vez.
 #[derive(Default)]
 struct Frame {
     backgrounds: Vec<RectInstance>,
     glyphs: Vec<GlyphInstance>,
     overlays: Vec<RectInstance>,
+    batches: Vec<Batch>,
     text: String,
 }
 
@@ -56,6 +69,74 @@ impl Frame {
         self.backgrounds.clear();
         self.glyphs.clear();
         self.overlays.clear();
+        self.batches.clear();
+    }
+
+    /// Cuántas instancias hay de cada tipo hasta ahora
+    fn lengths(&self) -> (u32, u32, u32) {
+        (
+            self.backgrounds.len() as u32,
+            self.glyphs.len() as u32,
+            self.overlays.len() as u32,
+        )
+    }
+}
+
+/// Un panel a dibujar: su terminal, el estado de libghostty que usa el dibujo, y dónde va
+pub struct PaneView<'a> {
+    pub terminal: &'a Terminal<'static, 'static>,
+    pub render_state: &'a mut RenderState<'static>,
+    /// Rectángulo en pixeles físicos, con el margen incluido
+    pub rect: Rect,
+    /// El cursor se dibuja activo (y parpadea si el programa lo pide); si no, hueco y fijo
+    pub focused: bool,
+    /// El texto se apaga (`panes.inactive_dim`): un panel sin foco cuando hay varios a la vista
+    pub dim: bool,
+    /// Se dibuja el marco del panel con foco a su alrededor
+    pub frame: bool,
+    /// El prefijo está pulsado: el marco toma el color del prefijo
+    pub leader: bool,
+    /// Panel flotante: tapa con un fondo opaco lo que tiene debajo y siempre lleva borde
+    pub floating: bool,
+}
+
+/// Colores del texto seleccionado (`None` = invertir los de la pantalla)
+#[derive(Clone, Copy, Default)]
+struct SelectionColors {
+    foreground: Option<RgbColor>,
+    background: Option<RgbColor>,
+}
+
+impl From<&Config> for SelectionColors {
+    fn from(settings: &Config) -> Self {
+        Self {
+            foreground: settings.colors.selection_foreground.map(|color| color.0),
+            background: settings.colors.selection_background.map(|color| color.0),
+        }
+    }
+}
+
+/// Cómo se distinguen los paneles entre sí (`None` = derivarlo de los colores del tema)
+#[derive(Clone, Copy, Default)]
+struct PaneStyle {
+    /// Color de los divisores
+    border: Option<RgbColor>,
+    /// Color del marco del panel con foco
+    focus: Option<RgbColor>,
+    /// Color del marco mientras el prefijo está pulsado
+    leader: Option<RgbColor>,
+    /// Cuánto se apaga el texto de los paneles sin foco (0 a 1)
+    inactive_dim: f32,
+}
+
+impl From<&Config> for PaneStyle {
+    fn from(settings: &Config) -> Self {
+        Self {
+            border: settings.panes.border_color.map(|color| color.0),
+            focus: settings.panes.focus_color.map(|color| color.0),
+            leader: settings.panes.leader_color.map(|color| color.0),
+            inactive_dim: settings.panes.inactive_dim,
+        }
     }
 }
 
@@ -126,9 +207,10 @@ pub struct Renderer {
     /// Margen en pixeles lógicos (de la configuración) y en pixeles físicos con la escala actual
     padding_logical: f64,
     padding: u32,
+    selection: SelectionColors,
+    panes: PaneStyle,
     frame: Frame,
-    // Estado de libghostty que solo se usa para dibujar
-    render_state: RenderState<'static>,
+    // Iteradores de libghostty que solo se usan para dibujar (se reapuntan en cada panel)
     row_iter: RowIterator<'static>,
     cell_iter: CellIterator<'static>,
 }
@@ -237,8 +319,9 @@ impl Renderer {
             glyph_buffer: GrowBuffer::new(&device, "glifos"),
             padding_logical: settings.padding,
             padding: padding_for(settings.padding, scale_factor),
+            selection: SelectionColors::from(settings),
+            panes: PaneStyle::from(settings),
             frame: Frame::default(),
-            render_state: RenderState::new().map_err(|e| e.to_string())?,
             row_iter: RowIterator::new().map_err(|e| e.to_string())?,
             cell_iter: CellIterator::new().map_err(|e| e.to_string())?,
             window,
@@ -294,7 +377,14 @@ impl Renderer {
         self.cache.set_font(&settings.font)?;
         self.padding_logical = settings.padding;
         self.padding = padding_for(settings.padding, self.window.scale_factor());
+        self.selection = SelectionColors::from(settings);
+        self.panes = PaneStyle::from(settings);
         Ok(())
+    }
+
+    /// Grosor, en pixeles, de los divisores entre paneles
+    pub fn divider_thickness(&self) -> u32 {
+        self.cache.thickness.max(1)
     }
 
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
@@ -302,33 +392,138 @@ impl Renderer {
         self.padding = padding_for(self.padding_logical, scale_factor);
     }
 
-    pub fn draw(&mut self, terminal: &Terminal<'static, 'static>, focused: bool) {
-        let Ok(snapshot) = self.render_state.update(terminal) else {
-            return;
+    /// Dibuja un frame con los paneles dados, de abajo arriba. `blink_visible` es la fase actual
+    /// del parpadeo. Devuelve si el cursor del panel con foco está parpadeando, para que la app sepa
+    /// si tiene que programar el siguiente cambio de fase.
+    pub fn draw(&mut self, views: &mut [PaneView], dividers: &[Rect], blink_visible: bool) -> bool {
+        /// Lo que se leyó de un panel y no cambia aunque haya que rehacer las instancias
+        struct Prepared<'s> {
+            snapshot: Snapshot<'static, 's>,
+            colors: Colors,
+            cursor: Option<Cursor>,
+            rect: Rect,
+            dim: f32,
+            frame: Option<RgbColor>,
+            floating: bool,
+        }
+
+        let mut prepared = Vec::with_capacity(views.len());
+        let mut blinking = false;
+        for view in views.iter_mut() {
+            let Ok(snapshot) = view.render_state.update(view.terminal) else {
+                continue;
+            };
+            let Ok(colors) = snapshot.colors() else {
+                continue;
+            };
+            let pane_blinking = snapshot.cursor_blinking().unwrap_or(false);
+            if view.focused {
+                blinking = pane_blinking;
+            }
+            // Parpadeo solo con foco: sin foco el cursor es un bloque hueco y fijo
+            let hidden_by_blink = view.focused && pane_blinking && !blink_visible;
+            let cursor = if hidden_by_blink {
+                None
+            } else {
+                read_cursor(&snapshot, &colors, view.focused)
+            };
+            // Marco: el del foco, y el borde de un flotante sin foco (como los divisores)
+            let frame = if view.frame && view.leader {
+                // Amarillo ANSI por defecto: se distingue del marco normal del foco
+                Some(self.panes.leader.unwrap_or(colors.palette[3]))
+            } else if view.frame {
+                Some(self.panes.focus.or(colors.cursor).unwrap_or(colors.foreground))
+            } else if view.floating {
+                Some(self.panes.border.unwrap_or_else(|| mix(colors.foreground, colors.background, 0.75)))
+            } else {
+                None
+            };
+            prepared.push(Prepared {
+                snapshot,
+                colors,
+                cursor,
+                rect: view.rect,
+                dim: if view.dim { self.panes.inactive_dim } else { 0.0 },
+                frame,
+                floating: view.floating,
+            });
+        }
+        let Some((background, foreground)) = prepared
+            .first()
+            .map(|pane| (pane.colors.background, pane.colors.foreground))
+        else {
+            return false;
         };
-        let Ok(colors) = snapshot.colors() else {
-            return;
-        };
-        let cursor = read_cursor(&snapshot, &colors, focused);
+        // Los divisores, por defecto, son el color del texto muy apagado
+        let divider_color = self.panes.border.unwrap_or_else(|| mix(foreground, background, 0.75));
+        let window = Rect::new(0, 0, self.config.width, self.config.height);
+        let frame_thickness = 2 * self.cache.thickness.max(1);
 
         // Si el atlas se llena a mitad de frame se vacía y hay que rehacer las instancias
         for _ in 0..2 {
             self.frame.clear();
-            build_frame(
-                &snapshot,
-                &mut self.row_iter,
-                &mut self.cell_iter,
-                &mut self.cache,
-                &mut self.frame,
-                &colors,
-                cursor,
-                self.padding,
-            );
+            // Los divisores van debajo de todo
+            if !dividers.is_empty() {
+                let start = self.frame.lengths();
+                for rect in dividers {
+                    self.frame
+                        .backgrounds
+                        .push(RectInstance::new(rect.x, rect.y, rect.w, rect.h, divider_color));
+                }
+                let end = self.frame.lengths();
+                self.frame.batches.push(Batch {
+                    scissor: window,
+                    backgrounds: start.0..end.0,
+                    glyphs: start.1..end.1,
+                    overlays: start.2..end.2,
+                });
+            }
+            for pane in &prepared {
+                let start = self.frame.lengths();
+                // Un flotante tapa por completo lo que hay debajo con el fondo del tema
+                if pane.floating {
+                    let r = pane.rect;
+                    self.frame
+                        .backgrounds
+                        .push(RectInstance::new(r.x, r.y, r.w, r.h, pane.colors.background));
+                }
+                build_frame(
+                    &pane.snapshot,
+                    &mut self.row_iter,
+                    &mut self.cell_iter,
+                    &mut self.cache,
+                    &mut self.frame,
+                    &pane.colors,
+                    pane.cursor,
+                    self.selection,
+                    (pane.rect.x + self.padding, pane.rect.y + self.padding),
+                    // Las celdas no se funden con el fondo opaco de un flotante
+                    start.0 as usize + usize::from(pane.floating),
+                    pane.dim,
+                );
+                if let Some(color) = pane.frame {
+                    let (r, t) = (pane.rect, frame_thickness);
+                    self.frame.overlays.extend([
+                        RectInstance::new(r.x, r.y, r.w, t, color),
+                        RectInstance::new(r.x, (r.y + r.h).saturating_sub(t), r.w, t, color),
+                        RectInstance::new(r.x, r.y, t, r.h, color),
+                        RectInstance::new((r.x + r.w).saturating_sub(t), r.y, t, r.h, color),
+                    ]);
+                }
+                let end = self.frame.lengths();
+                self.frame.batches.push(Batch {
+                    scissor: pane.rect,
+                    backgrounds: start.0..end.0,
+                    glyphs: start.1..end.1,
+                    overlays: start.2..end.2,
+                });
+            }
             if !self.cache.take_evicted() {
                 break;
             }
         }
-        self.present(colors.background);
+        self.present(background);
+        blinking
     }
 
     fn present(&mut self, background: RgbColor) {
@@ -390,31 +585,39 @@ impl Renderer {
                 ..Default::default()
             });
 
-            // 1. Fondos de celda
-            pass.set_pipeline(&self.rect_pipeline);
-            pass.set_bind_group(0, &self.rect_bind_group, &[]);
-            if !self.frame.backgrounds.is_empty() {
-                pass.set_vertex_buffer(0, self.rect_buffer.buffer.slice(..background_bytes));
-                pass.draw(0..4, 0..self.frame.backgrounds.len() as u32);
-            }
-            // 2. Texto
-            if !self.frame.glyphs.is_empty() {
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, &self.glyph_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.glyph_buffer.buffer.slice(..));
-                pass.draw(0..4, 0..self.frame.glyphs.len() as u32);
-            }
-            // 3. Subrayados, tachados y cursor por encima del texto
-            if !self.frame.overlays.is_empty() {
-                pass.set_pipeline(&self.rect_pipeline);
-                pass.set_bind_group(0, &self.rect_bind_group, &[]);
-                pass.set_vertex_buffer(
-                    0,
-                    self.rect_buffer
-                        .buffer
-                        .slice(background_bytes..background_bytes + overlay_bytes),
-                );
-                pass.draw(0..4, 0..self.frame.overlays.len() as u32);
+            // Un lote por panel, de abajo arriba: cada uno recortado a su rectángulo y con sus
+            // fondos, texto y decoraciones en ese orden
+            for batch in &self.frame.batches {
+                let Some(clip) = clip_to(batch.scissor, self.config.width, self.config.height) else {
+                    continue;
+                };
+                pass.set_scissor_rect(clip.x, clip.y, clip.w, clip.h);
+                // 1. Fondos de celda
+                if !batch.backgrounds.is_empty() {
+                    pass.set_pipeline(&self.rect_pipeline);
+                    pass.set_bind_group(0, &self.rect_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.rect_buffer.buffer.slice(..background_bytes));
+                    pass.draw(0..4, batch.backgrounds.clone());
+                }
+                // 2. Texto
+                if !batch.glyphs.is_empty() {
+                    pass.set_pipeline(&self.glyph_pipeline);
+                    pass.set_bind_group(0, &self.glyph_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.glyph_buffer.buffer.slice(..));
+                    pass.draw(0..4, batch.glyphs.clone());
+                }
+                // 3. Subrayados, tachados y cursor por encima del texto
+                if !batch.overlays.is_empty() {
+                    pass.set_pipeline(&self.rect_pipeline);
+                    pass.set_bind_group(0, &self.rect_bind_group, &[]);
+                    pass.set_vertex_buffer(
+                        0,
+                        self.rect_buffer
+                            .buffer
+                            .slice(background_bytes..background_bytes + overlay_bytes),
+                    );
+                    pass.draw(0..4, batch.overlays.clone());
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -425,6 +628,13 @@ impl Renderer {
 
 fn padding_for(padding: f64, scale_factor: f64) -> u32 {
     (padding * scale_factor).round() as u32
+}
+
+/// Recorte válido dentro de una superficie de `width` x `height`; `None` si no queda nada
+fn clip_to(rect: Rect, width: u32, height: u32) -> Option<Rect> {
+    let w = rect.w.min(width.saturating_sub(rect.x));
+    let h = rect.h.min(height.saturating_sub(rect.y));
+    (w > 0 && h > 0).then_some(Rect::new(rect.x, rect.y, w, h))
 }
 
 fn create_pipeline(
@@ -532,7 +742,10 @@ fn build_frame(
     frame: &mut Frame,
     colors: &Colors,
     cursor: Option<Cursor>,
-    padding: u32,
+    selection: SelectionColors,
+    origin: (u32, u32),
+    batch_start: usize,
+    dim: f32,
 ) {
     let Ok(mut rows) = row_iter.update(snapshot) else {
         return;
@@ -544,7 +757,13 @@ fn build_frame(
     while let Some(row) = rows.next() {
         let this_row = row_index;
         row_index += 1;
-        let y = padding + u32::from(this_row) * cell_h;
+        let y = origin.1 + u32::from(this_row) * cell_h;
+        // Columnas seleccionadas en esta fila (inclusive); `None` si la selección no la toca
+        let selected_columns = row
+            .selection()
+            .ok()
+            .flatten()
+            .map(|range| range.start_x..=range.end_x);
         let Ok(mut cells) = cell_iter.update(row) else {
             continue;
         };
@@ -555,7 +774,7 @@ fn build_frame(
         while let Some(cell) = cells.next() {
             let this_col = col;
             col += 1;
-            let x = padding + u32::from(this_col) * cell_w;
+            let x = origin.0 + u32::from(this_col) * cell_w;
 
             let style = cell.style().unwrap_or_default();
             let wide = cell
@@ -583,6 +802,18 @@ fn build_frame(
             if style.faint {
                 fg = mix(fg, bg, 0.5);
             }
+            // Panel sin foco: el texto se apaga hacia el fondo
+            if dim > 0.0 {
+                fg = mix(fg, bg, dim);
+            }
+            // Texto seleccionado: colores propios o, por defecto, los de la pantalla invertidos
+            if selected_columns
+                .as_ref()
+                .is_some_and(|range| range.contains(&this_col))
+            {
+                bg = selection.background.unwrap_or(colors.foreground);
+                fg = selection.foreground.unwrap_or(colors.background);
+            }
             if let Some(c) = cursor
                 && on_cursor
                 && c.style == CursorVisualStyle::Block
@@ -591,12 +822,15 @@ fn build_frame(
                 fg = colors.background;
             }
 
-            // Fondo (las celdas contiguas del mismo color se funden en un solo rectángulo)
+            // Fondo (las celdas contiguas del mismo color se funden en un solo rectángulo, pero
+            // nunca con uno de otro panel)
             if bg != colors.background {
                 let color = rgba(bg);
+                let can_merge = frame.backgrounds.len() > batch_start;
                 match frame.backgrounds.last_mut() {
                     Some(last)
-                        if last.color == color
+                        if can_merge
+                            && last.color == color
                             && last.pos[1] == y as f32
                             && last.pos[0] + last.size[0] == x as f32 =>
                     {

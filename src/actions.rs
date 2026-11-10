@@ -18,6 +18,8 @@ pub const CTRL: u8 = 1;
 pub const SHIFT: u8 = 2;
 pub const ALT: u8 = 4;
 pub const SUPER: u8 = 8;
+/// "Prefijo pulsado": en `mods` de una tecla, la enlaza para después de pulsar el `leader`
+pub const LEADER: u8 = 16;
 
 /// Tiempo máximo de un script: la configuración al cargar, o cada llamada a una función. Sin esto
 /// un `while true do end` congelaría la terminal entera, porque Lua corre en el hilo de la UI.
@@ -36,10 +38,20 @@ pub fn lua_message(error: &mlua::Error) -> String {
         .to_string()
 }
 
+/// Dirección de una acción de paneles (en Lua: "left", "right", "up", "down")
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// Lo que una tecla o un hook pueden hacer. Las nativas se construyen desde Lua con
 /// `terminal.action.X` (tablas con la clave `action`); `Lua` es una función propia.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "action")]
+#[serde(tag = "action", deny_unknown_fields)]
 pub enum Action {
     /// Escribe el texto en el shell, tal cual
     SendString { text: String },
@@ -55,6 +67,47 @@ pub enum Action {
     ReloadConfig,
     /// Pega el portapapeles (con pegado entre corchetes si el programa lo pidió)
     Paste,
+    /// Copia al portapapeles el texto seleccionado (no hace nada si no hay selección)
+    Copy,
+    ClearSelection,
+    /// Selecciona todo el contenido, historial incluido
+    SelectAll,
+    /// Divide el panel con foco: el nuevo queda a la derecha
+    SplitRight,
+    /// Divide el panel con foco: el nuevo queda debajo
+    SplitDown,
+    /// Cierra el panel con foco y termina su shell; si es el último del mosaico, cierra la ventana
+    ClosePane,
+    /// Pasa el foco al panel vecino en esa dirección
+    FocusPane { dir: Direction },
+    /// Pasa el foco al panel siguiente o anterior (primero el mosaico y luego los flotantes)
+    FocusNext,
+    FocusPrevious,
+    /// Mueve el borde del panel `amount` celdas hacia `dir` (agranda hacia ese lado, o encoge si el
+    /// panel está en el límite de la ventana por ahí)
+    ResizePane { dir: Direction, amount: u16 },
+    /// Amplía el panel con foco a toda la ventana, o vuelve al mosaico
+    ToggleZoom,
+    /// Abre un panel flotante con su propio shell, o con `program`, y se cierra cuando este
+    /// termina (como un popup). `width` y `height` son fracciones de la ventana (por defecto,
+    /// `panes.float_width` y `panes.float_height`); `cwd` por defecto es el directorio del panel
+    /// con foco si el shell lo informa.
+    NewFloat {
+        #[serde(default)]
+        program: Option<String>,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        width: Option<f32>,
+        #[serde(default)]
+        height: Option<f32>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// Oculta o muestra todos los flotantes sin cerrar sus shells; si no hay ninguno, abre uno
+    ToggleFloats,
+    /// Mueve el flotante con foco `amount` celdas hacia `dir`
+    MovePane { dir: Direction, amount: u16 },
     Quit,
     #[serde(skip)]
     Lua(Function),
@@ -155,6 +208,15 @@ fn parse_key(name: &str) -> Result<KeyId, String> {
 
 /// "CTRL|SHIFT" a bits. Admite CTRL, SHIFT, ALT y SUPER (también CMD y WIN).
 pub fn parse_mods(text: &str) -> Result<u8, String> {
+    parse_mods_with(text, false)
+}
+
+/// Como `parse_mods`, pero en las teclas de `keys` también vale `LEADER`
+fn parse_binding_mods(text: &str) -> Result<u8, String> {
+    parse_mods_with(text, true)
+}
+
+fn parse_mods_with(text: &str, allow_leader: bool) -> Result<u8, String> {
     let mut bits = 0;
     for part in text.split('|').map(str::trim).filter(|part| !part.is_empty()) {
         bits |= match part.to_uppercase().as_str() {
@@ -162,6 +224,12 @@ pub fn parse_mods(text: &str) -> Result<u8, String> {
             "SHIFT" => SHIFT,
             "ALT" | "OPTION" => ALT,
             "SUPER" | "CMD" | "WIN" | "META" => SUPER,
+            "LEADER" if allow_leader => LEADER,
+            _ if allow_leader => {
+                return Err(format!(
+                    "modificador desconocido {part:?} (usa CTRL, SHIFT, ALT, SUPER o LEADER, separados por |)"
+                ));
+            }
             _ => {
                 return Err(format!(
                     "modificador desconocido {part:?} (usa CTRL, SHIFT, ALT o SUPER, separados por |)"
@@ -181,13 +249,227 @@ impl Bindings {
     pub fn lookup(&self, key: &Key, mods: u8) -> Option<&Action> {
         self.map.get(&(key_id(key)?, mods))
     }
+
+    /// La tecla pulsada justo después del prefijo. Un carácter ya lleva el SHIFT en sí (`%` es
+    /// Shift+5 en un teclado US), así que si no hay un enlace exacto se prueba sin SHIFT; `w` y `W`
+    /// siguen siendo distintas porque se mira primero la combinación exacta.
+    fn lookup_after_leader(&self, key: &Key, mods: u8) -> Option<&Action> {
+        let id = key_id(key)?;
+        if let Some(action) = self.map.get(&(id.clone(), LEADER | mods)) {
+            return Some(action);
+        }
+        if matches!(id, KeyId::Char(_)) && mods & SHIFT != 0 {
+            return self.map.get(&(id, LEADER | (mods & !SHIFT)));
+        }
+        None
+    }
+
+    /// Las teclas que la terminal enlaza sin que nadie las configure: copiar, pegar y desplazar el
+    /// historial, y los paneles tras el prefijo (estilo tmux). Las de `keys` en config.lua las
+    /// sustituyen.
+    fn defaults() -> Self {
+        let mut map = HashMap::new();
+        let mut bind = |key: KeyId, mods: u8, action: Action| {
+            map.insert((key, mods), action);
+        };
+        bind(KeyId::Char('c'), CTRL | SHIFT, Action::Copy);
+        bind(KeyId::Named(NamedKey::Insert), CTRL, Action::Copy);
+        bind(KeyId::Char('v'), CTRL | SHIFT, Action::Paste);
+        bind(KeyId::Named(NamedKey::Insert), SHIFT, Action::Paste);
+        bind(KeyId::Named(NamedKey::PageUp), SHIFT, Action::ScrollPages { amount: -1 });
+        bind(KeyId::Named(NamedKey::PageDown), SHIFT, Action::ScrollPages { amount: 1 });
+
+        // Paneles, tras el prefijo
+        bind(KeyId::Char('%'), LEADER, Action::SplitRight);
+        bind(KeyId::Char('"'), LEADER, Action::SplitDown);
+        bind(KeyId::Char('x'), LEADER, Action::ClosePane);
+        bind(KeyId::Char('z'), LEADER, Action::ToggleZoom);
+        bind(KeyId::Char('o'), LEADER, Action::FocusNext);
+        bind(KeyId::Char('w'), LEADER, Action::ToggleFloats);
+        bind(
+            KeyId::Char('w'),
+            LEADER | SHIFT,
+            Action::NewFloat {
+                program: None,
+                args: Vec::new(),
+                width: None,
+                height: None,
+                cwd: None,
+            },
+        );
+        for (key, dir) in [
+            (NamedKey::ArrowLeft, Direction::Left),
+            (NamedKey::ArrowRight, Direction::Right),
+            (NamedKey::ArrowUp, Direction::Up),
+            (NamedKey::ArrowDown, Direction::Down),
+        ] {
+            bind(KeyId::Named(key), LEADER, Action::FocusPane { dir });
+            bind(KeyId::Named(key), LEADER | CTRL, Action::ResizePane { dir, amount: 1 });
+            bind(KeyId::Named(key), LEADER | ALT, Action::ResizePane { dir, amount: 5 });
+            bind(KeyId::Named(key), LEADER | SHIFT, Action::MovePane { dir, amount: 2 });
+        }
+        for (key, dir) in [
+            ('h', Direction::Left),
+            ('j', Direction::Down),
+            ('k', Direction::Up),
+            ('l', Direction::Right),
+        ] {
+            bind(KeyId::Char(key), LEADER, Action::FocusPane { dir });
+        }
+        Self { map }
+    }
+}
+
+/// La tecla de prefijo (como el Ctrl+B de tmux): tras pulsarla, la tecla siguiente se busca entre
+/// las enlazadas con `mods = "LEADER"`
+pub struct Leader {
+    key: KeyId,
+    mods: u8,
+    timeout: Duration,
+}
+
+impl Leader {
+    fn matches(&self, key: &Key, mods: u8) -> bool {
+        key_id(key).is_some_and(|id| id == self.key) && mods == self.mods
+    }
+
+    /// Lo que se envía al programa al pulsar el prefijo dos veces: el carácter de control de
+    /// Ctrl+letra (Ctrl+B es 0x02). Con cualquier otro prefijo, nada.
+    fn passthrough(&self) -> Option<Vec<u8>> {
+        match (&self.key, self.mods) {
+            (KeyId::Char(letter), CTRL) if letter.is_ascii_alphabetic() => Some(vec![(*letter as u8) & 0x1f]),
+            _ => None,
+        }
+    }
+}
+
+/// La tabla `leader` de config.lua tal como llega, antes de comprobar la tecla y los modificadores
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawLeader {
+    key: String,
+    mods: String,
+    timeout_ms: u32,
+}
+
+impl Default for RawLeader {
+    fn default() -> Self {
+        Self {
+            key: "b".to_string(),
+            mods: "CTRL".to_string(),
+            timeout_ms: 1500,
+        }
+    }
+}
+
+/// Convierte `leader`: sin ponerlo (o `true`) vale Ctrl+B, `false` lo desactiva, y una tabla
+/// `{ key, mods, timeout_ms }` lo personaliza
+pub fn parse_leader(value: Value) -> Result<Option<Leader>, String> {
+    let raw: RawLeader = match value {
+        Value::Nil | Value::Boolean(true) => RawLeader::default(),
+        Value::Boolean(false) => return Ok(None),
+        Value::Table(_) => serde_path_to_error::deserialize(mlua::serde::Deserializer::new(value))
+            .map_err(|e| format!("leader: {e}"))?,
+        other => {
+            return Err(format!(
+                "leader debe ser una tabla {{ key = ..., mods = ... }}, true o false (recibió {})",
+                other.type_name()
+            ));
+        }
+    };
+    let key = parse_key(&raw.key).map_err(|e| format!("leader.key: {e}"))?;
+    let mods = parse_mods(&raw.mods).map_err(|e| format!("leader.mods: {e}"))?;
+    if !(200..=10_000).contains(&raw.timeout_ms) {
+        return Err(format!(
+            "leader.timeout_ms debe estar entre 200 y 10000 (recibió {})",
+            raw.timeout_ms
+        ));
+    }
+    Ok(Some(Leader {
+        key,
+        mods,
+        timeout: Duration::from_millis(u64::from(raw.timeout_ms)),
+    }))
+}
+
+/// Si hay un prefijo pulsado esperando la tecla siguiente, y hasta cuándo
+#[derive(Default)]
+pub struct LeaderState {
+    until: Option<Instant>,
+}
+
+impl LeaderState {
+    pub fn pending(&self) -> bool {
+        self.until.is_some()
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.until
+    }
+
+    /// Si el plazo venció, cancela el prefijo y devuelve `true`
+    pub fn expire(&mut self, now: Instant) -> bool {
+        if self.until.is_some_and(|until| now >= until) {
+            self.until = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn clear(&mut self) {
+        self.until = None;
+    }
+}
+
+/// Qué hacer con una pulsación de tecla según el estado del prefijo
+#[derive(Debug)]
+pub enum LeaderOutcome {
+    /// No tiene que ver con el prefijo: sigue el camino normal (enlaces, encoder, shell)
+    Normal,
+    /// Un modificador suelto o una repetición mientras el prefijo está pendiente: no hacer nada
+    Ignore,
+    /// Se pulsó el prefijo: queda esperando la tecla siguiente
+    Arm,
+    /// El prefijo se cancela (Escape o una tecla sin enlace); la tecla se descarta
+    Cancel,
+    /// El prefijo se pulsó dos veces: se envía este carácter de control al programa
+    Passthrough(Vec<u8>),
+    /// La tecla tenía un enlace tras el prefijo
+    Run(Action),
+}
+
+/// Teclas que son solo un modificador: pulsar Shift para escribir `%` no cancela el prefijo
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Super
+                | NamedKey::Meta
+                | NamedKey::Hyper
+                | NamedKey::Fn
+                | NamedKey::CapsLock
+                | NamedKey::NumLock
+        )
+    )
 }
 
 /// Convierte la tabla `keys` de config.lua. Los modificadores tienen que coincidir exactamente
-/// (también SHIFT cuando el carácter lo necesita, como `+` en un teclado US).
-pub fn parse_keys(lua: &Lua, value: Value) -> Result<Bindings, String> {
+/// (también SHIFT cuando el carácter lo necesita, como `+` en un teclado US). Con `defaults`, se
+/// parte de las teclas por defecto: una tecla del usuario sustituye a la de por defecto con la
+/// misma combinación, pero dos del usuario con la misma combinación son un error.
+pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, String> {
     let table = match value {
-        Value::Nil => return Ok(Bindings::default()),
+        Value::Nil => {
+            return Ok(if defaults {
+                Bindings::defaults()
+            } else {
+                Bindings::default()
+            });
+        }
         Value::Table(table) => table,
         other => {
             return Err(format!(
@@ -197,7 +479,12 @@ pub fn parse_keys(lua: &Lua, value: Value) -> Result<Bindings, String> {
         }
     };
 
-    let mut bindings = Bindings::default();
+    let mut bindings = if defaults {
+        Bindings::defaults()
+    } else {
+        Bindings::default()
+    };
+    let mut from_user = std::collections::HashSet::new();
     for (index, entry) in table.sequence_values::<Value>().enumerate() {
         let at = format!("keys[{}]", index + 1);
         let entry = entry.map_err(|e| format!("{at}: {}", lua_message(&e)))?;
@@ -212,7 +499,7 @@ pub fn parse_keys(lua: &Lua, value: Value) -> Result<Bindings, String> {
         let mods = match entry.get::<Value>("mods").map_err(|e| lua_message(&e))? {
             Value::Nil => 0,
             Value::String(text) => {
-                parse_mods(&text.to_string_lossy()).map_err(|e| format!("{at}.mods: {e}"))?
+                parse_binding_mods(&text.to_string_lossy()).map_err(|e| format!("{at}.mods: {e}"))?
             }
             other => {
                 return Err(format!("{at}.mods debe ser un texto, como \"CTRL|SHIFT\" (recibió {})", other.type_name()));
@@ -221,9 +508,10 @@ pub fn parse_keys(lua: &Lua, value: Value) -> Result<Bindings, String> {
         let action = parse_action(lua, entry.get("action").map_err(|e| lua_message(&e))?)
             .map_err(|e| format!("{at}.action: {e}"))?;
 
-        if bindings.map.insert((key, mods), action).is_some() {
+        if !from_user.insert((key.clone(), mods)) {
             return Err(format!("{at}: la combinación {name:?} + {mods:?} ya estaba enlazada"));
         }
+        bindings.map.insert((key, mods), action);
     }
     Ok(bindings)
 }
@@ -311,6 +599,7 @@ pub fn parse_events(value: Value) -> Result<Events, String> {
 pub struct Script {
     lua: Lua,
     bindings: Bindings,
+    leader: Option<Leader>,
     events: Events,
     ctx: Table,
     commands: Rc<RefCell<Vec<Command>>>,
@@ -346,6 +635,7 @@ impl Script {
         Ok(Self {
             lua,
             bindings: Bindings::default(),
+            leader: None,
             events: Events::default(),
             ctx,
             commands,
@@ -367,6 +657,61 @@ impl Script {
 
     pub fn binding(&self, key: &Key, mods: u8) -> Option<&Action> {
         self.bindings.lookup(key, mods)
+    }
+
+    /// Fija el prefijo. Si su combinación ya es una tecla de `keys`, es un error: no se sabría
+    /// cuál de las dos hacer.
+    pub fn set_leader(&mut self, leader: Option<Leader>) -> Result<(), String> {
+        if let Some(leader) = &leader
+            && self.bindings.map.contains_key(&(leader.key.clone(), leader.mods))
+        {
+            return Err("leader: esa combinación de teclas ya está enlazada en keys".to_string());
+        }
+        self.leader = leader;
+        Ok(())
+    }
+
+    /// Decide qué hacer con una pulsación de tecla según el estado del prefijo (ver `LeaderOutcome`)
+    pub fn leader_step(
+        &self,
+        state: &mut LeaderState,
+        key: &Key,
+        mods: u8,
+        repeat: bool,
+        now: Instant,
+    ) -> LeaderOutcome {
+        let Some(leader) = &self.leader else {
+            state.clear();
+            return LeaderOutcome::Normal;
+        };
+        state.expire(now);
+        if state.pending() {
+            if repeat || is_modifier_key(key) {
+                return LeaderOutcome::Ignore;
+            }
+            state.clear();
+            if matches!(key, Key::Named(NamedKey::Escape)) && mods == 0 {
+                return LeaderOutcome::Cancel;
+            }
+            if leader.matches(key, mods) {
+                return leader
+                    .passthrough()
+                    .map_or(LeaderOutcome::Cancel, LeaderOutcome::Passthrough);
+            }
+            return self
+                .bindings
+                .lookup_after_leader(key, mods)
+                .cloned()
+                .map_or(LeaderOutcome::Cancel, LeaderOutcome::Run);
+        }
+        if leader.matches(key, mods) {
+            if repeat {
+                return LeaderOutcome::Ignore;
+            }
+            state.until = Some(now + leader.timeout);
+            return LeaderOutcome::Arm;
+        }
+        LeaderOutcome::Normal
     }
 
     pub fn has_handler(&self, kind: EventKind) -> bool {

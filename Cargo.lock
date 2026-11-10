@@ -2009,6 +2009,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_path_to_error",
+ "ttf-parser",
  "wgpu",
  "winit",
 ]
