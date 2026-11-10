@@ -5,6 +5,7 @@ mod glyphs;
 mod layout;
 mod mouse;
 mod pane;
+mod proc_cwd;
 mod renderer;
 
 use actions::{Action, Command, Direction, EventKind, LeaderOutcome, LeaderState, Script};
@@ -213,8 +214,8 @@ impl App {
         })
     }
 
-    /// Directorio donde arranca un panel nuevo: el del panel `from` si su shell lo informó (OSC 7)
-    /// y `panes.inherit_cwd` lo permite; si no, el de `shell.cwd`
+    /// Directorio donde arranca un panel nuevo: el del panel `from` (por OSC 7 o, en macOS y
+    /// Linux, preguntándole al sistema) si `panes.inherit_cwd` lo permite; si no, el de `shell.cwd`
     fn inherited_cwd(&self, from: PaneId) -> Option<PathBuf> {
         if !self.config.panes.inherit_cwd {
             return None;
