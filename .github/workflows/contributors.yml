@@ -1,0 +1,21 @@
+name: Contributors
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: akhilmhdh/contributors-readme-action@v2.3.10
+        with:
+          readme_path: README.md
+          commit_message: "docs: update contributors list"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
