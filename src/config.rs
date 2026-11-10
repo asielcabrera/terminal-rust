@@ -133,7 +133,10 @@ impl Default for FontConfig {
         Self {
             family: DEFAULT_FAMILY.to_string(),
             size: 16.0,
-            fallback: DEFAULT_FALLBACK.iter().map(|name| (*name).to_string()).collect(),
+            fallback: DEFAULT_FALLBACK
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         }
     }
 }
@@ -232,7 +235,9 @@ pub struct Modifiers(pub u8);
 impl<'de> Deserialize<'de> for Modifiers {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        actions::parse_mods(&text).map(Modifiers).map_err(de::Error::custom)
+        actions::parse_mods(&text)
+            .map(Modifiers)
+            .map_err(de::Error::custom)
     }
 }
 
@@ -323,13 +328,19 @@ pub enum ShellExit {
 impl Config {
     fn validate(&self) -> Result<(), String> {
         if !(self.font.size.is_finite() && (4.0..=200.0).contains(&self.font.size)) {
-            return Err(format!("font.size debe estar entre 4 y 200 (recibió {})", self.font.size));
+            return Err(format!(
+                "font.size debe estar entre 4 y 200 (recibió {})",
+                self.font.size
+            ));
         }
         if self.font.family.trim().is_empty() {
             return Err("font.family no puede estar vacío".to_string());
         }
         if !(self.padding.is_finite() && (0.0..=200.0).contains(&self.padding)) {
-            return Err(format!("padding debe estar entre 0 y 200 (recibió {})", self.padding));
+            return Err(format!(
+                "padding debe estar entre 0 y 200 (recibió {})",
+                self.padding
+            ));
         }
         if !(100..=5000).contains(&self.cursor.blink_ms) {
             return Err(format!(
@@ -349,14 +360,23 @@ impl Config {
         // Arrastrar sin modificadores es seleccionar: los dos gestos necesitan al menos uno, y
         // distinto entre sí (si no, no habría forma de saber cuál se pide)
         if self.mouse.rectangle_modifiers.0 == 0 {
-            return Err("mouse.rectangle_modifiers no puede estar vacío (arrastrar solo ya selecciona)".to_string());
+            return Err(
+                "mouse.rectangle_modifiers no puede estar vacío (arrastrar solo ya selecciona)"
+                    .to_string(),
+            );
         }
         if self.window.decorations == Decorations::None {
             if self.window.drag_modifiers.0 == 0 {
-                return Err("window.drag_modifiers no puede estar vacío (arrastrar solo ya selecciona)".to_string());
+                return Err(
+                    "window.drag_modifiers no puede estar vacío (arrastrar solo ya selecciona)"
+                        .to_string(),
+                );
             }
             if self.window.drag_modifiers == self.mouse.rectangle_modifiers {
-                return Err("window.drag_modifiers y mouse.rectangle_modifiers no pueden ser iguales".to_string());
+                return Err(
+                    "window.drag_modifiers y mouse.rectangle_modifiers no pueden ser iguales"
+                        .to_string(),
+                );
             }
         }
         if self.shell.program.is_none() && !self.shell.args.is_empty() {
@@ -448,9 +468,10 @@ fn default_script() -> Result<(Config, Script), String> {
 pub fn load_script_path(path: &Path) -> Result<(Config, Script), String> {
     match std::fs::read_to_string(path) {
         Ok(source) => {
-            let name = path
-                .file_name()
-                .map_or_else(|| "config.lua".to_string(), |name| name.to_string_lossy().into_owned());
+            let name = path.file_name().map_or_else(
+                || "config.lua".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
             parse_script(&source, &name, path.parent())
         }
         Err(e) if e.kind() == ErrorKind::NotFound => default_script(),
@@ -493,13 +514,19 @@ pub fn parse_script(
     let events: Value = table.get("events").map_err(|e| lua_message(&e))?;
     let leader: Value = table.get("leader").map_err(|e| lua_message(&e))?;
     table.set("keys", Value::Nil).map_err(|e| lua_message(&e))?;
-    table.set("events", Value::Nil).map_err(|e| lua_message(&e))?;
-    table.set("leader", Value::Nil).map_err(|e| lua_message(&e))?;
+    table
+        .set("events", Value::Nil)
+        .map_err(|e| lua_message(&e))?;
+    table
+        .set("leader", Value::Nil)
+        .map_err(|e| lua_message(&e))?;
 
     let deserializer = mlua::serde::Deserializer::new(Value::Table(table));
-    let config: Config = serde_path_to_error::deserialize(deserializer)
+    let config: Config =
+        serde_path_to_error::deserialize(deserializer).map_err(|e| format!("{chunk_name}: {e}"))?;
+    config
+        .validate()
         .map_err(|e| format!("{chunk_name}: {e}"))?;
-    config.validate().map_err(|e| format!("{chunk_name}: {e}"))?;
 
     let bindings = actions::parse_keys(script.lua(), keys, !config.disable_default_keys)
         .map_err(|e| format!("{chunk_name}: {e}"))?;
@@ -543,7 +570,12 @@ return action
 fn prepare(lua: &Lua, dir: Option<&Path>) -> mlua::Result<()> {
     let terminal = lua.create_table()?;
     terminal.set("os", std::env::consts::OS)?;
-    terminal.set("action", lua.load(ACTION_PRELUDE).set_name("=prelude").eval::<Table>()?)?;
+    terminal.set(
+        "action",
+        lua.load(ACTION_PRELUDE)
+            .set_name("=prelude")
+            .eval::<Table>()?,
+    )?;
     terminal.set(
         "log",
         lua.create_function(|_, message: String| {
@@ -625,7 +657,10 @@ mod tests {
         assert_eq!(config.shell.program.as_deref(), Some("pwsh"));
         assert_eq!(config.shell.args, vec!["-NoLogo"]);
         assert_eq!(config.shell.env.get("A").map(String::as_str), Some("1"));
-        assert_eq!((config.window.columns, config.window.rows), (Some(100), Some(30)));
+        assert_eq!(
+            (config.window.columns, config.window.rows),
+            (Some(100), Some(30))
+        );
         assert_eq!(config.window.title.as_deref(), Some("mi terminal"));
         assert_eq!(config.scrollback, 5000);
         assert_eq!(config.on_shell_exit, ShellExit::Hold);
@@ -633,7 +668,9 @@ mod tests {
 
     #[test]
     fn empty_lua_tables_are_accepted_for_lists_and_maps() {
-        let config = parse_str("return { font = { fallback = {} }, shell = { args = {}, env = {} } }").unwrap();
+        let config =
+            parse_str("return { font = { fallback = {} }, shell = { args = {}, env = {} } }")
+                .unwrap();
         assert!(config.font.fallback.is_empty());
         assert!(config.shell.args.is_empty());
         assert!(config.shell.env.is_empty());
@@ -670,7 +707,8 @@ mod tests {
 
     #[test]
     fn invalid_color_reports_path_and_value() {
-        let error = parse_str(r#"return { colors = { foreground = "no-es-un-color" } }"#).unwrap_err();
+        let error =
+            parse_str(r#"return { colors = { foreground = "no-es-un-color" } }"#).unwrap_err();
         assert!(error.contains("colors.foreground"), "{error}");
         assert!(error.contains("no-es-un-color"), "{error}");
     }
@@ -714,15 +752,37 @@ mod tests {
 
     #[test]
     fn out_of_range_values_are_rejected() {
-        assert!(parse_str("return { font = { size = 0 } }").unwrap_err().contains("font.size"));
-        assert!(parse_str("return { padding = -1 }").unwrap_err().contains("padding"));
-        assert!(parse_str("return { window = { columns = 0 } }").unwrap_err().contains("window"));
-        assert!(parse_str("return { window = { rows = 0 } }").unwrap_err().contains("window"));
+        assert!(
+            parse_str("return { font = { size = 0 } }")
+                .unwrap_err()
+                .contains("font.size")
+        );
+        assert!(
+            parse_str("return { padding = -1 }")
+                .unwrap_err()
+                .contains("padding")
+        );
+        assert!(
+            parse_str("return { window = { columns = 0 } }")
+                .unwrap_err()
+                .contains("window")
+        );
+        assert!(
+            parse_str("return { window = { rows = 0 } }")
+                .unwrap_err()
+                .contains("window")
+        );
         let palette = |count: u32| {
-            format!("local t = {{}} for i = 1, {count} do t[i] = '#000' end return {{ colors = {{ ansi = t }} }}")
+            format!(
+                "local t = {{}} for i = 1, {count} do t[i] = '#000' end return {{ colors = {{ ansi = t }} }}"
+            )
         };
         assert!(parse_str(&palette(256)).is_ok());
-        assert!(parse_str(&palette(257)).unwrap_err().contains("colors.ansi"));
+        assert!(
+            parse_str(&palette(257))
+                .unwrap_err()
+                .contains("colors.ansi")
+        );
     }
 
     #[test]
@@ -757,7 +817,9 @@ mod tests {
     fn shell_args_without_a_program_are_rejected() {
         let error = parse_str(r#"return { shell = { args = { "-NoLogo" } } }"#).unwrap_err();
         assert!(error.contains("shell.args"), "{error}");
-        assert!(parse_str(r#"return { shell = { program = "pwsh", args = { "-NoLogo" } } }"#).is_ok());
+        assert!(
+            parse_str(r#"return { shell = { program = "pwsh", args = { "-NoLogo" } } }"#).is_ok()
+        );
         // cwd y env sí valen con el shell por defecto
         assert!(parse_str(r#"return { shell = { cwd = "C:/", env = { A = "1" } } }"#).is_ok());
     }
@@ -768,7 +830,9 @@ mod tests {
         assert!(!defaults.cursor.blink);
         assert_eq!(defaults.cursor.blink_ms, 530);
 
-        let config = parse_str("return { cursor = { style = 'bar', blink = true, blink_ms = 300 } }").unwrap();
+        let config =
+            parse_str("return { cursor = { style = 'bar', blink = true, blink_ms = 300 } }")
+                .unwrap();
         assert!(config.cursor.blink);
         assert_eq!(config.cursor.blink_ms, 300);
     }
@@ -776,7 +840,8 @@ mod tests {
     #[test]
     fn blink_interval_must_be_sensible() {
         for bad in ["50", "99", "5001", "100000"] {
-            let error = parse_str(&format!("return {{ cursor = {{ blink_ms = {bad} }} }}")).unwrap_err();
+            let error =
+                parse_str(&format!("return {{ cursor = {{ blink_ms = {bad} }} }}")).unwrap_err();
             assert!(error.contains("cursor.blink_ms"), "{error}");
         }
         assert!(parse_str("return { cursor = { blink_ms = 100 } }").is_ok());
@@ -811,9 +876,15 @@ mod tests {
         let script = script_from("return {}").unwrap();
         let mut state = LeaderState::default();
         // Sin el prefijo, el % es una tecla normal
-        assert!(matches!(step(&script, &mut state, &char_key("%"), actions::SHIFT), LeaderOutcome::Normal));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("%"), actions::SHIFT),
+            LeaderOutcome::Normal
+        ));
         // Ctrl+B arma el prefijo y no llega al shell
-        assert!(matches!(step(&script, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Arm));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("b"), actions::CTRL),
+            LeaderOutcome::Arm
+        ));
         assert!(state.pending());
         // % llega como Shift+5: el enlace es `%` con LEADER, sin SHIFT
         assert!(matches!(
@@ -821,7 +892,10 @@ mod tests {
             LeaderOutcome::Run(Action::SplitRight)
         ));
         assert!(!state.pending(), "el prefijo se consume con una tecla");
-        assert!(matches!(step(&script, &mut state, &char_key("%"), actions::SHIFT), LeaderOutcome::Normal));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("%"), actions::SHIFT),
+            LeaderOutcome::Normal
+        ));
     }
 
     #[test]
@@ -831,35 +905,66 @@ mod tests {
         let script = script_from("return {}").unwrap();
         let mut state = LeaderState::default();
         let mut after = |key: winit::keyboard::Key, mods: u8| {
-            assert!(matches!(step(&script, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Arm));
+            assert!(matches!(
+                step(&script, &mut state, &char_key("b"), actions::CTRL),
+                LeaderOutcome::Arm
+            ));
             step(&script, &mut state, &key, mods)
         };
-        assert!(matches!(after(char_key("\""), actions::SHIFT), LeaderOutcome::Run(Action::SplitDown)));
-        assert!(matches!(after(char_key("x"), 0), LeaderOutcome::Run(Action::ClosePane)));
-        assert!(matches!(after(char_key("z"), 0), LeaderOutcome::Run(Action::ToggleZoom)));
-        assert!(matches!(after(char_key("o"), 0), LeaderOutcome::Run(Action::FocusNext)));
+        assert!(matches!(
+            after(char_key("\""), actions::SHIFT),
+            LeaderOutcome::Run(Action::SplitDown)
+        ));
+        assert!(matches!(
+            after(char_key("x"), 0),
+            LeaderOutcome::Run(Action::ClosePane)
+        ));
+        assert!(matches!(
+            after(char_key("z"), 0),
+            LeaderOutcome::Run(Action::ToggleZoom)
+        ));
+        assert!(matches!(
+            after(char_key("o"), 0),
+            LeaderOutcome::Run(Action::FocusNext)
+        ));
         assert!(matches!(
             after(char_key("h"), 0),
-            LeaderOutcome::Run(Action::FocusPane { dir: Direction::Left })
+            LeaderOutcome::Run(Action::FocusPane {
+                dir: Direction::Left
+            })
         ));
         assert!(matches!(
             after(named(NamedKey::ArrowDown), 0),
-            LeaderOutcome::Run(Action::FocusPane { dir: Direction::Down })
+            LeaderOutcome::Run(Action::FocusPane {
+                dir: Direction::Down
+            })
         ));
         assert!(matches!(
             after(named(NamedKey::ArrowLeft), actions::CTRL),
-            LeaderOutcome::Run(Action::ResizePane { dir: Direction::Left, amount: 1 })
+            LeaderOutcome::Run(Action::ResizePane {
+                dir: Direction::Left,
+                amount: 1
+            })
         ));
         assert!(matches!(
             after(named(NamedKey::ArrowRight), actions::ALT),
-            LeaderOutcome::Run(Action::ResizePane { dir: Direction::Right, amount: 5 })
+            LeaderOutcome::Run(Action::ResizePane {
+                dir: Direction::Right,
+                amount: 5
+            })
         ));
         assert!(matches!(
             after(named(NamedKey::ArrowUp), actions::SHIFT),
-            LeaderOutcome::Run(Action::MovePane { dir: Direction::Up, amount: 2 })
+            LeaderOutcome::Run(Action::MovePane {
+                dir: Direction::Up,
+                amount: 2
+            })
         ));
         // w y W son distintas aunque se pruebe sin SHIFT cuando no hay enlace exacto
-        assert!(matches!(after(char_key("w"), 0), LeaderOutcome::Run(Action::ToggleFloats)));
+        assert!(matches!(
+            after(char_key("w"), 0),
+            LeaderOutcome::Run(Action::ToggleFloats)
+        ));
         assert!(matches!(
             after(char_key("W"), actions::SHIFT),
             LeaderOutcome::Run(Action::NewFloat { program: None, .. })
@@ -875,26 +980,44 @@ mod tests {
         let now = std::time::Instant::now();
 
         // Mantener Ctrl+B pulsado no lo arma dos veces ni lo reenvía
-        assert!(matches!(step(&script, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Arm));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("b"), actions::CTRL),
+            LeaderOutcome::Arm
+        ));
         assert!(matches!(
             script.leader_step(&mut state, &char_key("b"), actions::CTRL, true, now),
             LeaderOutcome::Ignore
         ));
         // Pulsar Shift para escribir % no cancela
-        assert!(matches!(step(&script, &mut state, &named(NamedKey::Shift), actions::SHIFT), LeaderOutcome::Ignore));
+        assert!(matches!(
+            step(&script, &mut state, &named(NamedKey::Shift), actions::SHIFT),
+            LeaderOutcome::Ignore
+        ));
         assert!(state.pending());
-        assert!(matches!(step(&script, &mut state, &char_key("%"), actions::SHIFT), LeaderOutcome::Run(_)));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("%"), actions::SHIFT),
+            LeaderOutcome::Run(_)
+        ));
 
         // Escape cancela y no hace nada más
         step(&script, &mut state, &char_key("b"), actions::CTRL);
-        assert!(matches!(step(&script, &mut state, &named(NamedKey::Escape), 0), LeaderOutcome::Cancel));
+        assert!(matches!(
+            step(&script, &mut state, &named(NamedKey::Escape), 0),
+            LeaderOutcome::Cancel
+        ));
         assert!(!state.pending());
         // Una tecla sin enlace cancela y se descarta
         step(&script, &mut state, &char_key("b"), actions::CTRL);
-        assert!(matches!(step(&script, &mut state, &char_key("q"), 0), LeaderOutcome::Cancel));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("q"), 0),
+            LeaderOutcome::Cancel
+        ));
         assert!(!state.pending());
         // Con el prefijo ya cancelado, la siguiente tecla es normal
-        assert!(matches!(step(&script, &mut state, &char_key("x"), 0), LeaderOutcome::Normal));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("x"), 0),
+            LeaderOutcome::Normal
+        ));
     }
 
     #[test]
@@ -910,9 +1033,19 @@ mod tests {
         assert!(!state.pending());
         // Un prefijo que no es Ctrl+letra no tiene carácter que reenviar: solo cancela
         let script = script_from(r#"return { leader = { key = "Space", mods = "ALT" } }"#).unwrap();
-        step(&script, &mut state, &named(winit::keyboard::NamedKey::Space), actions::ALT);
+        step(
+            &script,
+            &mut state,
+            &named(winit::keyboard::NamedKey::Space),
+            actions::ALT,
+        );
         assert!(matches!(
-            step(&script, &mut state, &named(winit::keyboard::NamedKey::Space), actions::ALT),
+            step(
+                &script,
+                &mut state,
+                &named(winit::keyboard::NamedKey::Space),
+                actions::ALT
+            ),
             LeaderOutcome::Cancel
         ));
     }
@@ -920,14 +1053,19 @@ mod tests {
     #[test]
     fn the_leader_expires_after_its_timeout() {
         use actions::{LeaderOutcome, LeaderState};
-        let script = script_from(r#"return { leader = { key = "b", mods = "CTRL", timeout_ms = 500 } }"#).unwrap();
+        let script =
+            script_from(r#"return { leader = { key = "b", mods = "CTRL", timeout_ms = 500 } }"#)
+                .unwrap();
         let mut state = LeaderState::default();
         let start = std::time::Instant::now();
         assert!(matches!(
             script.leader_step(&mut state, &char_key("b"), actions::CTRL, false, start),
             LeaderOutcome::Arm
         ));
-        assert_eq!(state.deadline(), Some(start + std::time::Duration::from_millis(500)));
+        assert_eq!(
+            state.deadline(),
+            Some(start + std::time::Duration::from_millis(500))
+        );
         // El temporizador de la app lo cancela al vencer
         assert!(!state.expire(start + std::time::Duration::from_millis(499)));
         assert!(state.expire(start + std::time::Duration::from_millis(500)));
@@ -935,7 +1073,13 @@ mod tests {
         // Y una pulsación tardía, aún sin que el temporizador haya corrido, es una tecla normal
         script.leader_step(&mut state, &char_key("b"), actions::CTRL, false, start);
         assert!(matches!(
-            script.leader_step(&mut state, &char_key("x"), 0, false, start + std::time::Duration::from_secs(2)),
+            script.leader_step(
+                &mut state,
+                &char_key("x"),
+                0,
+                false,
+                start + std::time::Duration::from_secs(2)
+            ),
             LeaderOutcome::Normal
         ));
     }
@@ -945,18 +1089,33 @@ mod tests {
         use actions::{LeaderOutcome, LeaderState};
         let mut state = LeaderState::default();
 
-        let custom = script_from(r#"return { leader = { key = "a", mods = "CTRL|SHIFT" } }"#).unwrap();
+        let custom =
+            script_from(r#"return { leader = { key = "a", mods = "CTRL|SHIFT" } }"#).unwrap();
         assert!(matches!(
-            step(&custom, &mut state, &char_key("a"), actions::CTRL | actions::SHIFT),
+            step(
+                &custom,
+                &mut state,
+                &char_key("a"),
+                actions::CTRL | actions::SHIFT
+            ),
             LeaderOutcome::Arm
         ));
         state.clear();
-        assert!(matches!(step(&custom, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Normal));
+        assert!(matches!(
+            step(&custom, &mut state, &char_key("b"), actions::CTRL),
+            LeaderOutcome::Normal
+        ));
 
         let off = script_from("return { leader = false }").unwrap();
-        assert!(matches!(step(&off, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Normal));
+        assert!(matches!(
+            step(&off, &mut state, &char_key("b"), actions::CTRL),
+            LeaderOutcome::Normal
+        ));
         let on = script_from("return { leader = true }").unwrap();
-        assert!(matches!(step(&on, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Arm));
+        assert!(matches!(
+            step(&on, &mut state, &char_key("b"), actions::CTRL),
+            LeaderOutcome::Arm
+        ));
     }
 
     #[test]
@@ -972,12 +1131,24 @@ mod tests {
         .unwrap();
         let mut state = LeaderState::default();
         step(&script, &mut state, &char_key("b"), actions::CTRL);
-        assert!(matches!(step(&script, &mut state, &char_key("x"), 0), LeaderOutcome::Run(Action::Quit)));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("x"), 0),
+            LeaderOutcome::Run(Action::Quit)
+        ));
         step(&script, &mut state, &char_key("b"), actions::CTRL);
-        assert!(matches!(step(&script, &mut state, &char_key("v"), 0), LeaderOutcome::Run(Action::SplitRight)));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("v"), 0),
+            LeaderOutcome::Run(Action::SplitRight)
+        ));
         step(&script, &mut state, &char_key("b"), actions::CTRL);
         match step(&script, &mut state, &char_key("g"), actions::CTRL) {
-            LeaderOutcome::Run(Action::NewFloat { program, args, width, height, cwd }) => {
+            LeaderOutcome::Run(Action::NewFloat {
+                program,
+                args,
+                width,
+                height,
+                cwd,
+            }) => {
                 assert_eq!(program.as_deref(), Some("lazygit"));
                 assert_eq!(args, vec!["--version"]);
                 assert_eq!(width, Some(0.9));
@@ -989,46 +1160,77 @@ mod tests {
 
     #[test]
     fn leader_errors_explain_themselves() {
-        let error = script_from(r#"return { leader = { tecla = "b" } }"#).err().unwrap();
+        let error = script_from(r#"return { leader = { tecla = "b" } }"#)
+            .err()
+            .unwrap();
         assert!(error.contains("tecla"), "{error}");
-        let error = script_from(r#"return { leader = { key = "NoExiste" } }"#).err().unwrap();
+        let error = script_from(r#"return { leader = { key = "NoExiste" } }"#)
+            .err()
+            .unwrap();
         assert!(error.contains("leader.key"), "{error}");
-        let error = script_from(r#"return { leader = { mods = "LEADER" } }"#).err().unwrap();
-        assert!(error.contains("leader.mods") && error.contains("LEADER"), "{error}");
+        let error = script_from(r#"return { leader = { mods = "LEADER" } }"#)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("leader.mods") && error.contains("LEADER"),
+            "{error}"
+        );
         for bad in ["100", "20000"] {
-            let error = script_from(&format!("return {{ leader = {{ timeout_ms = {bad} }} }}")).err().unwrap();
+            let error = script_from(&format!("return {{ leader = {{ timeout_ms = {bad} }} }}"))
+                .err()
+                .unwrap();
             assert!(error.contains("leader.timeout_ms"), "{error}");
         }
         let error = script_from("return { leader = 3 }").err().unwrap();
         assert!(error.contains("leader debe ser"), "{error}");
         // Una tecla de `keys` con la misma combinación que el prefijo: no se sabría cuál hacer
-        let error = script_from(r#"return { keys = { { key = "b", mods = "CTRL", action = "Paste" } } }"#)
-            .err()
-            .unwrap();
-        assert!(error.contains("leader") && error.contains("enlazada"), "{error}");
+        let error =
+            script_from(r#"return { keys = { { key = "b", mods = "CTRL", action = "Paste" } } }"#)
+                .err()
+                .unwrap();
+        assert!(
+            error.contains("leader") && error.contains("enlazada"),
+            "{error}"
+        );
         // ...salvo que el prefijo esté desactivado
         assert!(script_from(r#"return { leader = false, keys = { { key = "b", mods = "CTRL", action = "Paste" } } }"#).is_ok());
     }
 
     #[test]
     fn the_leader_modifier_is_only_for_keys() {
-        assert!(actions::parse_mods("LEADER").unwrap_err().contains("LEADER"));
-        let error = parse_str(r#"return { window = { decorations = "none", drag_modifiers = "LEADER" } }"#).unwrap_err();
+        assert!(
+            actions::parse_mods("LEADER")
+                .unwrap_err()
+                .contains("LEADER")
+        );
+        let error =
+            parse_str(r#"return { window = { decorations = "none", drag_modifiers = "LEADER" } }"#)
+                .unwrap_err();
         assert!(error.contains("LEADER"), "{error}");
-        assert!(script_from(r#"return { keys = { { key = "x", mods = "LEADER|SHIFT", action = "Quit" } } }"#).is_ok());
+        assert!(
+            script_from(
+                r#"return { keys = { { key = "x", mods = "LEADER|SHIFT", action = "Quit" } } }"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn without_a_config_file_the_defaults_still_have_their_keys_and_leader() {
         use actions::{LeaderOutcome, LeaderState};
-        let path = std::env::temp_dir().join("terminal-no-existe-2").join("config.lua");
+        let path = std::env::temp_dir()
+            .join("terminal-no-existe-2")
+            .join("config.lua");
         let (_config, script) = load_script_path(&path).unwrap();
         assert!(matches!(
             script.binding(&char_key("C"), actions::CTRL | actions::SHIFT),
             Some(actions::Action::Copy)
         ));
         let mut state = LeaderState::default();
-        assert!(matches!(step(&script, &mut state, &char_key("b"), actions::CTRL), LeaderOutcome::Arm));
+        assert!(matches!(
+            step(&script, &mut state, &char_key("b"), actions::CTRL),
+            LeaderOutcome::Arm
+        ));
     }
 
     #[test]
@@ -1047,7 +1249,10 @@ mod tests {
         let key = |k: winit::keyboard::NamedKey| winit::keyboard::Key::Named(k);
 
         // Con Shift la tecla llega en mayúscula y aun así coincide
-        assert!(matches!(script.binding(&char_key("V"), actions::CTRL | actions::SHIFT), Some(actions::Action::Paste)));
+        assert!(matches!(
+            script.binding(&char_key("V"), actions::CTRL | actions::SHIFT),
+            Some(actions::Action::Paste)
+        ));
         assert!(matches!(
             script.binding(&key(winit::keyboard::NamedKey::PageUp), actions::SHIFT),
             Some(actions::Action::ScrollPages { amount: -1 })
@@ -1057,10 +1262,20 @@ mod tests {
             Some(actions::Action::SendString { text }) if text == "clear\r"
         ));
         // La forma corta con el nombre de la acción
-        assert!(matches!(script.binding(&char_key("q"), actions::CTRL), Some(actions::Action::Quit)));
+        assert!(matches!(
+            script.binding(&char_key("q"), actions::CTRL),
+            Some(actions::Action::Quit)
+        ));
         // Los modificadores tienen que coincidir exactamente
         assert!(script.binding(&char_key("v"), actions::CTRL).is_none());
-        assert!(script.binding(&char_key("v"), actions::CTRL | actions::SHIFT | actions::ALT).is_none());
+        assert!(
+            script
+                .binding(
+                    &char_key("v"),
+                    actions::CTRL | actions::SHIFT | actions::ALT
+                )
+                .is_none()
+        );
         assert!(script.binding(&char_key("x"), 0).is_none());
     }
 
@@ -1070,11 +1285,15 @@ mod tests {
             r#"return { keys = { { key = "k", mods = "CTRL|ALT", action = function(ctx) ctx:send_text("ls\r") end } } }"#,
         )
         .unwrap();
-        let Some(actions::Action::Lua(function)) = script.binding(&char_key("k"), actions::CTRL | actions::ALT) else {
+        let Some(actions::Action::Lua(function)) =
+            script.binding(&char_key("k"), actions::CTRL | actions::ALT)
+        else {
             panic!("debería ser una función de Lua");
         };
         let commands = script.call(&function.clone(), vec![]);
-        assert!(matches!(commands.as_slice(), [actions::Command::SendText(text)] if text == "ls\r"));
+        assert!(
+            matches!(commands.as_slice(), [actions::Command::SendText(text)] if text == "ls\r")
+        );
     }
 
     #[test]
@@ -1083,11 +1302,23 @@ mod tests {
         assert!(config.mouse.copy_on_select, "copiar al seleccionar");
         assert_eq!(config.mouse.right_click, RightClick::Paste);
         assert_eq!(config.mouse.scroll_lines, 3);
-        assert_eq!(config.mouse.rectangle_modifiers, Modifiers(actions::CTRL | actions::ALT));
+        assert_eq!(
+            config.mouse.rectangle_modifiers,
+            Modifiers(actions::CTRL | actions::ALT)
+        );
         assert_eq!(config.window.decorations, Decorations::Full);
         assert_eq!(config.window.drag_modifiers, Modifiers(actions::ALT));
-        assert!(config.window.rounded_corners, "esquinas como las del sistema");
-        assert_eq!((config.colors.selection_foreground, config.colors.selection_background), (None, None));
+        assert!(
+            config.window.rounded_corners,
+            "esquinas como las del sistema"
+        );
+        assert_eq!(
+            (
+                config.colors.selection_foreground,
+                config.colors.selection_background
+            ),
+            (None, None)
+        );
         assert!(!config.disable_default_keys);
     }
 
@@ -1111,7 +1342,10 @@ mod tests {
         assert!(!config.mouse.copy_on_select);
         assert_eq!(config.mouse.right_click, RightClick::None);
         assert_eq!(config.mouse.scroll_lines, 5);
-        assert_eq!(config.mouse.rectangle_modifiers, Modifiers(actions::CTRL | actions::SHIFT));
+        assert_eq!(
+            config.mouse.rectangle_modifiers,
+            Modifiers(actions::CTRL | actions::SHIFT)
+        );
         assert_eq!(config.colors.selection_background, rgb(0xff, 0xd8, 0x66));
         assert!(config.disable_default_keys);
     }
@@ -1119,16 +1353,27 @@ mod tests {
     #[test]
     fn bad_mouse_and_window_options_explain_themselves() {
         let error = parse_str(r#"return { window = { decorations = "borde" } }"#).unwrap_err();
-        assert!(error.contains("window.decorations") && error.contains("full"), "{error}");
+        assert!(
+            error.contains("window.decorations") && error.contains("full"),
+            "{error}"
+        );
 
-        let error = parse_str(r#"return { window = { drag_modifiers = "ALT|HYPER" } }"#).unwrap_err();
-        assert!(error.contains("window.drag_modifiers") && error.contains("HYPER"), "{error}");
+        let error =
+            parse_str(r#"return { window = { drag_modifiers = "ALT|HYPER" } }"#).unwrap_err();
+        assert!(
+            error.contains("window.drag_modifiers") && error.contains("HYPER"),
+            "{error}"
+        );
 
         let error = parse_str(r#"return { mouse = { right_click = "menu" } }"#).unwrap_err();
-        assert!(error.contains("mouse.right_click") && error.contains("paste"), "{error}");
+        assert!(
+            error.contains("mouse.right_click") && error.contains("paste"),
+            "{error}"
+        );
 
         for bad in ["0", "101"] {
-            let error = parse_str(&format!("return {{ mouse = {{ scroll_lines = {bad} }} }}")).unwrap_err();
+            let error =
+                parse_str(&format!("return {{ mouse = {{ scroll_lines = {bad} }} }}")).unwrap_err();
             assert!(error.contains("mouse.scroll_lines"), "{error}");
         }
     }
@@ -1138,7 +1383,9 @@ mod tests {
         // Arrastrar sin modificadores ya es seleccionar
         let error = parse_str(r#"return { mouse = { rectangle_modifiers = "" } }"#).unwrap_err();
         assert!(error.contains("mouse.rectangle_modifiers"), "{error}");
-        let error = parse_str(r#"return { window = { decorations = "none", drag_modifiers = "" } }"#).unwrap_err();
+        let error =
+            parse_str(r#"return { window = { decorations = "none", drag_modifiers = "" } }"#)
+                .unwrap_err();
         assert!(error.contains("window.drag_modifiers"), "{error}");
         // Si son iguales no habría forma de saber cuál se pide
         let error = parse_str(
@@ -1155,10 +1402,22 @@ mod tests {
         use winit::keyboard::{Key, NamedKey};
         let script = script_from("return {}").unwrap();
         let named = |key: NamedKey| Key::Named(key);
-        assert!(matches!(script.binding(&char_key("C"), actions::CTRL | actions::SHIFT), Some(actions::Action::Copy)));
-        assert!(matches!(script.binding(&named(NamedKey::Insert), actions::CTRL), Some(actions::Action::Copy)));
-        assert!(matches!(script.binding(&char_key("v"), actions::CTRL | actions::SHIFT), Some(actions::Action::Paste)));
-        assert!(matches!(script.binding(&named(NamedKey::Insert), actions::SHIFT), Some(actions::Action::Paste)));
+        assert!(matches!(
+            script.binding(&char_key("C"), actions::CTRL | actions::SHIFT),
+            Some(actions::Action::Copy)
+        ));
+        assert!(matches!(
+            script.binding(&named(NamedKey::Insert), actions::CTRL),
+            Some(actions::Action::Copy)
+        ));
+        assert!(matches!(
+            script.binding(&char_key("v"), actions::CTRL | actions::SHIFT),
+            Some(actions::Action::Paste)
+        ));
+        assert!(matches!(
+            script.binding(&named(NamedKey::Insert), actions::SHIFT),
+            Some(actions::Action::Paste)
+        ));
         assert!(matches!(
             script.binding(&named(NamedKey::PageUp), actions::SHIFT),
             Some(actions::Action::ScrollPages { amount: -1 })
@@ -1174,7 +1433,11 @@ mod tests {
     #[test]
     fn default_keys_can_be_disabled_or_overridden() {
         let disabled = script_from("return { disable_default_keys = true }").unwrap();
-        assert!(disabled.binding(&char_key("v"), actions::CTRL | actions::SHIFT).is_none());
+        assert!(
+            disabled
+                .binding(&char_key("v"), actions::CTRL | actions::SHIFT)
+                .is_none()
+        );
 
         // Con las de por defecto desactivadas, las del usuario siguen funcionando
         let only_mine = script_from(
@@ -1182,8 +1445,15 @@ mod tests {
                         keys = { { key = "v", mods = "CTRL", action = "Paste" } } }"#,
         )
         .unwrap();
-        assert!(matches!(only_mine.binding(&char_key("v"), actions::CTRL), Some(actions::Action::Paste)));
-        assert!(only_mine.binding(&char_key("v"), actions::CTRL | actions::SHIFT).is_none());
+        assert!(matches!(
+            only_mine.binding(&char_key("v"), actions::CTRL),
+            Some(actions::Action::Paste)
+        ));
+        assert!(
+            only_mine
+                .binding(&char_key("v"), actions::CTRL | actions::SHIFT)
+                .is_none()
+        );
 
         // Una tecla del usuario sustituye a la de por defecto con la misma combinación
         let overridden = script_from(
@@ -1195,7 +1465,10 @@ mod tests {
             Some(actions::Action::SendString { text }) if text == "copiar\r"
         ));
         // ...y el resto de las de por defecto se conservan
-        assert!(matches!(overridden.binding(&char_key("v"), actions::CTRL | actions::SHIFT), Some(actions::Action::Paste)));
+        assert!(matches!(
+            overridden.binding(&char_key("v"), actions::CTRL | actions::SHIFT),
+            Some(actions::Action::Paste)
+        ));
 
         // Dos teclas del usuario con la misma combinación siguen siendo un error
         let error = script_from(
@@ -1211,7 +1484,8 @@ mod tests {
     fn the_shell_integration_is_on_by_default_and_can_be_turned_off() {
         assert!(Config::default().shell.integration);
         assert!(parse_str("return {}").unwrap().shell.integration);
-        let config = parse_str(r#"return { shell = { program = "pwsh", integration = false } }"#).unwrap();
+        let config =
+            parse_str(r#"return { shell = { program = "pwsh", integration = false } }"#).unwrap();
         assert!(!config.shell.integration);
         let error = parse_str(r#"return { shell = { integracion = true } }"#).unwrap_err();
         assert!(error.contains("integracion"), "{error}");
@@ -1220,7 +1494,10 @@ mod tests {
     #[test]
     fn pane_options_have_defaults_and_are_read() {
         let defaults = Config::default();
-        assert_eq!((defaults.panes.border_color, defaults.panes.focus_color), (None, None));
+        assert_eq!(
+            (defaults.panes.border_color, defaults.panes.focus_color),
+            (None, None)
+        );
         assert!((defaults.panes.inactive_dim - 0.35).abs() < 1e-6);
 
         let config = parse_str(
@@ -1234,7 +1511,8 @@ mod tests {
         assert!(parse_str("return { panes = { inactive_dim = 0 } }").is_ok());
         assert!(parse_str("return { panes = { inactive_dim = 1 } }").is_ok());
         for bad in ["-0.1", "1.5"] {
-            let error = parse_str(&format!("return {{ panes = {{ inactive_dim = {bad} }} }}")).unwrap_err();
+            let error =
+                parse_str(&format!("return {{ panes = {{ inactive_dim = {bad} }} }}")).unwrap_err();
             assert!(error.contains("panes.inactive_dim"), "{error}");
         }
         let error = parse_str("return { panes = { borde = 1 } }").unwrap_err();
@@ -1258,12 +1536,33 @@ mod tests {
             } }"#,
         )
         .unwrap();
-        let at = |key: &str| script.binding(&char_key(key), actions::CTRL | actions::ALT).cloned();
+        let at = |key: &str| {
+            script
+                .binding(&char_key(key), actions::CTRL | actions::ALT)
+                .cloned()
+        };
         assert!(matches!(at("d"), Some(Action::SplitRight)));
         assert!(matches!(at("e"), Some(Action::SplitDown)));
-        assert!(matches!(at("h"), Some(Action::FocusPane { dir: Direction::Left })));
-        assert!(matches!(at("l"), Some(Action::ResizePane { dir: Direction::Right, amount: 5 })));
-        assert!(matches!(at("k"), Some(Action::ResizePane { dir: Direction::Up, amount: 1 })));
+        assert!(matches!(
+            at("h"),
+            Some(Action::FocusPane {
+                dir: Direction::Left
+            })
+        ));
+        assert!(matches!(
+            at("l"),
+            Some(Action::ResizePane {
+                dir: Direction::Right,
+                amount: 5
+            })
+        ));
+        assert!(matches!(
+            at("k"),
+            Some(Action::ResizePane {
+                dir: Direction::Up,
+                amount: 1
+            })
+        ));
         assert!(matches!(at("z"), Some(Action::ToggleZoom)));
         assert!(matches!(at("x"), Some(Action::ClosePane)));
         assert!(matches!(at("n"), Some(Action::FocusNext)));
@@ -1290,9 +1589,18 @@ mod tests {
             } }"#,
         )
         .unwrap();
-        assert!(matches!(script.binding(&char_key("a"), actions::CTRL | actions::ALT), Some(actions::Action::SelectAll)));
-        assert!(matches!(script.binding(&char_key("x"), actions::CTRL | actions::ALT), Some(actions::Action::ClearSelection)));
-        assert!(matches!(script.binding(&char_key("y"), actions::CTRL | actions::ALT), Some(actions::Action::Copy)));
+        assert!(matches!(
+            script.binding(&char_key("a"), actions::CTRL | actions::ALT),
+            Some(actions::Action::SelectAll)
+        ));
+        assert!(matches!(
+            script.binding(&char_key("x"), actions::CTRL | actions::ALT),
+            Some(actions::Action::ClearSelection)
+        ));
+        assert!(matches!(
+            script.binding(&char_key("y"), actions::CTRL | actions::ALT),
+            Some(actions::Action::Copy)
+        ));
     }
 
     #[test]
@@ -1306,21 +1614,41 @@ mod tests {
         let error = script_from(r#"return { keys = { { key = "v", action = "Paste" }, { key = "PagUp", action = "Paste" } } }"#)
             .err()
             .unwrap();
-        assert!(error.contains("keys[2].key") && error.contains("PagUp"), "{error}");
+        assert!(
+            error.contains("keys[2].key") && error.contains("PagUp"),
+            "{error}"
+        );
 
-        let error = script_from(r#"return { keys = { { key = "v", mods = "CTRL|HYPER", action = "Paste" } } }"#).err().unwrap();
-        assert!(error.contains("keys[1].mods") && error.contains("HYPER"), "{error}");
+        let error = script_from(
+            r#"return { keys = { { key = "v", mods = "CTRL|HYPER", action = "Paste" } } }"#,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("keys[1].mods") && error.contains("HYPER"),
+            "{error}"
+        );
 
-        let error = script_from(r#"return { keys = { { key = "v", action = "Pegar" } } }"#).err().unwrap();
-        assert!(error.contains("keys[1].action") && error.contains("Pegar"), "{error}");
+        let error = script_from(r#"return { keys = { { key = "v", action = "Pegar" } } }"#)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("keys[1].action") && error.contains("Pegar"),
+            "{error}"
+        );
 
-        let error = script_from(r#"return { keys = { { key = "v" } } }"#).err().unwrap();
+        let error = script_from(r#"return { keys = { { key = "v" } } }"#)
+            .err()
+            .unwrap();
         assert!(error.contains("keys[1].action"), "{error}");
 
         let error = script_from(r#"return { keys = { { key = "v", action = "Paste" }, { key = "V", action = "Quit" } } }"#)
             .err()
             .unwrap();
-        assert!(error.contains("keys[2]") && error.contains("ya estaba enlazada"), "{error}");
+        assert!(
+            error.contains("keys[2]") && error.contains("ya estaba enlazada"),
+            "{error}"
+        );
 
         let error = script_from(r#"return { keys = "nada" }"#).err().unwrap();
         assert!(error.contains("keys debe ser"), "{error}");
@@ -1336,10 +1664,20 @@ mod tests {
         assert!(script.has_handler(actions::EventKind::TitleChanged));
         assert!(!script.has_handler(actions::EventKind::ShellExit));
 
-        let error = script_from(r#"return { events = { ["campana"] = function() end } }"#).err().unwrap();
-        assert!(error.contains("campana") && error.contains("bell"), "{error}");
-        let error = script_from(r#"return { events = { ["bell"] = "no soy una función" } }"#).err().unwrap();
-        assert!(error.contains("bell") && error.contains("función"), "{error}");
+        let error = script_from(r#"return { events = { ["campana"] = function() end } }"#)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("campana") && error.contains("bell"),
+            "{error}"
+        );
+        let error = script_from(r#"return { events = { ["bell"] = "no soy una función" } }"#)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("bell") && error.contains("función"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1374,7 +1712,11 @@ mod tests {
         .unwrap();
         // El error del hook se registra y no sale: lo que pidió antes de fallar es lo único que queda
         assert!(script.fire(actions::EventKind::Bell, vec![]).is_empty());
-        assert!(script.fire(actions::EventKind::ShellExit, vec![]).is_empty());
+        assert!(
+            script
+                .fire(actions::EventKind::ShellExit, vec![])
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1382,7 +1724,11 @@ mod tests {
         let started = std::time::Instant::now();
         let error = script_from("while true do end").err().unwrap();
         assert!(error.contains("demasiado"), "{error}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1432,13 +1778,18 @@ mod tests {
         step(&script, &mut state, &char_key("b"), actions::CTRL);
         assert!(matches!(
             step(&script, &mut state, &char_key("g"), 0),
-            actions::LeaderOutcome::Run(actions::Action::NewFloat { program: Some(_), .. })
+            actions::LeaderOutcome::Run(actions::Action::NewFloat {
+                program: Some(_),
+                ..
+            })
         ));
     }
 
     #[test]
     fn missing_file_gives_defaults() {
-        let path = std::env::temp_dir().join("terminal-no-existe").join("config.lua");
+        let path = std::env::temp_dir()
+            .join("terminal-no-existe")
+            .join("config.lua");
         let (config, _script) = load_script_path(&path).unwrap();
         assert_eq!(config, Config::default());
     }

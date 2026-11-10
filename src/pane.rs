@@ -45,7 +45,11 @@ const DEVICE_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
 };
 
 // Colores de fábrica de libghostty (medidos: texto blanco sobre fondo negro)
-const DEFAULT_FOREGROUND: RgbColor = RgbColor { r: 255, g: 255, b: 255 };
+const DEFAULT_FOREGROUND: RgbColor = RgbColor {
+    r: 255,
+    g: 255,
+    b: 255,
+};
 const DEFAULT_BACKGROUND: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
 
 /// Colores y cursor por defecto de la configuración.
@@ -56,8 +60,10 @@ const DEFAULT_BACKGROUND: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
 /// Así, quitar una línea de config.lua al recargar devuelve los colores de fábrica.
 pub fn apply_theme(terminal: &mut Terminal<'static, 'static>, config: &Config) {
     let colors = &config.colors;
-    let _ = terminal.set_default_fg_color(Some(colors.foreground.map_or(DEFAULT_FOREGROUND, |c| c.0)));
-    let _ = terminal.set_default_bg_color(Some(colors.background.map_or(DEFAULT_BACKGROUND, |c| c.0)));
+    let _ =
+        terminal.set_default_fg_color(Some(colors.foreground.map_or(DEFAULT_FOREGROUND, |c| c.0)));
+    let _ =
+        terminal.set_default_bg_color(Some(colors.background.map_or(DEFAULT_BACKGROUND, |c| c.0)));
     let _ = terminal.set_default_cursor_color(colors.cursor.map(|c| c.0));
 
     let palette = colors.ansi.as_ref().map(|ansi| {
@@ -106,7 +112,14 @@ fn runs_a_command(args: &[String]) -> bool {
         let name = arg.trim_start_matches(['-', '/']).to_ascii_lowercase();
         matches!(
             name.as_str(),
-            "c" | "command" | "commandwithargs" | "cwa" | "f" | "file" | "e" | "ec" | "encodedcommand"
+            "c" | "command"
+                | "commandwithargs"
+                | "cwa"
+                | "f"
+                | "file"
+                | "e"
+                | "ec"
+                | "encodedcommand"
         )
     })
 }
@@ -116,9 +129,11 @@ fn runs_a_command(args: &[String]) -> bool {
 fn with_integration(mut shell: ShellConfig) -> ShellConfig {
     let powershell = shell.program.as_deref().is_some_and(is_powershell);
     if shell.integration && powershell && !runs_a_command(&shell.args) {
-        shell
-            .args
-            .extend(["-NoExit".to_string(), "-Command".to_string(), PWSH_OSC7.to_string()]);
+        shell.args.extend([
+            "-NoExit".to_string(),
+            "-Command".to_string(),
+            PWSH_OSC7.to_string(),
+        ]);
     }
     shell
 }
@@ -163,7 +178,10 @@ pub fn write_notice(terminal: &mut Terminal<'static, 'static>, tag: &str, messag
         .chars()
         .filter(|c| *c == '\n' || !c.is_control())
         .collect();
-    let notice = format!("\x1b[1;31m[{tag}]\x1b[0m {}\r\n", clean.replace('\n', "\r\n"));
+    let notice = format!(
+        "\x1b[1;31m[{tag}]\x1b[0m {}\r\n",
+        clean.replace('\n', "\r\n")
+    );
     terminal.vt_write(notice.as_bytes());
 }
 
@@ -178,7 +196,9 @@ fn reported_path(value: &str) -> Option<String> {
         return osc7_path(value);
     }
     let path = value.trim().trim_matches('"');
-    std::path::Path::new(path).is_absolute().then(|| path.to_string())
+    std::path::Path::new(path)
+        .is_absolute()
+        .then(|| path.to_string())
 }
 
 /// La ruta de un URI de directorio de OSC 7 ("file://host/C:/ruta%20con%20espacios", con o sin
@@ -202,8 +222,13 @@ fn osc7_path(uri: &str) -> Option<String> {
     }
     let text = String::from_utf8(decoded).ok()?;
     let drive_path = text.as_bytes();
-    let windows_drive = cfg!(windows) && drive_path.len() >= 3 && drive_path[0] == b'/' && drive_path[2] == b':';
-    Some(if windows_drive { text[1..].to_string() } else { text })
+    let windows_drive =
+        cfg!(windows) && drive_path.len() >= 3 && drive_path[0] == b'/' && drive_path[2] == b':';
+    Some(if windows_drive {
+        text[1..].to_string()
+    } else {
+        text
+    })
 }
 
 /// Directorio que el shell de un terminal informó con OSC 7, si existe
@@ -514,7 +539,12 @@ mod tests {
     fn seen(
         state: &mut RenderState<'static>,
         terminal: &Terminal<'static, 'static>,
-    ) -> (Rgb, Rgb, Rgb, Option<libghostty_vt::render::CursorVisualStyle>) {
+    ) -> (
+        Rgb,
+        Rgb,
+        Rgb,
+        Option<libghostty_vt::render::CursorVisualStyle>,
+    ) {
         let snapshot = state.update(terminal).unwrap();
         let colors = snapshot.colors().unwrap();
         let rgb = |c: RgbColor| (c.r, c.g, c.b);
@@ -543,7 +573,10 @@ mod tests {
         let factory = seen(&mut state, &terminal);
 
         // Solo fondo: libghostty lo ignoraría si el texto no se fijara también
-        apply_theme(&mut terminal, &config_from(r##"return { colors = { background = "#1e1e2e" } }"##));
+        apply_theme(
+            &mut terminal,
+            &config_from(r##"return { colors = { background = "#1e1e2e" } }"##),
+        );
         let themed = seen(&mut state, &terminal);
         assert_eq!(themed.1, (0x1e, 0x1e, 0x2e));
         assert_eq!(themed.0, factory.0, "el texto conserva el color de fábrica");
@@ -557,7 +590,10 @@ mod tests {
         );
         let custom = seen(&mut state, &terminal);
         assert_eq!(custom.2, (1, 2, 3));
-        assert_eq!(custom.3, Some(libghostty_vt::render::CursorVisualStyle::Bar));
+        assert_eq!(
+            custom.3,
+            Some(libghostty_vt::render::CursorVisualStyle::Bar)
+        );
 
         // Quitar todo (recargar una config vacía) devuelve el aspecto de fábrica
         apply_theme(&mut terminal, &Config::default());
@@ -575,9 +611,22 @@ mod tests {
 
     #[test]
     fn powershell_gets_the_directory_integration_appended_to_its_arguments() {
-        for program in ["pwsh", "pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe", "PowerShell.EXE"] {
-            let result = with_integration(shell(Some(program), &["-NoLogo", "-ExecutionPolicy", "Bypass"], true));
-            assert_eq!(result.args[..3], ["-NoLogo", "-ExecutionPolicy", "Bypass"], "{program}");
+        for program in [
+            "pwsh",
+            "pwsh.exe",
+            "C:/Program Files/PowerShell/7/pwsh.exe",
+            "PowerShell.EXE",
+        ] {
+            let result = with_integration(shell(
+                Some(program),
+                &["-NoLogo", "-ExecutionPolicy", "Bypass"],
+                true,
+            ));
+            assert_eq!(
+                result.args[..3],
+                ["-NoLogo", "-ExecutionPolicy", "Bypass"],
+                "{program}"
+            );
             assert_eq!(result.args[3..5], ["-NoExit", "-Command"], "{program}");
             assert_eq!(result.args[5], PWSH_OSC7);
             assert_eq!(result.args.len(), 6);
@@ -607,27 +656,49 @@ mod tests {
             assert_eq!(with_integration(original.clone()), original, "{args:?}");
         }
         // `-ExecutionPolicy` empieza por -e pero no es un comando
-        assert!(with_integration(shell(Some("pwsh"), &["-ExecutionPolicy", "Bypass"], true)).args.len() > 2);
+        assert!(
+            with_integration(shell(Some("pwsh"), &["-ExecutionPolicy", "Bypass"], true))
+                .args
+                .len()
+                > 2
+        );
     }
 
     #[test]
     fn the_powershell_script_survives_the_windows_command_line() {
         assert!(!PWSH_OSC7.contains('\n'), "una sola línea");
         assert!(!PWSH_OSC7.contains('"'), "sin comillas dobles");
-        assert!(!PWSH_OSC7.ends_with('\\'), "una barra al final se comería la comilla que cierra el argumento");
+        assert!(
+            !PWSH_OSC7.ends_with('\\'),
+            "una barra al final se comería la comilla que cierra el argumento"
+        );
         // La función `prompt` original se llama antes que nada: starship lee `$?` en su primera línea
-        let call = PWSH_OSC7.find("$text = & $global:__terminal_prompt").unwrap();
+        let call = PWSH_OSC7
+            .find("$text = & $global:__terminal_prompt")
+            .unwrap();
         let first_statement_in_prompt = PWSH_OSC7.find("function global:prompt {").unwrap();
         assert!(call > first_statement_in_prompt);
-        assert!(!PWSH_OSC7[first_statement_in_prompt..call].contains(';'), "nada entre la entrada y la llamada");
+        assert!(
+            !PWSH_OSC7[first_statement_in_prompt..call].contains(';'),
+            "nada entre la entrada y la llamada"
+        );
         assert!(PWSH_OSC7.contains("]7;file://localhost/"));
     }
 
     #[test]
     fn osc7_uris_become_paths() {
-        assert_eq!(osc7_path("file:///usr/local/bin").as_deref(), Some("/usr/local/bin"));
-        assert_eq!(osc7_path("file://mi-pc/home/yo").as_deref(), Some("/home/yo"));
-        assert_eq!(osc7_path("file:///home/mi%20carpeta/%C3%B1").as_deref(), Some("/home/mi carpeta/ñ"));
+        assert_eq!(
+            osc7_path("file:///usr/local/bin").as_deref(),
+            Some("/usr/local/bin")
+        );
+        assert_eq!(
+            osc7_path("file://mi-pc/home/yo").as_deref(),
+            Some("/home/yo")
+        );
+        assert_eq!(
+            osc7_path("file:///home/mi%20carpeta/%C3%B1").as_deref(),
+            Some("/home/mi carpeta/ñ")
+        );
         assert_eq!(osc7_path("http://example.com/x"), None);
         assert_eq!(osc7_path("file://sin-ruta"), None);
         assert_eq!(osc7_path("file:///mal%2"), None);
@@ -637,9 +708,16 @@ mod tests {
 
     #[test]
     fn a_plain_absolute_path_is_accepted_as_osc_9_9_does() {
-        let absolute = if cfg!(windows) { r"C:\Users\yo" } else { "/home/yo" };
+        let absolute = if cfg!(windows) {
+            r"C:\Users\yo"
+        } else {
+            "/home/yo"
+        };
         assert_eq!(reported_path(absolute).as_deref(), Some(absolute));
-        assert_eq!(reported_path(&format!("\"{absolute}\"")).as_deref(), Some(absolute));
+        assert_eq!(
+            reported_path(&format!("\"{absolute}\"")).as_deref(),
+            Some(absolute)
+        );
         assert_eq!(reported_path("relativa/ruta"), None);
         assert_eq!(reported_path(""), None);
         // Un URI inválido no se interpreta como ruta
@@ -662,8 +740,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn osc7_windows_drive_paths_lose_the_leading_slash() {
-        assert_eq!(osc7_path("file:///C:/Users/yo").as_deref(), Some("C:/Users/yo"));
-        assert_eq!(osc7_path("file://PC/C:/Users/yo%20x").as_deref(), Some("C:/Users/yo x"));
+        assert_eq!(
+            osc7_path("file:///C:/Users/yo").as_deref(),
+            Some("C:/Users/yo")
+        );
+        assert_eq!(
+            osc7_path("file://PC/C:/Users/yo%20x").as_deref(),
+            Some("C:/Users/yo x")
+        );
     }
 
     #[test]
@@ -698,13 +782,18 @@ mod tests {
         })
         .unwrap();
         let mut state = RenderState::new().unwrap();
-        let entry = |state: &mut RenderState<'static>, terminal: &Terminal<'static, 'static>, index: usize| {
+        let entry = |state: &mut RenderState<'static>,
+                     terminal: &Terminal<'static, 'static>,
+                     index: usize| {
             let snapshot = state.update(terminal).unwrap();
             let color = snapshot.colors().unwrap().palette[index];
             (color.r, color.g, color.b)
         };
         apply_theme(&mut terminal, &Config::default());
-        let factory = (entry(&mut state, &terminal, 16), entry(&mut state, &terminal, 17));
+        let factory = (
+            entry(&mut state, &terminal, 16),
+            entry(&mut state, &terminal, 17),
+        );
 
         apply_theme(
             &mut terminal,
@@ -718,6 +807,12 @@ mod tests {
 
         // Al quitar la paleta propia vuelven los de fábrica
         apply_theme(&mut terminal, &Config::default());
-        assert_eq!((entry(&mut state, &terminal, 16), entry(&mut state, &terminal, 17)), factory);
+        assert_eq!(
+            (
+                entry(&mut state, &terminal, 16),
+                entry(&mut state, &terminal, 17)
+            ),
+            factory
+        );
     }
 }

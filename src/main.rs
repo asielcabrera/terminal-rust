@@ -67,7 +67,9 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CONFIG_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 fn modified_time(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 /// Vigila el archivo de configuración comparando su fecha de modificación. Es un solo archivo, así
@@ -218,7 +220,10 @@ impl App {
         if !self.config.panes.inherit_cwd {
             return None;
         }
-        self.panes.iter().find(|pane| pane.id == from)?.current_dir()
+        self.panes
+            .iter()
+            .find(|pane| pane.id == from)?
+            .current_dir()
     }
 
     /// Divide el panel con foco (o, desde un flotante, el último del mosaico) y da el foco al nuevo
@@ -284,8 +289,11 @@ impl App {
             .or_else(|| self.inherited_cwd(self.layout.focus()));
         let id = PaneId(self.next_pane_id);
         let panes = &self.config.panes;
-        self.layout
-            .add_float(id, width.unwrap_or(panes.float_width), height.unwrap_or(panes.float_height));
+        self.layout.add_float(
+            id,
+            width.unwrap_or(panes.float_width),
+            height.unwrap_or(panes.float_height),
+        );
         let Some(rect) = self.layout.float_rect(id, area) else {
             return;
         };
@@ -391,10 +399,13 @@ impl App {
             Direction::Up | Direction::Down => cell_height,
         };
         let focus = self.layout.focus();
-        if self
-            .layout
-            .resize(focus, layout_dir(direction), u32::from(amount) * step, area, limits)
-        {
+        if self.layout.resize(
+            focus,
+            layout_dir(direction),
+            u32::from(amount) * step,
+            area,
+            limits,
+        ) {
             self.relayout(area);
         }
     }
@@ -657,7 +668,11 @@ impl App {
             }
         };
         self.clear_selection();
-        let bracketed = self.focused().terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+        let bracketed = self
+            .focused()
+            .terminal
+            .mode(Mode::BRACKETED_PASTE)
+            .unwrap_or(false);
         let mut data = text.into_bytes();
         let mut buffer = vec![0u8; data.len() + 32];
         loop {
@@ -765,7 +780,9 @@ impl App {
             || new.window.rows != self.config.window.rows
             || new.shell != self.config.shell
         {
-            eprintln!("[config] scrollback, window.columns/rows y shell solo se aplican al arrancar");
+            eprintln!(
+                "[config] scrollback, window.columns/rows y shell solo se aplican al arrancar"
+            );
         }
         self.config = new;
         // Las teclas y los hooks nuevos sustituyen a los anteriores (con su intérprete de Lua), y
@@ -868,7 +885,12 @@ impl App {
         let order = self.layout.visible_ids();
         let several = order.len() > 1;
         let leader_pending = self.leader.pending();
-        let floating: Vec<PaneId> = self.panes.iter().map(|pane| pane.id).filter(|&id| self.layout.is_float(id)).collect();
+        let floating: Vec<PaneId> = self
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .filter(|&id| self.layout.is_float(id))
+            .collect();
         let dividers = self.divider_rects();
         let Some(renderer) = &mut self.renderer else {
             return;
@@ -964,10 +986,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let padding = 2 * renderer.padding();
                 let columns = u32::from(window_config.columns.unwrap_or(DEFAULT_COLUMNS));
                 let rows = u32::from(window_config.rows.unwrap_or(DEFAULT_ROWS));
-                let wanted = PhysicalSize::new(
-                    columns * cell_width + padding,
-                    rows * cell_height + padding,
-                );
+                let wanted =
+                    PhysicalSize::new(columns * cell_width + padding, rows * cell_height + padding);
                 size = window.request_inner_size(wanted).unwrap_or(size);
             }
 
@@ -1003,10 +1023,14 @@ impl ApplicationHandler<UserEvent> for App {
     /// enfocada) o el siguiente paso del autodesplazamiento de una selección.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let blink = (self.cursor_blinks && self.focused).then(|| self.blink.deadline());
-        let next = [blink, self.mouse.autoscroll_deadline, self.leader.deadline()]
-            .into_iter()
-            .flatten()
-            .min();
+        let next = [
+            blink,
+            self.mouse.autoscroll_deadline,
+            self.leader.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         event_loop.set_control_flow(match next {
             Some(deadline) => ControlFlow::WaitUntil(deadline),
             None => ControlFlow::Wait,

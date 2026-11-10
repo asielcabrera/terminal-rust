@@ -280,7 +280,9 @@ impl Node {
         }
         match self {
             Node::Leaf(_) => false,
-            Node::Split { a, b, .. } => a.split_leaf(target, axis, new_id) || b.split_leaf(target, axis, new_id),
+            Node::Split { a, b, .. } => {
+                a.split_leaf(target, axis, new_id) || b.split_leaf(target, axis, new_id)
+            }
         }
     }
 
@@ -417,7 +419,10 @@ impl Layout {
     }
 
     fn recency(&self, id: PaneId) -> i64 {
-        self.history.iter().position(|&other| other == id).map_or(-1, |index| index as i64)
+        self.history
+            .iter()
+            .position(|&other| other == id)
+            .map_or(-1, |index| index as i64)
     }
 
     /// Da el foco a un panel. Un flotante sube al primer plano; pasar a otro panel del mosaico
@@ -459,12 +464,23 @@ impl Layout {
     /// Panel del mosaico al que afecta un split: el enfocado o, si el foco está en un flotante,
     /// el último del mosaico que lo tuvo
     pub fn split_target(&self) -> PaneId {
-        if self.is_float(self.focus) { self.last_tiled() } else { self.focus }
+        if self.is_float(self.focus) {
+            self.last_tiled()
+        } else {
+            self.focus
+        }
     }
 
     /// Divide el panel `target` del mosaico en dos y da el foco al nuevo. `false` si `target` no
     /// está en el mosaico o si las dos mitades quedarían por debajo del tamaño mínimo.
-    pub fn split(&mut self, target: PaneId, axis: Axis, new_id: PaneId, area: Rect, limits: Limits) -> bool {
+    pub fn split(
+        &mut self,
+        target: PaneId,
+        axis: Axis,
+        new_id: PaneId,
+        area: Rect,
+        limits: Limits,
+    ) -> bool {
         let before = self.zoomed.take();
         let Some((_, rect)) = self.rects(area).into_iter().find(|(id, _)| *id == target) else {
             self.zoomed = before;
@@ -472,7 +488,10 @@ impl Layout {
         };
         // Con el zoom puesto `rects` solo devolvía el ampliado: se recalcula sin zoom
         let rect = if before.is_some() {
-            self.rects(area).into_iter().find(|(id, _)| *id == target).map_or(rect, |(_, r)| r)
+            self.rects(area)
+                .into_iter()
+                .find(|(id, _)| *id == target)
+                .map_or(rect, |(_, r)| r)
         } else {
             rect
         };
@@ -536,7 +555,8 @@ impl Layout {
         }
         let mut rects = Vec::new();
         let mut dividers = Vec::new();
-        self.root.layout(area, &mut Vec::new(), &mut rects, &mut dividers);
+        self.root
+            .layout(area, &mut Vec::new(), &mut rects, &mut dividers);
         rects
     }
 
@@ -547,7 +567,8 @@ impl Layout {
         }
         let mut rects = Vec::new();
         let mut dividers = Vec::new();
-        self.root.layout(area, &mut Vec::new(), &mut rects, &mut dividers);
+        self.root
+            .layout(area, &mut Vec::new(), &mut rects, &mut dividers);
         dividers
     }
 
@@ -588,7 +609,13 @@ impl Layout {
                 };
                 (shared > 0).then_some((id, distance, shared))
             })
-            .min_by_key(|&(id, distance, shared)| (distance, std::cmp::Reverse(shared), std::cmp::Reverse(self.recency(id))))
+            .min_by_key(|&(id, distance, shared)| {
+                (
+                    distance,
+                    std::cmp::Reverse(shared),
+                    std::cmp::Reverse(self.recency(id)),
+                )
+            })
             .map(|(id, ..)| id);
         match best {
             Some(id) => self.set_focus(id),
@@ -717,7 +744,13 @@ impl Layout {
     }
 
     /// Arrastre de un divisor con el ratón: lleva el límite a la coordenada `boundary`
-    pub fn set_divider(&mut self, path: &[bool], boundary: i64, area: Rect, limits: Limits) -> bool {
+    pub fn set_divider(
+        &mut self,
+        path: &[bool],
+        boundary: i64,
+        area: Rect,
+        limits: Limits,
+    ) -> bool {
         let Some(rect) = self.node_rect(area, path) else {
             return false;
         };
@@ -833,8 +866,10 @@ impl Layout {
         };
         let max_x = i64::from(window.right() - rect.w);
         let max_y = i64::from(window.bottom() - rect.h);
-        let x = (i64::from(rect.x) + dx).clamp(i64::from(window.x), max_x.max(i64::from(window.x))) as u32;
-        let y = (i64::from(rect.y) + dy).clamp(i64::from(window.y), max_y.max(i64::from(window.y))) as u32;
+        let x = (i64::from(rect.x) + dx).clamp(i64::from(window.x), max_x.max(i64::from(window.x)))
+            as u32;
+        let y = (i64::from(rect.y) + dy).clamp(i64::from(window.y), max_y.max(i64::from(window.y)))
+            as u32;
         if (x, y) == (rect.x, rect.y) {
             return false;
         }
@@ -843,7 +878,14 @@ impl Layout {
     }
 
     /// Cambia el tamaño de un flotante moviendo su esquina inferior derecha
-    fn resize_float_by(&mut self, id: PaneId, dw: i64, dh: i64, window: Rect, limits: Limits) -> bool {
+    fn resize_float_by(
+        &mut self,
+        id: PaneId,
+        dw: i64,
+        dh: i64,
+        window: Rect,
+        limits: Limits,
+    ) -> bool {
         let Some(rect) = self.float_rect(id, window) else {
             return false;
         };
@@ -860,7 +902,15 @@ impl Layout {
 
     /// Arrastre del borde (o esquina) de un flotante con el ratón: `dx`/`dy` son lo que se movió
     /// el puntero desde el último evento
-    pub fn resize_float_edge(&mut self, id: PaneId, edge: Edge, dx: i64, dy: i64, window: Rect, limits: Limits) -> bool {
+    pub fn resize_float_edge(
+        &mut self,
+        id: PaneId,
+        edge: Edge,
+        dx: i64,
+        dy: i64,
+        window: Rect,
+        limits: Limits,
+    ) -> bool {
         let Some(rect) = self.float_rect(id, window) else {
             return false;
         };
@@ -868,18 +918,35 @@ impl Layout {
         let (mut top, mut bottom) = (i64::from(rect.y), i64::from(rect.bottom()));
         let (min_w, min_h) = (i64::from(limits.min_w), i64::from(limits.min_h));
         if edge.left {
-            left = (left + dx).clamp(i64::from(window.x), (right - min_w).max(i64::from(window.x)));
+            left = (left + dx).clamp(
+                i64::from(window.x),
+                (right - min_w).max(i64::from(window.x)),
+            );
         }
         if edge.right {
-            right = (right + dx).clamp((left + min_w).min(i64::from(window.right())), i64::from(window.right()));
+            right = (right + dx).clamp(
+                (left + min_w).min(i64::from(window.right())),
+                i64::from(window.right()),
+            );
         }
         if edge.top {
-            top = (top + dy).clamp(i64::from(window.y), (bottom - min_h).max(i64::from(window.y)));
+            top = (top + dy).clamp(
+                i64::from(window.y),
+                (bottom - min_h).max(i64::from(window.y)),
+            );
         }
         if edge.bottom {
-            bottom = (bottom + dy).clamp((top + min_h).min(i64::from(window.bottom())), i64::from(window.bottom()));
+            bottom = (bottom + dy).clamp(
+                (top + min_h).min(i64::from(window.bottom())),
+                i64::from(window.bottom()),
+            );
         }
-        let new = Rect::new(left as u32, top as u32, (right - left) as u32, (bottom - top) as u32);
+        let new = Rect::new(
+            left as u32,
+            top as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        );
         if new == rect {
             return false;
         }
@@ -910,19 +977,28 @@ impl Layout {
                 || f64::from(rect.right()) - x <= ring
                 || y - f64::from(rect.y) < ring
                 || f64::from(rect.bottom()) - y <= ring;
-            return if in_ring { Hit::FloatMove(id) } else { Hit::Pane(id) };
+            return if in_ring {
+                Hit::FloatMove(id)
+            } else {
+                Hit::Pane(id)
+            };
         }
         for divider in self.dividers(window) {
             let (along, across) = match divider.axis {
                 Axis::Horizontal => (y, x),
                 Axis::Vertical => (x, y),
             };
-            let inside = along >= f64::from(divider.start) && along < f64::from(divider.start + divider.len);
+            let inside =
+                along >= f64::from(divider.start) && along < f64::from(divider.start + divider.len);
             if inside && (across - f64::from(divider.pos)).abs() <= params.divider_zone {
                 return Hit::Divider(divider.path, divider.axis);
             }
         }
-        match self.rects(window).into_iter().find(|(_, rect)| rect.contains(x, y)) {
+        match self
+            .rects(window)
+            .into_iter()
+            .find(|(_, rect)| rect.contains(x, y))
+        {
             Some((id, _)) => Hit::Pane(id),
             None => Hit::None,
         }
@@ -934,7 +1010,10 @@ mod tests {
     use super::*;
 
     const WINDOW: Rect = Rect::new(0, 0, 801, 601);
-    const LIMITS: Limits = Limits { min_w: 80, min_h: 60 };
+    const LIMITS: Limits = Limits {
+        min_w: 80,
+        min_h: 60,
+    };
     const PARAMS: HitParams = HitParams {
         divider_zone: 4.0,
         edge_band: 6.0,
@@ -1110,7 +1189,11 @@ mod tests {
         // Un panel pegado al borde derecho "crece hacia la derecha" moviendo su borde izquierdo
         let width = rect_of(&layout, 2).w;
         assert!(layout.resize(id(2), Dir::Right, 20, WINDOW, LIMITS));
-        assert_eq!(rect_of(&layout, 2).w, width - 20, "encoge: no tiene borde a la derecha");
+        assert_eq!(
+            rect_of(&layout, 2).w,
+            width - 20,
+            "encoge: no tiene borde a la derecha"
+        );
         // Hacia el lado contrario crece
         assert!(layout.resize(id(2), Dir::Left, 20, WINDOW, LIMITS));
         assert_eq!(rect_of(&layout, 2).w, width);
@@ -1145,7 +1228,10 @@ mod tests {
         layout.split(id(1), Axis::Horizontal, id(2), WINDOW, LIMITS);
         layout.split(id(2), Axis::Horizontal, id(3), WINDOW, LIMITS);
         layout.resize(id(1), Dir::Right, 10_000, WINDOW, LIMITS);
-        assert_eq!(rect_of(&layout, 2).w + rect_of(&layout, 3).w, 2 * LIMITS.min_w);
+        assert_eq!(
+            rect_of(&layout, 2).w + rect_of(&layout, 3).w,
+            2 * LIMITS.min_w
+        );
         assert!(rect_of(&layout, 2).w >= LIMITS.min_w && rect_of(&layout, 3).w >= LIMITS.min_w);
     }
 
@@ -1239,7 +1325,10 @@ mod tests {
         assert!(layout.move_float(id(2), -10_000, -10_000, WINDOW));
         let rect = layout.float_rect(id(2), WINDOW).unwrap();
         assert_eq!((rect.x, rect.y), (0, 0));
-        assert!(!layout.move_float(id(2), -5, -5, WINDOW), "ya está en la esquina");
+        assert!(
+            !layout.move_float(id(2), -5, -5, WINDOW),
+            "ya está en la esquina"
+        );
         let doubled = Rect::new(0, 0, 1602, 1202);
         let big = layout.float_rect(id(2), doubled).unwrap();
         assert!((i64::from(big.w) - 2 * i64::from(rect.w)).abs() <= 2);
@@ -1250,10 +1339,17 @@ mod tests {
         let mut layout = Layout::new(id(1));
         layout.add_float(id(2), 0.5, 0.5);
         let start = layout.float_rect(id(2), WINDOW).unwrap();
-        let right = Edge { right: true, ..Edge::default() };
+        let right = Edge {
+            right: true,
+            ..Edge::default()
+        };
         assert!(layout.resize_float_edge(id(2), right, 40, 0, WINDOW, LIMITS));
         assert_eq!(layout.float_rect(id(2), WINDOW).unwrap().w, start.w + 40);
-        let top_left = Edge { left: true, top: true, ..Edge::default() };
+        let top_left = Edge {
+            left: true,
+            top: true,
+            ..Edge::default()
+        };
         assert!(layout.resize_float_edge(id(2), top_left, -20, -10, WINDOW, LIMITS));
         let now = layout.float_rect(id(2), WINDOW).unwrap();
         assert_eq!((now.x, now.y), (start.x - 20, start.y - 10));
@@ -1272,7 +1368,10 @@ mod tests {
         assert!(layout.resize(id(2), Dir::Right, 20, WINDOW, LIMITS));
         assert!(layout.resize(id(2), Dir::Up, 15, WINDOW, LIMITS));
         let now = layout.float_rect(id(2), WINDOW).unwrap();
-        assert_eq!((now.w, now.h, now.x, now.y), (start.w + 20, start.h - 15, start.x, start.y));
+        assert_eq!(
+            (now.w, now.h, now.x, now.y),
+            (start.w + 20, start.h - 15, start.x, start.y)
+        );
     }
 
     #[test]
@@ -1318,7 +1417,10 @@ mod tests {
         layout.set_focus(id(1));
         layout.add_float(id(3), 0.5, 0.5);
         assert_eq!(layout.split_target(), id(1));
-        assert!(!layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS), "un flotante no se divide");
+        assert!(
+            !layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS),
+            "un flotante no se divide"
+        );
     }
 
     #[test]
@@ -1326,7 +1428,13 @@ mod tests {
         let mut layout = Layout::new(id(1));
         layout.add_float(id(2), 0.5, 0.5);
         layout.add_float(id(3), 0.5, 0.5);
-        let order = |layout: &Layout| layout.float_rects(WINDOW).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let order = |layout: &Layout| {
+            layout
+                .float_rects(WINDOW)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(order(&layout), vec![id(2), id(3)]);
         layout.set_focus(id(2));
         assert_eq!(order(&layout), vec![id(3), id(2)]);
@@ -1351,31 +1459,70 @@ mod tests {
     fn hit_testing_prefers_floats_then_dividers_then_panes() {
         let mut layout = two_columns();
         let divider_x = f64::from(rect_of(&layout, 1).right());
-        assert_eq!(layout.hit_test(divider_x + 2.0, 100.0, WINDOW, PARAMS), Hit::Divider(vec![], Axis::Horizontal));
-        assert_eq!(layout.hit_test(divider_x - 100.0, 100.0, WINDOW, PARAMS), Hit::Pane(id(1)));
-        assert_eq!(layout.hit_test(divider_x + 100.0, 100.0, WINDOW, PARAMS), Hit::Pane(id(2)));
+        assert_eq!(
+            layout.hit_test(divider_x + 2.0, 100.0, WINDOW, PARAMS),
+            Hit::Divider(vec![], Axis::Horizontal)
+        );
+        assert_eq!(
+            layout.hit_test(divider_x - 100.0, 100.0, WINDOW, PARAMS),
+            Hit::Pane(id(1))
+        );
+        assert_eq!(
+            layout.hit_test(divider_x + 100.0, 100.0, WINDOW, PARAMS),
+            Hit::Pane(id(2))
+        );
         assert_eq!(layout.hit_test(-1.0, 10.0, WINDOW, PARAMS), Hit::None);
 
         layout.add_float(id(3), 0.5, 0.5);
         let float = layout.float_rect(id(3), WINDOW).unwrap();
-        let (cx, cy) = (f64::from(float.x + float.w / 2), f64::from(float.y + float.h / 2));
+        let (cx, cy) = (
+            f64::from(float.x + float.w / 2),
+            f64::from(float.y + float.h / 2),
+        );
         assert_eq!(layout.hit_test(cx, cy, WINDOW, PARAMS), Hit::Pane(id(3)));
         // El anillo mueve, la banda del borde redimensiona
-        assert_eq!(layout.hit_test(f64::from(float.x) + 8.0, cy, WINDOW, PARAMS), Hit::FloatMove(id(3)));
         assert_eq!(
-            layout.hit_test(f64::from(float.x) + 2.0, cy, WINDOW, PARAMS),
-            Hit::FloatResize(id(3), Edge { left: true, ..Edge::default() })
+            layout.hit_test(f64::from(float.x) + 8.0, cy, WINDOW, PARAMS),
+            Hit::FloatMove(id(3))
         );
         assert_eq!(
-            layout.hit_test(f64::from(float.right()) - 1.0, f64::from(float.bottom()) - 1.0, WINDOW, PARAMS),
-            Hit::FloatResize(id(3), Edge { right: true, bottom: true, ..Edge::default() })
+            layout.hit_test(f64::from(float.x) + 2.0, cy, WINDOW, PARAMS),
+            Hit::FloatResize(
+                id(3),
+                Edge {
+                    left: true,
+                    ..Edge::default()
+                }
+            )
+        );
+        assert_eq!(
+            layout.hit_test(
+                f64::from(float.right()) - 1.0,
+                f64::from(float.bottom()) - 1.0,
+                WINDOW,
+                PARAMS
+            ),
+            Hit::FloatResize(
+                id(3),
+                Edge {
+                    right: true,
+                    bottom: true,
+                    ..Edge::default()
+                }
+            )
         );
         // Un divisor tapado por el flotante no se agarra a través de él
         let hidden_divider = layout.hit_test(divider_x, cy, WINDOW, PARAMS);
-        assert!(matches!(hidden_divider, Hit::Pane(_) | Hit::FloatMove(_) | Hit::FloatResize(..)));
+        assert!(matches!(
+            hidden_divider,
+            Hit::Pane(_) | Hit::FloatMove(_) | Hit::FloatResize(..)
+        ));
         // Y ocultos los flotantes, se vuelve a ver lo de debajo
         layout.toggle_floats();
-        assert_eq!(layout.hit_test(divider_x, cy, WINDOW, PARAMS), Hit::Divider(vec![], Axis::Horizontal));
+        assert_eq!(
+            layout.hit_test(divider_x, cy, WINDOW, PARAMS),
+            Hit::Divider(vec![], Axis::Horizontal)
+        );
     }
 
     #[test]

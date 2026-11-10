@@ -262,7 +262,8 @@ impl Renderer {
             label: Some("terminal"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let rect_attributes = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4];
+        let rect_attributes =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4];
         let rect_pipeline = create_pipeline(
             &device,
             &shader,
@@ -353,7 +354,10 @@ impl Renderer {
     pub fn grid_size(&self, width: u32, height: u32) -> (u16, u16) {
         let cols = width.saturating_sub(2 * self.padding) / self.cache.cell_width;
         let rows = height.saturating_sub(2 * self.padding) / self.cache.cell_height;
-        (cols.clamp(1, u16::MAX.into()) as u16, rows.clamp(1, u16::MAX.into()) as u16)
+        (
+            cols.clamp(1, u16::MAX.into()) as u16,
+            rows.clamp(1, u16::MAX.into()) as u16,
+        )
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -432,9 +436,18 @@ impl Renderer {
                 // Amarillo ANSI por defecto: se distingue del marco normal del foco
                 Some(self.panes.leader.unwrap_or(colors.palette[3]))
             } else if view.frame {
-                Some(self.panes.focus.or(colors.cursor).unwrap_or(colors.foreground))
+                Some(
+                    self.panes
+                        .focus
+                        .or(colors.cursor)
+                        .unwrap_or(colors.foreground),
+                )
             } else if view.floating {
-                Some(self.panes.border.unwrap_or_else(|| mix(colors.foreground, colors.background, 0.75)))
+                Some(
+                    self.panes
+                        .border
+                        .unwrap_or_else(|| mix(colors.foreground, colors.background, 0.75)),
+                )
             } else {
                 None
             };
@@ -443,7 +456,11 @@ impl Renderer {
                 colors,
                 cursor,
                 rect: view.rect,
-                dim: if view.dim { self.panes.inactive_dim } else { 0.0 },
+                dim: if view.dim {
+                    self.panes.inactive_dim
+                } else {
+                    0.0
+                },
                 frame,
                 floating: view.floating,
             });
@@ -455,7 +472,10 @@ impl Renderer {
             return false;
         };
         // Los divisores, por defecto, son el color del texto muy apagado
-        let divider_color = self.panes.border.unwrap_or_else(|| mix(foreground, background, 0.75));
+        let divider_color = self
+            .panes
+            .border
+            .unwrap_or_else(|| mix(foreground, background, 0.75));
         let window = Rect::new(0, 0, self.config.width, self.config.height);
         let frame_thickness = 2 * self.cache.thickness.max(1);
 
@@ -466,9 +486,13 @@ impl Renderer {
             if !dividers.is_empty() {
                 let start = self.frame.lengths();
                 for rect in dividers {
-                    self.frame
-                        .backgrounds
-                        .push(RectInstance::new(rect.x, rect.y, rect.w, rect.h, divider_color));
+                    self.frame.backgrounds.push(RectInstance::new(
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        divider_color,
+                    ));
                 }
                 let end = self.frame.lengths();
                 self.frame.batches.push(Batch {
@@ -483,9 +507,13 @@ impl Renderer {
                 // Un flotante tapa por completo lo que hay debajo con el fondo del tema
                 if pane.floating {
                     let r = pane.rect;
-                    self.frame
-                        .backgrounds
-                        .push(RectInstance::new(r.x, r.y, r.w, r.h, pane.colors.background));
+                    self.frame.backgrounds.push(RectInstance::new(
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        pane.colors.background,
+                    ));
                 }
                 build_frame(
                     &pane.snapshot,
@@ -588,7 +616,8 @@ impl Renderer {
             // Un lote por panel, de abajo arriba: cada uno recortado a su rectángulo y con sus
             // fondos, texto y decoraciones en ese orden
             for batch in &self.frame.batches {
-                let Some(clip) = clip_to(batch.scissor, self.config.width, self.config.height) else {
+                let Some(clip) = clip_to(batch.scissor, self.config.width, self.config.height)
+                else {
                     continue;
                 };
                 pass.set_scissor_rect(clip.x, clip.y, clip.w, clip.h);
@@ -916,9 +945,13 @@ fn build_frame(
                 {
                     let color = c.color;
                     match c.style {
-                        CursorVisualStyle::Bar => frame
-                            .overlays
-                            .push(RectInstance::new(x, y, thickness * 2, cell_h, color)),
+                        CursorVisualStyle::Bar => frame.overlays.push(RectInstance::new(
+                            x,
+                            y,
+                            thickness * 2,
+                            cell_h,
+                            color,
+                        )),
                         CursorVisualStyle::Underline => frame.overlays.push(RectInstance::new(
                             x,
                             y + cell_h.saturating_sub(thickness * 2),
