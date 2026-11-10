@@ -25,6 +25,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -42,15 +44,23 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libfontconfig1-dev
       - run: cargo build --release --target ${{ matrix.target }}
       - name: Package
+        shell: bash
         run: |
           name="terminal-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/terminal" "$name/"
-          tar -czf "$name.tar.gz" "$name"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/terminal.exe" "$name/"
+            7z a "$name.zip" "$name"
+          else
+            cp "target/${{ matrix.target }}/release/terminal" "$name/"
+            tar -czf "$name.tar.gz" "$name"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
-          path: "*.tar.gz"
+          path: |
+            *.tar.gz
+            *.zip
 
   publish:
     needs: build
@@ -61,6 +71,8 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v3
         with:
-          files: "*.tar.gz"
+          files: |
+            *.tar.gz
+            *.zip
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
