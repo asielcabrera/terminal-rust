@@ -41,7 +41,7 @@ pub fn process_cwd(pid: i32) -> Option<PathBuf> {
 }
 
 /// Current directory of the process `pid`, if the system exposes it
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub fn process_cwd(_pid: i32) -> Option<PathBuf> {
     None
 }
