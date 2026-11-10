@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-latest]  # macos-26 breaks zig 0.15.2 linking (undefined _waitpid)
+        os: [macos-15, ubuntu-latest, windows-latest]  # macos-26 breaks zig 0.15.2 linking (undefined _waitpid)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

@@ -5,6 +5,7 @@ mod glyphs;
 mod layout;
 mod mouse;
 mod pane;
+#[cfg(unix)] // Windows has no API for another process' cwd; pane.rs only calls it on unix
 mod proc_cwd;
 mod renderer;
 
