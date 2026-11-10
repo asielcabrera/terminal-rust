@@ -158,7 +158,13 @@ pub fn gesture_time(elapsed: Duration, ticks_per_second: u64) -> Duration {
 
 /// Qué borde o esquina de una ventana de `width` x `height` está bajo `(x, y)`, con un borde
 /// sensible de `border` pixeles. Las esquinas mandan sobre los lados.
-pub fn resize_direction(x: f64, y: f64, width: f64, height: f64, border: f64) -> Option<ResizeDirection> {
+pub fn resize_direction(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    border: f64,
+) -> Option<ResizeDirection> {
     let left = x < border;
     let right = x >= width - border;
     let top = y < border;
@@ -187,7 +193,15 @@ fn resize_icon(direction: ResizeDirection) -> CursorIcon {
 
 /// Celda (columna, fila) bajo el punto `(x, y)` de la ventana. Fuera de la cuadrícula (en el margen
 /// o más allá) se queda en la celda más cercana, como hacen los terminales al arrastrar.
-pub fn cell_at(x: f64, y: f64, padding: f64, cell_width: u32, cell_height: u32, columns: u16, rows: u16) -> (u16, u16) {
+pub fn cell_at(
+    x: f64,
+    y: f64,
+    padding: f64,
+    cell_width: u32,
+    cell_height: u32,
+    columns: u16,
+    rows: u16,
+) -> (u16, u16) {
     let column = ((x - padding) / f64::from(cell_width.max(1))).floor();
     let row = ((y - padding) / f64::from(cell_height.max(1))).floor();
     let clamp = |value: f64, count: u16| value.clamp(0.0, f64::from(count.max(1) - 1)) as u16;
@@ -204,7 +218,12 @@ fn viewport_point(column: u16, row: u16) -> Point {
 /// Líneas que corresponden a un giro de rueda. Positivo = hacia arriba (ver el historial). Un
 /// `LineDelta` (rueda con muescas) vale `scroll_lines` líneas por muesca; un `PixelDelta` (touchpad)
 /// vale lo que mida en celdas. Lo que no llega a una línea entera se acumula en `remainder`.
-pub fn wheel_lines(delta: MouseScrollDelta, scroll_lines: u16, cell_height: u32, remainder: &mut f64) -> i32 {
+pub fn wheel_lines(
+    delta: MouseScrollDelta,
+    scroll_lines: u16,
+    cell_height: u32,
+    remainder: &mut f64,
+) -> i32 {
     let lines = match delta {
         MouseScrollDelta::LineDelta(_, y) => f64::from(y) * f64::from(scroll_lines),
         MouseScrollDelta::PixelDelta(position) => position.y / f64::from(cell_height.max(1)),
@@ -236,7 +255,11 @@ impl App {
     /// Flotante bajo el puntero, esté sobre su contenido, su margen o su borde
     fn float_under_pointer(&self) -> Option<PaneId> {
         match self.hit_at_pointer()? {
-            Hit::Pane(id) | Hit::FloatMove(id) | Hit::FloatResize(id, _) if self.layout.is_float(id) => Some(id),
+            Hit::Pane(id) | Hit::FloatMove(id) | Hit::FloatResize(id, _)
+                if self.layout.is_float(id) =>
+            {
+                Some(id)
+            }
             _ => None,
         }
     }
@@ -297,7 +320,9 @@ impl App {
         self.mouse.drag_from = (x, y);
         let changed = match edge {
             None => self.layout.move_float(id, dx, dy, area),
-            Some(edge) => self.layout.resize_float_edge(id, edge, dx, dy, area, limits),
+            Some(edge) => self
+                .layout
+                .resize_float_edge(id, edge, dx, dy, area, limits),
         };
         if changed {
             self.relayout(area);
@@ -314,7 +339,10 @@ impl App {
             Axis::Horizontal => x,
             Axis::Vertical => y,
         };
-        if self.layout.set_divider(path, boundary.round() as i64, area, limits) {
+        if self
+            .layout
+            .set_divider(path, boundary.round() as i64, area, limits)
+        {
             self.relayout(area);
         }
     }
@@ -331,7 +359,11 @@ impl App {
     /// ¿El programa de ese panel pidió recibir el ratón? Con Shift mantenido el ratón es siempre de
     /// la terminal (selección), como en cualquier emulador.
     fn app_wants_mouse_at(&self, idx: usize) -> bool {
-        self.panes[idx].terminal.is_mouse_tracking().unwrap_or(false) && self.mod_bits & actions::SHIFT == 0
+        self.panes[idx]
+            .terminal
+            .is_mouse_tracking()
+            .unwrap_or(false)
+            && self.mod_bits & actions::SHIFT == 0
     }
 
     fn rectangle_requested(&self) -> bool {
@@ -403,7 +435,9 @@ impl App {
                 Some(Hit::FloatMove(_)) => CursorIcon::Move,
                 Some(Hit::FloatResize(_, edge)) => edge_icon(edge),
                 Some(Hit::Pane(id))
-                    if self.index_of(id).is_some_and(|idx| self.app_wants_mouse_at(idx)) =>
+                    if self
+                        .index_of(id)
+                        .is_some_and(|idx| self.app_wants_mouse_at(idx)) =>
                 {
                     CursorIcon::Default
                 }
@@ -583,7 +617,12 @@ impl App {
         };
         let (_, cell_height) = renderer.cell_size();
         let scroll_lines = self.config.mouse.scroll_lines;
-        let lines = wheel_lines(delta, scroll_lines, cell_height, &mut self.mouse.wheel_remainder);
+        let lines = wheel_lines(
+            delta,
+            scroll_lines,
+            cell_height,
+            &mut self.mouse.wheel_remainder,
+        );
         if lines == 0 {
             return;
         }
@@ -591,14 +630,21 @@ impl App {
 
         if self.app_wants_mouse_at(idx) {
             // La rueda es el "botón" 4 (arriba) o 5 (abajo); una muesca es un evento
-            let button = if up { mouse::Button::Four } else { mouse::Button::Five };
+            let button = if up {
+                mouse::Button::Four
+            } else {
+                mouse::Button::Five
+            };
             let notches = (lines.unsigned_abs() / u32::from(scroll_lines)).max(1);
             for _ in 0..notches {
                 self.send_mouse(idx, mouse::Action::Press, Some(button));
             }
         } else if self.mod_bits & actions::SHIFT == 0
             && self.panes[idx].terminal.active_screen().unwrap_or_default() == Screen::Alternate
-            && self.panes[idx].terminal.mode(Mode::ALT_SCROLL).unwrap_or(false)
+            && self.panes[idx]
+                .terminal
+                .mode(Mode::ALT_SCROLL)
+                .unwrap_or(false)
         {
             // Pantalla alternativa sin ratón (less, man...): la rueda mueve el cursor con flechas
             let key = if up { Key::ArrowUp } else { Key::ArrowDown };
@@ -634,7 +680,12 @@ impl App {
                 y: y as f32,
             });
         let mut bytes = Vec::new();
-        if mouse.encoder.encode_to_vec(&mouse.event, &mut bytes).is_ok() && !bytes.is_empty() {
+        if mouse
+            .encoder
+            .encode_to_vec(&mouse.event, &mut bytes)
+            .is_ok()
+            && !bytes.is_empty()
+        {
             pane.write(&bytes);
         }
     }
@@ -651,7 +702,12 @@ impl App {
         let pane = &mut self.panes[idx];
         self.key_encoder.set_options_from_terminal(&pane.terminal);
         let mut sequence = Vec::new();
-        if self.key_encoder.encode_to_vec(&event, &mut sequence).is_ok() && !sequence.is_empty() {
+        if self
+            .key_encoder
+            .encode_to_vec(&event, &mut sequence)
+            .is_ok()
+            && !sequence.is_empty()
+        {
             for _ in 0..count {
                 pane.write(&sequence);
             }
@@ -693,7 +749,10 @@ impl App {
             .press
             .set_time(gesture_time(mouse.clock.elapsed(), mouse.ticks_per_second));
         let _ = mouse.press.set_repeat_interval(MULTI_CLICK_INTERVAL);
-        match mouse.press.apply(&mut pane.gesture, &pane.terminal, grid_ref) {
+        match mouse
+            .press
+            .apply(&mut pane.gesture, &pane.terminal, grid_ref)
+        {
             Ok(selection) => {
                 let _ = pane.terminal.set_selection(selection.as_ref());
             }
@@ -721,12 +780,19 @@ impl App {
         let mouse = &mut self.mouse;
         let _ = mouse.drag.set_position(x, y);
         let _ = mouse.drag.set_rectangle(rectangle);
-        if let Ok(Some(selection)) = mouse.drag.apply(&mut pane.gesture, &pane.terminal, grid_ref, geometry) {
+        if let Ok(Some(selection)) =
+            mouse
+                .drag
+                .apply(&mut pane.gesture, &pane.terminal, grid_ref, geometry)
+        {
             let _ = pane.terminal.set_selection(Some(&selection));
         }
 
         // Si el puntero salió por arriba o por abajo, el historial sigue desplazándose
-        let direction = pane.gesture.autoscroll(&pane.terminal).unwrap_or(Autoscroll::None);
+        let direction = pane
+            .gesture
+            .autoscroll(&pane.terminal)
+            .unwrap_or(Autoscroll::None);
         match direction {
             Autoscroll::Up | Autoscroll::Down => {
                 mouse
@@ -762,10 +828,14 @@ impl App {
                 return;
             }
         };
-        self.panes[idx].terminal.scroll_viewport(ScrollViewport::Delta(step));
+        self.panes[idx]
+            .terminal
+            .scroll_viewport(ScrollViewport::Delta(step));
 
         let rectangle = self.rectangle_requested();
-        let (Some((column, row)), Some(geometry)) = (self.cell_in_pane(idx), self.gesture_geometry(idx)) else {
+        let (Some((column, row)), Some(geometry)) =
+            (self.cell_in_pane(idx), self.gesture_geometry(idx))
+        else {
             return;
         };
         let (x, y) = self.local_pointer(idx);
@@ -792,13 +862,12 @@ impl App {
     fn finish_selection(&mut self, idx: usize) {
         let grid_ref_cell = self.cell_in_pane(idx);
         let pane = &mut self.panes[idx];
-        let grid_ref = grid_ref_cell.and_then(|(column, row)| {
-            pane.terminal
-                .grid_ref(viewport_point(column, row))
-                .ok()
-        });
+        let grid_ref = grid_ref_cell
+            .and_then(|(column, row)| pane.terminal.grid_ref(viewport_point(column, row)).ok());
         let mouse = &mut self.mouse;
-        let _ = mouse.release.apply(&mut pane.gesture, &pane.terminal, grid_ref);
+        let _ = mouse
+            .release
+            .apply(&mut pane.gesture, &pane.terminal, grid_ref);
         pane.selecting = false;
         mouse.autoscroll_deadline = None;
         if self.config.mouse.copy_on_select {
@@ -810,14 +879,19 @@ impl App {
     /// finales
     fn copy_selection_at(&mut self, idx: usize) {
         let options = FormatOptions::new().with_unwrap(true).with_trim(true);
-        let text = match self.panes[idx].terminal.format_selection_alloc(None, options) {
+        let text = match self.panes[idx]
+            .terminal
+            .format_selection_alloc(None, options)
+        {
             Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
             _ => return,
         };
         if text.is_empty() {
             return;
         }
-        if let Err(error) = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+        if let Err(error) =
+            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
+        {
             eprintln!("[copy] no se pudo escribir en el portapapeles: {error}");
         }
     }
@@ -862,23 +936,53 @@ mod tests {
     #[test]
     fn corners_win_over_sides_and_the_inside_is_not_an_edge() {
         let (w, h, b) = (800.0, 600.0, 6.0);
-        assert_eq!(resize_direction(0.0, 0.0, w, h, b), Some(ResizeDirection::NorthWest));
-        assert_eq!(resize_direction(799.0, 0.0, w, h, b), Some(ResizeDirection::NorthEast));
-        assert_eq!(resize_direction(0.0, 599.0, w, h, b), Some(ResizeDirection::SouthWest));
-        assert_eq!(resize_direction(799.0, 599.0, w, h, b), Some(ResizeDirection::SouthEast));
-        assert_eq!(resize_direction(3.0, 300.0, w, h, b), Some(ResizeDirection::West));
-        assert_eq!(resize_direction(797.0, 300.0, w, h, b), Some(ResizeDirection::East));
-        assert_eq!(resize_direction(400.0, 2.0, w, h, b), Some(ResizeDirection::North));
-        assert_eq!(resize_direction(400.0, 597.0, w, h, b), Some(ResizeDirection::South));
+        assert_eq!(
+            resize_direction(0.0, 0.0, w, h, b),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            resize_direction(799.0, 0.0, w, h, b),
+            Some(ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            resize_direction(0.0, 599.0, w, h, b),
+            Some(ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            resize_direction(799.0, 599.0, w, h, b),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            resize_direction(3.0, 300.0, w, h, b),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            resize_direction(797.0, 300.0, w, h, b),
+            Some(ResizeDirection::East)
+        );
+        assert_eq!(
+            resize_direction(400.0, 2.0, w, h, b),
+            Some(ResizeDirection::North)
+        );
+        assert_eq!(
+            resize_direction(400.0, 597.0, w, h, b),
+            Some(ResizeDirection::South)
+        );
         assert_eq!(resize_direction(400.0, 300.0, w, h, b), None);
     }
 
     #[test]
     fn the_edge_zone_is_exactly_the_border_wide() {
         let (w, h, b) = (800.0, 600.0, 6.0);
-        assert_eq!(resize_direction(5.9, 300.0, w, h, b), Some(ResizeDirection::West));
+        assert_eq!(
+            resize_direction(5.9, 300.0, w, h, b),
+            Some(ResizeDirection::West)
+        );
         assert_eq!(resize_direction(6.0, 300.0, w, h, b), None);
-        assert_eq!(resize_direction(794.0, 300.0, w, h, b), Some(ResizeDirection::East));
+        assert_eq!(
+            resize_direction(794.0, 300.0, w, h, b),
+            Some(ResizeDirection::East)
+        );
         assert_eq!(resize_direction(793.9, 300.0, w, h, b), None);
     }
 
@@ -886,27 +990,65 @@ mod tests {
     fn resize_icons_match_their_direction() {
         assert_eq!(resize_icon(ResizeDirection::West), CursorIcon::EwResize);
         assert_eq!(resize_icon(ResizeDirection::South), CursorIcon::NsResize);
-        assert_eq!(resize_icon(ResizeDirection::NorthWest), CursorIcon::NwseResize);
-        assert_eq!(resize_icon(ResizeDirection::SouthWest), CursorIcon::NeswResize);
+        assert_eq!(
+            resize_icon(ResizeDirection::NorthWest),
+            CursorIcon::NwseResize
+        );
+        assert_eq!(
+            resize_icon(ResizeDirection::SouthWest),
+            CursorIcon::NeswResize
+        );
     }
 
     #[test]
     fn float_edges_get_the_matching_resize_arrow() {
-        let edge = |left, right, top, bottom| Edge { left, right, top, bottom };
-        assert_eq!(edge_icon(edge(true, false, false, false)), CursorIcon::EwResize);
-        assert_eq!(edge_icon(edge(false, true, false, false)), CursorIcon::EwResize);
-        assert_eq!(edge_icon(edge(false, false, true, false)), CursorIcon::NsResize);
-        assert_eq!(edge_icon(edge(false, false, false, true)), CursorIcon::NsResize);
-        assert_eq!(edge_icon(edge(true, false, true, false)), CursorIcon::NwseResize);
-        assert_eq!(edge_icon(edge(false, true, false, true)), CursorIcon::NwseResize);
-        assert_eq!(edge_icon(edge(false, true, true, false)), CursorIcon::NeswResize);
-        assert_eq!(edge_icon(edge(true, false, false, true)), CursorIcon::NeswResize);
+        let edge = |left, right, top, bottom| Edge {
+            left,
+            right,
+            top,
+            bottom,
+        };
+        assert_eq!(
+            edge_icon(edge(true, false, false, false)),
+            CursorIcon::EwResize
+        );
+        assert_eq!(
+            edge_icon(edge(false, true, false, false)),
+            CursorIcon::EwResize
+        );
+        assert_eq!(
+            edge_icon(edge(false, false, true, false)),
+            CursorIcon::NsResize
+        );
+        assert_eq!(
+            edge_icon(edge(false, false, false, true)),
+            CursorIcon::NsResize
+        );
+        assert_eq!(
+            edge_icon(edge(true, false, true, false)),
+            CursorIcon::NwseResize
+        );
+        assert_eq!(
+            edge_icon(edge(false, true, false, true)),
+            CursorIcon::NwseResize
+        );
+        assert_eq!(
+            edge_icon(edge(false, true, true, false)),
+            CursorIcon::NeswResize
+        );
+        assert_eq!(
+            edge_icon(edge(true, false, false, true)),
+            CursorIcon::NeswResize
+        );
     }
 
     #[test]
     fn dragging_has_an_icon_but_a_selection_does_not() {
         assert_eq!(capture_icon(&Capture::Pane(PaneId(1))), None);
-        assert_eq!(capture_icon(&Capture::FloatMove(PaneId(1))), Some(CursorIcon::Move));
+        assert_eq!(
+            capture_icon(&Capture::FloatMove(PaneId(1))),
+            Some(CursorIcon::Move)
+        );
         assert_eq!(
             capture_icon(&Capture::Divider(vec![], Axis::Vertical)),
             Some(CursorIcon::NsResize)
@@ -920,7 +1062,10 @@ mod tests {
         assert_eq!(at(6.0, 6.0), (0, 0));
         assert_eq!(at(14.9, 24.9), (0, 0));
         assert_eq!(at(15.0, 25.0), (1, 1));
-        assert_eq!(at(6.0 + 79.0 * 9.0 + 4.0, 6.0 + 23.0 * 19.0 + 4.0), (79, 23));
+        assert_eq!(
+            at(6.0 + 79.0 * 9.0 + 4.0, 6.0 + 23.0 * 19.0 + 4.0),
+            (79, 23)
+        );
         // En el margen o fuera de la ventana se queda en la celda más cercana
         assert_eq!(at(0.0, 0.0), (0, 0));
         assert_eq!(at(-50.0, -50.0), (0, 0));
@@ -936,7 +1081,10 @@ mod tests {
     #[test]
     fn gesture_time_counts_ticks_for_a_10_mhz_clock() {
         // 1,5 s a 10 MHz son 15 millones de ticks, que `set_time` recibe como "nanosegundos"
-        assert_eq!(gesture_time(Duration::from_millis(1500), 10_000_000), Duration::from_nanos(15_000_000));
+        assert_eq!(
+            gesture_time(Duration::from_millis(1500), 10_000_000),
+            Duration::from_nanos(15_000_000)
+        );
         assert_eq!(gesture_time(Duration::ZERO, 10_000_000), Duration::ZERO);
     }
 
@@ -961,8 +1109,14 @@ mod tests {
     #[test]
     fn notched_wheels_scroll_scroll_lines_per_notch() {
         let mut rest = 0.0;
-        assert_eq!(wheel_lines(MouseScrollDelta::LineDelta(0.0, 1.0), 3, 19, &mut rest), 3);
-        assert_eq!(wheel_lines(MouseScrollDelta::LineDelta(0.0, -2.0), 3, 19, &mut rest), -6);
+        assert_eq!(
+            wheel_lines(MouseScrollDelta::LineDelta(0.0, 1.0), 3, 19, &mut rest),
+            3
+        );
+        assert_eq!(
+            wheel_lines(MouseScrollDelta::LineDelta(0.0, -2.0), 3, 19, &mut rest),
+            -6
+        );
         assert_eq!(rest, 0.0);
     }
 
@@ -981,8 +1135,19 @@ mod tests {
     #[test]
     fn a_wheel_event_of_zero_height_does_nothing() {
         let mut rest = 0.0;
-        assert_eq!(wheel_lines(MouseScrollDelta::LineDelta(0.0, 0.0), 3, 19, &mut rest), 0);
-        assert_eq!(wheel_lines(MouseScrollDelta::PixelDelta(PhysicalPosition::new(5.0, 0.0)), 3, 19, &mut rest), 0);
+        assert_eq!(
+            wheel_lines(MouseScrollDelta::LineDelta(0.0, 0.0), 3, 19, &mut rest),
+            0
+        );
+        assert_eq!(
+            wheel_lines(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(5.0, 0.0)),
+                3,
+                19,
+                &mut rest
+            ),
+            0
+        );
     }
 
     fn terminal_with(input: &[u8]) -> libghostty_vt::Terminal<'static, 'static> {
@@ -996,7 +1161,13 @@ mod tests {
         terminal
     }
 
-    fn encoded(terminal: &libghostty_vt::Terminal<'static, 'static>, action: mouse::Action, button: Option<mouse::Button>, x: f32, y: f32) -> Vec<u8> {
+    fn encoded(
+        terminal: &libghostty_vt::Terminal<'static, 'static>,
+        action: mouse::Action,
+        button: Option<mouse::Button>,
+        x: f32,
+        y: f32,
+    ) -> Vec<u8> {
         let mut encoder = mouse::Encoder::new().unwrap();
         encoder
             .set_options_from_terminal(terminal)
@@ -1026,7 +1197,16 @@ mod tests {
     fn a_terminal_without_mouse_mode_reports_nothing() {
         let terminal = terminal_with(b"");
         assert!(!terminal.is_mouse_tracking().unwrap());
-        assert!(encoded(&terminal, mouse::Action::Press, Some(mouse::Button::Left), 15.0, 25.0).is_empty());
+        assert!(
+            encoded(
+                &terminal,
+                mouse::Action::Press,
+                Some(mouse::Button::Left),
+                15.0,
+                25.0
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1036,14 +1216,38 @@ mod tests {
         assert!(terminal.is_mouse_tracking().unwrap());
 
         // Celda (columna 2, fila 1) -> coordenadas de 1 en 1: 3;2
-        let press = encoded(&terminal, mouse::Action::Press, Some(mouse::Button::Left), 25.0, 25.0);
+        let press = encoded(
+            &terminal,
+            mouse::Action::Press,
+            Some(mouse::Button::Left),
+            25.0,
+            25.0,
+        );
         assert_eq!(String::from_utf8_lossy(&press), "\x1b[<0;3;2M");
-        let release = encoded(&terminal, mouse::Action::Release, Some(mouse::Button::Left), 25.0, 25.0);
+        let release = encoded(
+            &terminal,
+            mouse::Action::Release,
+            Some(mouse::Button::Left),
+            25.0,
+            25.0,
+        );
         assert_eq!(String::from_utf8_lossy(&release), "\x1b[<0;3;2m");
         // La rueda hacia arriba es el botón 4 (código 64) y hacia abajo el 5 (65)
-        let up = encoded(&terminal, mouse::Action::Press, Some(mouse::Button::Four), 25.0, 25.0);
+        let up = encoded(
+            &terminal,
+            mouse::Action::Press,
+            Some(mouse::Button::Four),
+            25.0,
+            25.0,
+        );
         assert_eq!(String::from_utf8_lossy(&up), "\x1b[<64;3;2M");
-        let down = encoded(&terminal, mouse::Action::Press, Some(mouse::Button::Five), 25.0, 25.0);
+        let down = encoded(
+            &terminal,
+            mouse::Action::Press,
+            Some(mouse::Button::Five),
+            25.0,
+            25.0,
+        );
         assert_eq!(String::from_utf8_lossy(&down), "\x1b[<65;3;2M");
     }
 }
