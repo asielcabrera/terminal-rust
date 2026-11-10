@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   update:
+    # Forks would otherwise commit to their own master and diverge from upstream
+    if: github.repository == 'cabrerasiel/terminal'
     runs-on: ubuntu-latest
     steps:
       - uses: akhilmhdh/contributors-readme-action@v2.3.10

@@ -21,7 +21,13 @@ pub fn process_cwd(pid: i32) -> Option<PathBuf> {
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
     // SAFETY: the buffer is a zeroed `proc_vnodepathinfo` and `size` is exactly its length
     let written = unsafe {
-        libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size)
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
     };
     if written != size {
         return None;
@@ -64,7 +70,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
         let pair = NativePtySystem::default()
-            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 5,
+                cols: 20,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .unwrap();
         let mut command = CommandBuilder::new("sleep");
         command.arg("5");
