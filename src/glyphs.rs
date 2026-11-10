@@ -181,9 +181,15 @@ impl Fonts {
         let px = config.size * scale_factor as f32;
         let regular = find_face(db, &config.family, false, false)
             .and_then(|id| load_face(db, id, px))
-            .ok_or_else(|| format!("no se encontró la fuente \"{}\" en el sistema", config.family))?;
+            .ok_or_else(|| {
+                format!(
+                    "no se encontró la fuente \"{}\" en el sistema",
+                    config.family
+                )
+            })?;
 
-        let mut fallbacks: Vec<LazyFont> = config.fallback.iter().cloned().map(LazyFont::new).collect();
+        let mut fallbacks: Vec<LazyFont> =
+            config.fallback.iter().cloned().map(LazyFont::new).collect();
         // Última red: cualquier Nerd Font instalada, solo para lo que nadie más tiene
         if let Some(nerd) = detect_nerd_font(db)
             && nerd != config.family
@@ -318,7 +324,8 @@ impl GlyphCache {
     }
 
     pub fn atlas_view(&self) -> wgpu::TextureView {
-        self.texture.create_view(&wgpu::TextureViewDescriptor::default())
+        self.texture
+            .create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     /// Recarga las fuentes al nuevo tamaño en pixeles y vacía el atlas
@@ -367,12 +374,15 @@ impl GlyphCache {
         let font = &self.fonts.regular;
         let (ascent, descent, gap) = font
             .horizontal_line_metrics(px)
-            .map_or((px * 0.8, -px * 0.2, 0.0), |m| (m.ascent, m.descent, m.line_gap));
+            .map_or((px * 0.8, -px * 0.2, 0.0), |m| {
+                (m.ascent, m.descent, m.line_gap)
+            });
         self.cell_width = font.metrics('0', px).advance_width.round().max(1.0) as u32;
         self.cell_height = (ascent - descent + gap).ceil().max(1.0) as u32;
         self.baseline = (ascent + gap / 2.0).round().max(0.0) as u32;
         self.thickness = (px / 14.0).round().max(1.0) as u32;
-        self.underline_y = (self.baseline + (self.cell_height - self.baseline.min(self.cell_height)) / 3)
+        self.underline_y = (self.baseline
+            + (self.cell_height - self.baseline.min(self.cell_height)) / 3)
             .min(self.cell_height.saturating_sub(self.thickness));
         self.strikethrough_y = self.baseline.saturating_sub((px * 0.3).round() as u32);
     }
@@ -446,7 +456,6 @@ impl GlyphCache {
         Some(position)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -553,7 +562,10 @@ mod tests {
         let mut slot = LazyFont::new("Microsoft YaHei".to_string());
         assert!(slot.covers(&db, '日'));
         assert!(!slot.covers(&db, POWERLINE));
-        assert!(slot.font.is_none(), "covers no debe cargar la fuente (pesa decenas de MB)");
+        assert!(
+            slot.font.is_none(),
+            "covers no debe cargar la fuente (pesa decenas de MB)"
+        );
         assert!(slot.get(&db, 16.0).is_some());
         assert!(slot.font.is_some());
     }
@@ -581,7 +593,11 @@ mod tests {
         for ch in [POWERLINE, HOME_ICON, MATERIAL_ICON] {
             let (metrics, bitmap) = fonts.rasterize(&db, plain(ch));
             let (expected_metrics, expected) = reference.rasterize(&db, plain(ch));
-            assert_eq!((metrics.width, metrics.height), (expected_metrics.width, expected_metrics.height), "{ch:?}");
+            assert_eq!(
+                (metrics.width, metrics.height),
+                (expected_metrics.width, expected_metrics.height),
+                "{ch:?}"
+            );
             assert_eq!(bitmap, expected, "{ch:?} no salió de {nerd}");
         }
     }
@@ -594,19 +610,35 @@ mod tests {
             return;
         }
         let mut fonts = Fonts::load(&db, &config("Consolas"), 1.0).unwrap();
-        assert!(fonts.bold.font.is_none() && fonts.italic.font.is_none() && fonts.bold_italic.font.is_none());
+        assert!(
+            fonts.bold.font.is_none()
+                && fonts.italic.font.is_none()
+                && fonts.bold_italic.font.is_none()
+        );
 
         fonts.rasterize(&db, plain('a'));
-        assert!(fonts.bold.font.is_none(), "una letra normal no debe cargar la negrita");
+        assert!(
+            fonts.bold.font.is_none(),
+            "una letra normal no debe cargar la negrita"
+        );
 
-        fonts.rasterize(&db, GlyphKey { ch: 'a', bold: true, italic: false });
+        fonts.rasterize(
+            &db,
+            GlyphKey {
+                ch: 'a',
+                bold: true,
+                italic: false,
+            },
+        );
         assert!(fonts.bold.font.is_some(), "la negrita se carga al usarla");
         assert!(fonts.italic.font.is_none() && fonts.bold_italic.font.is_none());
     }
 
     #[test]
     fn private_use_ranges_are_recognized() {
-        assert!(is_private_use('\u{E0B0}') && is_private_use('\u{F8FF}') && is_private_use('\u{F0001}'));
+        assert!(
+            is_private_use('\u{E0B0}') && is_private_use('\u{F8FF}') && is_private_use('\u{F0001}')
+        );
         assert!(!is_private_use('a') && !is_private_use('日') && !is_private_use('\u{1F600}'));
     }
 
@@ -625,14 +657,22 @@ mod tests {
             eprintln!("saltada: no hay ninguna Nerd Font instalada");
             return;
         };
-        assert_eq!(detect_nerd_font(&db), Some(chosen.clone()), "debe elegir siempre la misma");
+        assert_eq!(
+            detect_nerd_font(&db),
+            Some(chosen.clone()),
+            "debe elegir siempre la misma"
+        );
         assert!(chosen.contains("Nerd Font"), "{chosen}");
-        let any_symbols = db
-            .faces()
-            .any(|f| f.families.iter().any(|(n, _)| n.starts_with("Symbols") && n.contains("Nerd Font")));
-        let any_mono = db
-            .faces()
-            .any(|f| f.families.iter().any(|(n, _)| n.ends_with("Nerd Font Mono")));
+        let any_symbols = db.faces().any(|f| {
+            f.families
+                .iter()
+                .any(|(n, _)| n.starts_with("Symbols") && n.contains("Nerd Font"))
+        });
+        let any_mono = db.faces().any(|f| {
+            f.families
+                .iter()
+                .any(|(n, _)| n.ends_with("Nerd Font Mono"))
+        });
         if any_symbols {
             assert!(chosen.starts_with("Symbols"), "{chosen}");
         } else if any_mono {

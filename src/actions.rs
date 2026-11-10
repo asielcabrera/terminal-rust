@@ -54,10 +54,16 @@ pub enum Direction {
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum Action {
     /// Escribe el texto en el shell, tal cual
-    SendString { text: String },
+    SendString {
+        text: String,
+    },
     /// Desplaza el historial: negativo sube, positivo baja
-    ScrollLines { amount: isize },
-    ScrollPages { amount: isize },
+    ScrollLines {
+        amount: isize,
+    },
+    ScrollPages {
+        amount: isize,
+    },
     ScrollToTop,
     ScrollToBottom,
     IncreaseFontSize,
@@ -79,13 +85,18 @@ pub enum Action {
     /// Cierra el panel con foco y termina su shell; si es el último del mosaico, cierra la ventana
     ClosePane,
     /// Pasa el foco al panel vecino en esa dirección
-    FocusPane { dir: Direction },
+    FocusPane {
+        dir: Direction,
+    },
     /// Pasa el foco al panel siguiente o anterior (primero el mosaico y luego los flotantes)
     FocusNext,
     FocusPrevious,
     /// Mueve el borde del panel `amount` celdas hacia `dir` (agranda hacia ese lado, o encoge si el
     /// panel está en el límite de la ventana por ahí)
-    ResizePane { dir: Direction, amount: u16 },
+    ResizePane {
+        dir: Direction,
+        amount: u16,
+    },
     /// Amplía el panel con foco a toda la ventana, o vuelve al mosaico
     ToggleZoom,
     /// Abre un panel flotante con su propio shell, o con `program`, y se cierra cuando este
@@ -107,7 +118,10 @@ pub enum Action {
     /// Oculta o muestra todos los flotantes sin cerrar sus shells; si no hay ninguno, abre uno
     ToggleFloats,
     /// Mueve el flotante con foco `amount` celdas hacia `dir`
-    MovePane { dir: Direction, amount: u16 },
+    MovePane {
+        dir: Direction,
+        amount: u16,
+    },
     Quit,
     #[serde(skip)]
     Lua(Function),
@@ -218,7 +232,11 @@ fn parse_binding_mods(text: &str) -> Result<u8, String> {
 
 fn parse_mods_with(text: &str, allow_leader: bool) -> Result<u8, String> {
     let mut bits = 0;
-    for part in text.split('|').map(str::trim).filter(|part| !part.is_empty()) {
+    for part in text
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
         bits |= match part.to_uppercase().as_str() {
             "CTRL" | "CONTROL" => CTRL,
             "SHIFT" => SHIFT,
@@ -276,8 +294,16 @@ impl Bindings {
         bind(KeyId::Named(NamedKey::Insert), CTRL, Action::Copy);
         bind(KeyId::Char('v'), CTRL | SHIFT, Action::Paste);
         bind(KeyId::Named(NamedKey::Insert), SHIFT, Action::Paste);
-        bind(KeyId::Named(NamedKey::PageUp), SHIFT, Action::ScrollPages { amount: -1 });
-        bind(KeyId::Named(NamedKey::PageDown), SHIFT, Action::ScrollPages { amount: 1 });
+        bind(
+            KeyId::Named(NamedKey::PageUp),
+            SHIFT,
+            Action::ScrollPages { amount: -1 },
+        );
+        bind(
+            KeyId::Named(NamedKey::PageDown),
+            SHIFT,
+            Action::ScrollPages { amount: 1 },
+        );
 
         // Paneles, tras el prefijo
         bind(KeyId::Char('%'), LEADER, Action::SplitRight);
@@ -304,9 +330,21 @@ impl Bindings {
             (NamedKey::ArrowDown, Direction::Down),
         ] {
             bind(KeyId::Named(key), LEADER, Action::FocusPane { dir });
-            bind(KeyId::Named(key), LEADER | CTRL, Action::ResizePane { dir, amount: 1 });
-            bind(KeyId::Named(key), LEADER | ALT, Action::ResizePane { dir, amount: 5 });
-            bind(KeyId::Named(key), LEADER | SHIFT, Action::MovePane { dir, amount: 2 });
+            bind(
+                KeyId::Named(key),
+                LEADER | CTRL,
+                Action::ResizePane { dir, amount: 1 },
+            );
+            bind(
+                KeyId::Named(key),
+                LEADER | ALT,
+                Action::ResizePane { dir, amount: 5 },
+            );
+            bind(
+                KeyId::Named(key),
+                LEADER | SHIFT,
+                Action::MovePane { dir, amount: 2 },
+            );
         }
         for (key, dir) in [
             ('h', Direction::Left),
@@ -337,7 +375,9 @@ impl Leader {
     /// Ctrl+letra (Ctrl+B es 0x02). Con cualquier otro prefijo, nada.
     fn passthrough(&self) -> Option<Vec<u8>> {
         match (&self.key, self.mods) {
-            (KeyId::Char(letter), CTRL) if letter.is_ascii_alphabetic() => Some(vec![(*letter as u8) & 0x1f]),
+            (KeyId::Char(letter), CTRL) if letter.is_ascii_alphabetic() => {
+                Some(vec![(*letter as u8) & 0x1f])
+            }
             _ => None,
         }
     }
@@ -489,7 +529,9 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
         let at = format!("keys[{}]", index + 1);
         let entry = entry.map_err(|e| format!("{at}: {}", lua_message(&e)))?;
         let Value::Table(entry) = entry else {
-            return Err(format!("{at} debe ser una tabla {{ key = ..., mods = ..., action = ... }}"));
+            return Err(format!(
+                "{at} debe ser una tabla {{ key = ..., mods = ..., action = ... }}"
+            ));
         };
 
         let name: String = entry
@@ -498,18 +540,22 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
         let key = parse_key(&name).map_err(|e| format!("{at}.key: {e}"))?;
         let mods = match entry.get::<Value>("mods").map_err(|e| lua_message(&e))? {
             Value::Nil => 0,
-            Value::String(text) => {
-                parse_binding_mods(&text.to_string_lossy()).map_err(|e| format!("{at}.mods: {e}"))?
-            }
+            Value::String(text) => parse_binding_mods(&text.to_string_lossy())
+                .map_err(|e| format!("{at}.mods: {e}"))?,
             other => {
-                return Err(format!("{at}.mods debe ser un texto, como \"CTRL|SHIFT\" (recibió {})", other.type_name()));
+                return Err(format!(
+                    "{at}.mods debe ser un texto, como \"CTRL|SHIFT\" (recibió {})",
+                    other.type_name()
+                ));
             }
         };
         let action = parse_action(lua, entry.get("action").map_err(|e| lua_message(&e))?)
             .map_err(|e| format!("{at}.action: {e}"))?;
 
         if !from_user.insert((key.clone(), mods)) {
-            return Err(format!("{at}: la combinación {name:?} + {mods:?} ya estaba enlazada"));
+            return Err(format!(
+                "{at}: la combinación {name:?} + {mods:?} ya estaba enlazada"
+            ));
         }
         bindings.map.insert((key, mods), action);
     }
@@ -523,7 +569,8 @@ pub fn parse_action(lua: &Lua, value: Value) -> Result<Action, String> {
         Value::String(name) => {
             let table = lua.create_table().map_err(|e| lua_message(&e))?;
             table.set("action", name).map_err(|e| lua_message(&e))?;
-            lua.from_value(Value::Table(table)).map_err(|e| lua_message(&e))
+            lua.from_value(Value::Table(table))
+                .map_err(|e| lua_message(&e))
         }
         Value::Table(_) => lua.from_value(value).map_err(|e| lua_message(&e)),
         other => Err(format!(
@@ -555,7 +602,10 @@ impl EventKind {
     ];
 
     fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.iter().find(|(known, _)| *known == name).map(|(_, kind)| *kind)
+        Self::ALL
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, kind)| *kind)
     }
 }
 
@@ -584,10 +634,16 @@ pub fn parse_events(value: Value) -> Result<Events, String> {
         })?;
         let Some(kind) = EventKind::from_name(&name) else {
             let valid: Vec<_> = EventKind::ALL.iter().map(|(name, _)| *name).collect();
-            return Err(format!("evento desconocido {name:?} (válidos: {})", valid.join(", ")));
+            return Err(format!(
+                "evento desconocido {name:?} (válidos: {})",
+                valid.join(", ")
+            ));
         };
         let Value::Function(function) = handler else {
-            return Err(format!("events[{name:?}] debe ser una función (recibió {})", handler.type_name()));
+            return Err(format!(
+                "events[{name:?}] debe ser una función (recibió {})",
+                handler.type_name()
+            ));
         };
         events.handlers.insert(kind, function);
     }
@@ -663,7 +719,10 @@ impl Script {
     /// cuál de las dos hacer.
     pub fn set_leader(&mut self, leader: Option<Leader>) -> Result<(), String> {
         if let Some(leader) = &leader
-            && self.bindings.map.contains_key(&(leader.key.clone(), leader.mods))
+            && self
+                .bindings
+                .map
+                .contains_key(&(leader.key.clone(), leader.mods))
         {
             return Err("leader: esa combinación de teclas ya está enlazada en keys".to_string());
         }
@@ -807,7 +866,10 @@ mod tests {
     #[test]
     fn key_names_map_to_winit_keys() {
         assert_eq!(parse_key("PageUp").unwrap(), KeyId::Named(NamedKey::PageUp));
-        assert_eq!(parse_key("pagedown").unwrap(), KeyId::Named(NamedKey::PageDown));
+        assert_eq!(
+            parse_key("pagedown").unwrap(),
+            KeyId::Named(NamedKey::PageDown)
+        );
         assert_eq!(parse_key("F5").unwrap(), KeyId::Named(NamedKey::F5));
         assert_eq!(parse_key("f24").unwrap(), KeyId::Named(NamedKey::F24));
         assert_eq!(parse_key("Enter").unwrap(), KeyId::Named(NamedKey::Enter));
@@ -832,7 +894,10 @@ mod tests {
         // Con Shift, la tecla "v" llega como "V": tiene que coincidir con el mismo enlace
         assert_eq!(key_id(&Key::Character("V".into())), Some(KeyId::Char('v')));
         assert_eq!(key_id(&Key::Character("v".into())), Some(KeyId::Char('v')));
-        assert_eq!(key_id(&Key::Named(NamedKey::F5)), Some(KeyId::Named(NamedKey::F5)));
+        assert_eq!(
+            key_id(&Key::Named(NamedKey::F5)),
+            Some(KeyId::Named(NamedKey::F5))
+        );
         // Secuencias de varios caracteres y teclas muertas no se pueden enlazar
         assert_eq!(key_id(&Key::Character("ab".into())), None);
         assert_eq!(key_id(&Key::Dead(Some('´'))), None);
@@ -841,18 +906,27 @@ mod tests {
     #[test]
     fn event_names_are_known() {
         assert_eq!(EventKind::from_name("bell"), Some(EventKind::Bell));
-        assert_eq!(EventKind::from_name("title-changed"), Some(EventKind::TitleChanged));
+        assert_eq!(
+            EventKind::from_name("title-changed"),
+            Some(EventKind::TitleChanged)
+        );
         assert_eq!(EventKind::from_name("nope"), None);
     }
 
     #[test]
     fn runaway_scripts_are_aborted() {
         let script = Script::new().unwrap();
-        script.deadline.set(Instant::now() + Duration::from_millis(100));
+        script
+            .deadline
+            .set(Instant::now() + Duration::from_millis(100));
         let started = Instant::now();
         let result = script.lua().load("while true do end").exec();
         assert!(result.is_err(), "un bucle infinito debería abortarse");
-        assert!(started.elapsed() < Duration::from_secs(2), "tardó {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "tardó {:?}",
+            started.elapsed()
+        );
         let message = lua_message(&result.unwrap_err());
         assert!(message.contains("demasiado"), "{message}");
     }
@@ -860,7 +934,11 @@ mod tests {
     #[test]
     fn a_failing_hook_does_not_propagate_and_keeps_working_afterwards() {
         let script = Script::new().unwrap();
-        let broken: Function = script.lua().load(r#"return function(ctx) error("fallé") end"#).eval().unwrap();
+        let broken: Function = script
+            .lua()
+            .load(r#"return function(ctx) error("fallé") end"#)
+            .eval()
+            .unwrap();
         assert!(script.call(&broken, vec![]).is_empty());
         let working: Function = script
             .lua()
@@ -874,11 +952,23 @@ mod tests {
     #[test]
     fn a_hook_stuck_in_a_loop_is_cut_off_and_the_next_call_still_works() {
         let script = Script::new().unwrap();
-        let looping: Function = script.lua().load("return function() while true do end end").eval().unwrap();
+        let looping: Function = script
+            .lua()
+            .load("return function() while true do end end")
+            .eval()
+            .unwrap();
         let started = Instant::now();
         script.call(&looping, vec![]);
-        assert!(started.elapsed() < Duration::from_secs(3), "tardó {:?}", started.elapsed());
-        let fine: Function = script.lua().load(r#"return function(ctx) ctx:log("sigo vivo") end"#).eval().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "tardó {:?}",
+            started.elapsed()
+        );
+        let fine: Function = script
+            .lua()
+            .load(r#"return function(ctx) ctx:log("sigo vivo") end"#)
+            .eval()
+            .unwrap();
         let commands = script.call(&fine, vec![]);
         assert!(matches!(commands.as_slice(), [Command::Log(text)] if text == "sigo vivo"));
     }
