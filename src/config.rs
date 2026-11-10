@@ -96,7 +96,7 @@ pub struct PanesConfig {
     /// Cuánto se apaga el texto de los paneles sin foco: 0 no cambia nada, 1 lo hace invisible
     pub inactive_dim: f32,
     /// Un panel nuevo (o un flotante) arranca en el directorio del panel con foco, si su shell lo
-    /// informa con OSC 7; si no, en `shell.cwd`
+    /// informa con OSC 7 o, en macOS y Linux, preguntándole al sistema; si no, en `shell.cwd`
     pub inherit_cwd: bool,
     /// Tamaño de un flotante nuevo, como fracción de la ventana
     pub float_width: f32,
@@ -1391,7 +1391,9 @@ mod tests {
         let (config, script) =
             parse_script(include_str!("../examples/config.lua"), "config.lua", None).unwrap();
         assert_eq!(config.colors.ansi.as_ref().map(Vec::len), Some(16));
-        assert_eq!(config.shell.program.as_deref(), Some("pwsh"));
+        // PowerShell solo en Windows; en el resto, el shell del sistema
+        let expected_shell = if cfg!(windows) { Some("pwsh") } else { None };
+        assert_eq!(config.shell.program.as_deref(), expected_shell);
         // Las teclas y los hooks del ejemplo también se interpretan sin errores
         assert!(matches!(
             script.binding(&char_key("v"), actions::CTRL | actions::SHIFT),

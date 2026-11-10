@@ -143,8 +143,9 @@ return {
     -- Un panel nuevo (un split o un flotante) arranca en el directorio del panel activo. La
     -- terminal lo sabe porque el shell lo informa con OSC 7 (`ESC ] 7 ; file:///C:/ruta ST`) o con
     -- OSC 9;9 (`ESC ] 9 ; 9 ; C:\ruta ST`, el de ConEmu y Windows Terminal). PowerShell no lo hace
-    -- solo: ver `shell.integration`. Con cmd, se consigue con `PROMPT $E]9;9;$P$E\$P$G`. Si el shell
-    -- no informa nada se usa `shell.cwd`.
+    -- solo: ver `shell.integration`. Con cmd, se consigue con `PROMPT $E]9;9;$P$E\$P$G`. En macOS y
+    -- Linux no hace falta nada: si el shell no lo informa, se le pregunta al sistema por el
+    -- directorio del programa en primer plano (zsh, bash, fish...). Si nada lo da se usa `shell.cwd`.
     inherit_cwd = true,
     float_width = 0.7,             -- tamaño de un flotante nuevo, como fracción de la ventana
     float_height = 0.7,

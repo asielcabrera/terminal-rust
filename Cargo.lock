@@ -2003,6 +2003,7 @@ dependencies = [
  "bytemuck",
  "fontdb",
  "fontdue",
+ "libc",
  "libghostty-vt",
  "mlua",
  "pollster",
