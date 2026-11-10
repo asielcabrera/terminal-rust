@@ -19,11 +19,19 @@
 local size = 16
 if terminal.os == "macos" then size = 14 end
 
+-- Each system ships different fonts: a family that is not installed stops the terminal from starting
+local family, fallback = "Consolas", { "Symbols Nerd Font Mono", "Segoe UI Symbol", "Microsoft YaHei", "Malgun Gothic", "Segoe UI Emoji" }
+if terminal.os == "macos" then
+  family, fallback = "Menlo", { "Symbols Nerd Font Mono", "Apple Symbols", "PingFang SC", "Apple SD Gothic Neo" }
+elseif terminal.os == "linux" then
+  family, fallback = "DejaVu Sans Mono", { "Symbols Nerd Font Mono", "DejaVu Sans" }
+end
+
 return {
   font = {
     -- Nombre de la familia tal como la ve el sistema. Las fuentes variables no están soportadas.
-    family = "Consolas",
-    size = size,                 -- píxeles lógicos (se escala con el DPI del monitor)
+    family = family,
+    size = size,                -- píxeles lógicos (se escala con el DPI del monitor)
     -- Familias a probar, en orden, para los caracteres que la principal no cubre.
     --
     -- Nerd Fonts (iconos y Powerline): los caracteres del área de uso privado (U+E000..U+F8FF y
@@ -33,7 +41,7 @@ return {
     --   * como respaldo: una de solo símbolos, "Symbols Nerd Font Mono", que ya viene en la lista
     --     por defecto. Si no la tienes instalada se ignora y se usa cualquier Nerd Font del sistema.
     -- Si pones `fallback`, sustituye a la lista por defecto entera.
-    fallback = { "Symbols Nerd Font Mono", "Segoe UI Symbol", "Microsoft YaHei", "Malgun Gothic", "Segoe UI Emoji" },
+    fallback = fallback,
   },
 
   padding = 6,                   -- margen alrededor del texto, en píxeles lógicos
@@ -65,8 +73,9 @@ return {
 
   shell = {
     -- Si falta `program`, se usa el shell por defecto del sistema. `args` necesita `program`.
-    program = "pwsh",
-    args = { "-NoLogo" },
+    -- PowerShell only on Windows; elsewhere the system shell ($SHELL) is used.
+    program = terminal.os == "windows" and "pwsh" or nil,
+    args = terminal.os == "windows" and { "-NoLogo" } or nil,
     -- cwd = "C:/Users/yo/proyectos",
     env = { EDITOR = "nvim" },
     -- PowerShell no dice en qué directorio está (su `cd` no cambia el del proceso). Con esto se
