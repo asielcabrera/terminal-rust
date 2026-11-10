@@ -28,9 +28,20 @@ const DEFAULT_FALLBACK: &[&str] = &[
     "Malgun Gothic",
     "Segoe UI Emoji",
 ];
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const DEFAULT_FAMILY: &str = "Menlo";
+// Apple Color Emoji is left out: its glyphs are color bitmaps (sbix) that fontdue cannot rasterize
+#[cfg(target_os = "macos")]
+const DEFAULT_FALLBACK: &[&str] = &[
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "Apple Symbols",
+    "PingFang SC",
+    "Apple SD Gothic Neo",
+];
+#[cfg(not(any(windows, target_os = "macos")))]
 const DEFAULT_FAMILY: &str = "DejaVu Sans Mono";
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 const DEFAULT_FALLBACK: &[&str] = &["Symbols Nerd Font Mono", "Symbols Nerd Font", "DejaVu Sans"];
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
