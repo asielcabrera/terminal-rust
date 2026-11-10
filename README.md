@@ -23,6 +23,13 @@ Requires Rust stable and Zig 0.15.2. See [CONTRIBUTING.md](CONTRIBUTING.md).
                     <sub><b>Asiel Cabrera</b></sub>
                 </a>
             </td>
+            <td align="center">
+                <a href="https://github.com/asielcabrera">
+                    <img src="https://avatars.githubusercontent.com/u/24819851?v=4" width="100;" alt="asielcabrera"/>
+                    <br />
+                    <sub><b>Asiel Cabrera</b></sub>
+                </a>
+            </td>
 		</tr>
 	<tbody>
 </table>
