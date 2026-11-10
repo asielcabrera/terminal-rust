@@ -471,9 +471,22 @@ impl Pane {
         }
     }
 
-    /// Directorio actual del shell, si lo informa con OSC 7 y existe
+    /// Directorio actual del panel: el que informó el shell con OSC 7 (también llega por ssh) o,
+    /// si no informó nada, el del proceso en primer plano según el sistema (macOS y Linux), así
+    /// que funciona con cualquier shell sin integración
     pub fn current_dir(&self) -> Option<PathBuf> {
-        terminal_dir(&self.terminal)
+        terminal_dir(&self.terminal).or_else(|| self.foreground_dir())
+    }
+
+    #[cfg(unix)]
+    fn foreground_dir(&self) -> Option<PathBuf> {
+        let pid = self.master.process_group_leader()?;
+        crate::proc_cwd::process_cwd(pid).filter(|path| path.is_dir())
+    }
+
+    #[cfg(not(unix))]
+    fn foreground_dir(&self) -> Option<PathBuf> {
+        None
     }
 
     pub fn kill(&mut self) {
