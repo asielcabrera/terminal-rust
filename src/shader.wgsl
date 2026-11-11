@@ -1,5 +1,5 @@
-// Cada rectángulo y cada glifo es un quad instanciado, dibujado como triangle strip de 4 vértices.
-// Las posiciones llegan en pixeles con origen arriba a la izquierda.
+// Every rectangle and every glyph is an instanced quad, drawn as a 4-vertex triangle strip.
+// Positions arrive in pixels, with the origin at the top left.
 
 struct Globals {
     screen: vec2<f32>,
@@ -9,7 +9,7 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 
-// Esquinas del quad: (0,0) (1,0) (0,1) (1,1)
+// Quad corners: (0,0) (1,0) (0,1) (1,1)
 fn corner(index: u32) -> vec2<f32> {
     return vec2<f32>(f32(index & 1u), f32(index >> 1u));
 }
@@ -22,7 +22,7 @@ fn to_clip(p: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(ndc, 0.0, 1.0);
 }
 
-// --- Rectángulos (fondos, subrayados, cursor) ---
+// --- Rectangles (backgrounds, underlines, cursor) ---
 
 struct RectOut {
     @builtin(position) clip: vec4<f32>,
@@ -47,9 +47,9 @@ fn fs_rect(v: RectOut) -> @location(0) vec4<f32> {
     return v.color;
 }
 
-// --- Glifos ---
-// El atlas guarda solo cobertura (R8). Como cada glifo se dibuja 1:1 sobre pixeles enteros,
-// se lee con textureLoad en vez de muestrear: no hay filtrado ni coordenadas UV normalizadas.
+// --- Glyphs ---
+// The atlas stores coverage only (R8). Since each glyph is drawn 1:1 on whole pixels, it is
+// read with textureLoad instead of sampled: no filtering and no normalized UV coordinates.
 
 struct GlyphOut {
     @builtin(position) clip: vec4<f32>,

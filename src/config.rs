@@ -1,7 +1,7 @@
-//! Configuración en Lua: carga, validación y valores por defecto.
+//! Lua configuration: loading, validation and defaults.
 //!
-//! `config.lua` devuelve una tabla que se convierte a [`Config`] con serde. Todo es opcional y
-//! los campos desconocidos son un error, para que un `font_sise` no se ignore en silencio.
+//! `config.lua` returns a table converted to [`Config`] with serde. Everything is optional and
+//! unknown fields are an error, so a `font_sise` is not silently ignored.
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -17,8 +17,8 @@ pub const DEFAULT_TITLE: &str = "Ghostty Rust Terminal Emulator";
 
 #[cfg(windows)]
 const DEFAULT_FAMILY: &str = "Consolas";
-// Las dos primeras son las fuentes de solo símbolos de Nerd Fonts (iconos, Powerline). Si no están
-// instaladas se ignoran, y como último recurso se usa cualquier Nerd Font que haya (ver glyphs.rs).
+// The first two are the symbols-only Nerd Fonts (icons, Powerline). If they are not installed
+// they are skipped, and as a last resort any installed Nerd Font is used (see glyphs.rs).
 #[cfg(windows)]
 const DEFAULT_FALLBACK: &[&str] = &[
     "Symbols Nerd Font Mono",
@@ -50,7 +50,7 @@ const DEFAULT_FALLBACK: &[&str] = &["Symbols Nerd Font Mono", "Symbols Nerd Font
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub font: FontConfig,
-    /// Margen alrededor de la cuadrícula, en pixeles lógicos
+    /// Padding around the grid, in logical pixels
     pub padding: f64,
     pub cursor: CursorConfig,
     pub colors: ColorsConfig,
@@ -58,11 +58,11 @@ pub struct Config {
     pub window: WindowConfig,
     pub mouse: MouseConfig,
     pub panes: PanesConfig,
-    /// Líneas de historial (solo al arrancar)
+    /// Lines of history (startup only)
     pub scrollback: usize,
     pub on_shell_exit: ShellExit,
-    /// Quita las teclas que la terminal enlaza por defecto (copiar, pegar, desplazar). Las que
-    /// definas en `keys` siempre mandan sobre las de por defecto.
+    /// Drops the keys the terminal binds by default (copy, paste, scroll). Keys defined in `keys`
+    /// always take precedence over the defaults.
     pub disable_default_keys: bool,
 }
 
@@ -84,23 +84,23 @@ impl Default for Config {
     }
 }
 
-/// Varios paneles: cómo se distingue cuál tiene el foco
+/// Multiple panes: how the focused one is distinguished
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PanesConfig {
-    /// Color de los divisores entre paneles. Por defecto, el del texto muy atenuado.
+    /// Color of the dividers between panes. Defaults to heavily dimmed text color.
     pub border_color: Option<Color>,
-    /// Color del marco del panel con foco. Por defecto, el del cursor.
+    /// Color of the focused pane's frame. Defaults to the cursor color.
     pub focus_color: Option<Color>,
-    /// Color del marco mientras el prefijo (`leader`) espera la tecla siguiente. Por defecto, el
-    /// amarillo de la paleta (índice 3).
+    /// Frame color while the leader (`leader`) waits for the next key. Defaults to the palette's
+    /// yellow (index 3).
     pub leader_color: Option<Color>,
-    /// Cuánto se apaga el texto de los paneles sin foco: 0 no cambia nada, 1 lo hace invisible
+    /// How much unfocused panes' text is dimmed: 0 changes nothing, 1 makes it invisible
     pub inactive_dim: f32,
-    /// Un panel nuevo (o un flotante) arranca en el directorio del panel con foco, si su shell lo
-    /// informa con OSC 7 o, en macOS y Linux, preguntándole al sistema; si no, en `shell.cwd`
+    /// A new pane (or float) starts in the focused pane's directory, if its shell reports it via
+    /// OSC 7 or, on macOS and Linux, by asking the system; otherwise in `shell.cwd`
     pub inherit_cwd: bool,
-    /// Tamaño de un flotante nuevo, como fracción de la ventana
+    /// Size of a new float, as a fraction of the window
     pub float_width: f32,
     pub float_height: f32,
 }
@@ -122,11 +122,11 @@ impl Default for PanesConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FontConfig {
-    /// Nombre de la familia tal como la ve el sistema ("Consolas", "JetBrains Mono"...)
+    /// Family name as the system sees it ("Consolas", "JetBrains Mono"...)
     pub family: String,
-    /// Tamaño en pixeles lógicos (se multiplica por el factor de escala de la pantalla)
+    /// Size in logical pixels (multiplied by the display scale factor)
     pub size: f32,
-    /// Familias a probar, en orden, para los caracteres que la principal no cubre
+    /// Families to try, in order, for characters the main family does not cover
     pub fallback: Vec<String>,
 }
 
@@ -155,11 +155,11 @@ pub enum CursorStyle {
 #[serde(default, deny_unknown_fields)]
 pub struct CursorConfig {
     pub style: CursorStyle,
-    /// Parpadeo del cursor. Los programas que piden un cursor parpadeante (DECSCUSR) lo hacen
-    /// parpadear aunque esto sea `false`. Solo parpadea con la ventana enfocada, y se queda fijo
-    /// mientras se escribe o llega salida.
+    /// Cursor blinking. Programs that request a blinking cursor (DECSCUSR) make it blink even if
+    /// this is `false`. It only blinks while the window is focused, and stays solid while typing
+    /// or while output arrives.
     pub blink: bool,
-    /// Milisegundos que dura cada fase (visible u oculto)
+    /// Duration of each phase (visible or hidden) in milliseconds
     pub blink_ms: u32,
 }
 
@@ -173,7 +173,7 @@ impl Default for CursorConfig {
     }
 }
 
-/// Color en texto: "#rrggbb", "#rgb" o un nombre X11 ("tomato")
+/// Color as text: "#rrggbb", "#rgb" or an X11 name ("tomato")
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color(pub RgbColor);
 
@@ -182,7 +182,7 @@ impl<'de> Deserialize<'de> for Color {
         let text = String::deserialize(deserializer)?;
         RgbColor::parse(&text).map(Color).map_err(|_| {
             de::Error::custom(format!(
-                "color no válido: {text:?} (usa \"#rrggbb\" o un nombre X11)"
+                "invalid color: {text:?} (use \"#rrggbb\" or an X11 name)"
             ))
         })
     }
@@ -194,11 +194,11 @@ pub struct ColorsConfig {
     pub foreground: Option<Color>,
     pub background: Option<Color>,
     pub cursor: Option<Color>,
-    /// Colores de la paleta desde el índice 0 (0–15 son los ANSI, 16–255 el cubo de color y los
-    /// grises); lo que no se da queda por defecto
+    /// Palette colors starting at index 0 (0–15 are ANSI, 16–255 the color cube and the grays);
+    /// anything not given keeps its default
     pub ansi: Option<Vec<Color>>,
-    /// Colores del texto seleccionado. Si faltan, se invierten los de la pantalla (el fondo toma el
-    /// color del texto y viceversa).
+    /// Colors of selected text. If missing, the screen colors are swapped (the background takes
+    /// the text color and vice versa).
     pub selection_foreground: Option<Color>,
     pub selection_background: Option<Color>,
 }
@@ -206,15 +206,15 @@ pub struct ColorsConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShellConfig {
-    /// Si falta, se usa el shell por defecto del sistema (solo al arrancar)
+    /// If missing, the system's default shell is used (startup only)
     pub program: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
-    /// PowerShell no cuenta en qué directorio está (su `cd` no cambia el del proceso). Con esto la
-    /// terminal lo lanza con `-NoExit -Command` y un script que envuelve el prompt para informarlo
-    /// por OSC 7, y así los paneles nuevos y los flotantes arrancan donde estás. No se aplica si
-    /// `args` ya lleva `-Command`, `-File` o `-EncodedCommand`. Solo al arrancar.
+    /// PowerShell does not report its current directory (its `cd` does not change the process one).
+    /// With this, the terminal launches it with `-NoExit -Command` and a prompt-wrapping script
+    /// that reports it via OSC 7, so new panes and floats start where you are. Not applied if `args`
+    /// already contains `-Command`, `-File` or `-EncodedCommand`. Startup only.
     pub integration: bool,
 }
 
@@ -230,7 +230,7 @@ impl Default for ShellConfig {
     }
 }
 
-/// Modificadores en texto: "CTRL|SHIFT", "ALT"... (CTRL, SHIFT, ALT y SUPER)
+/// Modifiers as text: "CTRL|SHIFT", "ALT"... (CTRL, SHIFT, ALT and SUPER)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Modifiers(pub u8);
 
@@ -246,29 +246,29 @@ impl<'de> Deserialize<'de> for Modifiers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decorations {
-    /// Con la barra de título y sus botones del sistema
+    /// With the system title bar and its buttons
     Full,
-    /// Sin barra ni botones. La ventana se redimensiona por los bordes y se mueve con
-    /// `window.drag_modifiers` + arrastrar.
+    /// No bar or buttons. The window is resized by its edges and moved with
+    /// `window.drag_modifiers` + drag.
     None,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowConfig {
-    /// Título fijo de la ventana. Si falta, la ventana muestra el título que pone el programa
-    /// (`DEFAULT_TITLE` hasta que ponga uno).
+    /// Fixed window title. If missing, the window shows the title set by the program
+    /// (`DEFAULT_TITLE` until it sets one).
     pub title: Option<String>,
     pub decorations: Decorations,
-    /// Con `decorations = "none"`: modificadores que, mantenidos al arrastrar con el botón
-    /// izquierdo, mueven la ventana
+    /// With `decorations = "none"`: modifiers that, held while dragging with the left button,
+    /// move the window
     pub drag_modifiers: Modifiers,
-    /// Esquinas redondeadas de la ventana, como decide el sistema (`true`) o cuadradas (`false`).
-    /// Solo tiene efecto en Windows 11.
+    /// Window corners rounded as the system decides (`true`) or square (`false`).
+    /// Only has an effect on Windows 11.
     pub rounded_corners: bool,
-    /// Tamaño inicial de la cuadrícula (solo al arrancar). Si faltan, la ventana tiene el tamaño
-    /// que le dé el sistema; si solo hay uno, el otro es 80 columnas o 24 filas. Es una petición:
-    /// un gestor de ventanas en mosaico puede ignorarla.
+    /// Initial grid size (startup only). If missing, the window gets whatever size the system
+    /// gives it; if only one is set, the other is 80 columns or 24 rows. It is a request:
+    /// a tiling window manager may ignore it.
     pub columns: Option<u16>,
     pub rows: Option<u16>,
 }
@@ -286,7 +286,7 @@ impl Default for WindowConfig {
     }
 }
 
-/// Qué hace el clic derecho cuando el programa no se queda con el ratón
+/// What right click does when the program does not capture the mouse
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RightClick {
@@ -297,12 +297,12 @@ pub enum RightClick {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MouseConfig {
-    /// Al soltar el botón tras seleccionar, el texto va al portapapeles
+    /// On button release after selecting, the text goes to the clipboard
     pub copy_on_select: bool,
     pub right_click: RightClick,
-    /// Líneas que baja o sube cada giro de la rueda
+    /// Lines scrolled per wheel notch
     pub scroll_lines: u16,
-    /// Modificadores que, mantenidos al arrastrar, hacen una selección rectangular
+    /// Modifiers that, held while dragging, make a rectangular selection
     pub rectangle_modifiers: Modifiers,
 }
 
@@ -317,13 +317,13 @@ impl Default for MouseConfig {
     }
 }
 
-/// Qué hacer cuando el shell termina
+/// What to do when the shell exits
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellExit {
-    /// Cerrar la ventana
+    /// Close the window
     Close,
-    /// Dejar la ventana abierta con lo que quedó en pantalla
+    /// Keep the window open with whatever was left on screen
     Hold,
 }
 
@@ -331,62 +331,62 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         if !(self.font.size.is_finite() && (4.0..=200.0).contains(&self.font.size)) {
             return Err(format!(
-                "font.size debe estar entre 4 y 200 (recibió {})",
+                "font.size must be between 4 and 200 (got {})",
                 self.font.size
             ));
         }
         if self.font.family.trim().is_empty() {
-            return Err("font.family no puede estar vacío".to_string());
+            return Err("font.family cannot be empty".to_string());
         }
         if !(self.padding.is_finite() && (0.0..=200.0).contains(&self.padding)) {
             return Err(format!(
-                "padding debe estar entre 0 y 200 (recibió {})",
+                "padding must be between 0 and 200 (got {})",
                 self.padding
             ));
         }
         if !(100..=5000).contains(&self.cursor.blink_ms) {
             return Err(format!(
-                "cursor.blink_ms debe estar entre 100 y 5000 (recibió {})",
+                "cursor.blink_ms must be between 100 and 5000 (got {})",
                 self.cursor.blink_ms
             ));
         }
         if self.window.columns == Some(0) || self.window.rows == Some(0) {
-            return Err("window.columns y window.rows deben ser mayores que 0".to_string());
+            return Err("window.columns and window.rows must be greater than 0".to_string());
         }
         if !(1..=100).contains(&self.mouse.scroll_lines) {
             return Err(format!(
-                "mouse.scroll_lines debe estar entre 1 y 100 (recibió {})",
+                "mouse.scroll_lines must be between 1 and 100 (got {})",
                 self.mouse.scroll_lines
             ));
         }
-        // Arrastrar sin modificadores es seleccionar: los dos gestos necesitan al menos uno, y
-        // distinto entre sí (si no, no habría forma de saber cuál se pide)
+        // Dragging without modifiers is selecting: both gestures need at least one, and they must
+        // differ from each other (otherwise there would be no way to tell which one is meant)
         if self.mouse.rectangle_modifiers.0 == 0 {
             return Err(
-                "mouse.rectangle_modifiers no puede estar vacío (arrastrar solo ya selecciona)"
+                "mouse.rectangle_modifiers cannot be empty (a plain drag already selects)"
                     .to_string(),
             );
         }
         if self.window.decorations == Decorations::None {
             if self.window.drag_modifiers.0 == 0 {
                 return Err(
-                    "window.drag_modifiers no puede estar vacío (arrastrar solo ya selecciona)"
+                    "window.drag_modifiers cannot be empty (a plain drag already selects)"
                         .to_string(),
                 );
             }
             if self.window.drag_modifiers == self.mouse.rectangle_modifiers {
                 return Err(
-                    "window.drag_modifiers y mouse.rectangle_modifiers no pueden ser iguales"
+                    "window.drag_modifiers and mouse.rectangle_modifiers cannot be the same"
                         .to_string(),
                 );
             }
         }
         if self.shell.program.is_none() && !self.shell.args.is_empty() {
-            return Err("shell.args necesita shell.program (con el shell por defecto no se pueden pasar argumentos)".to_string());
+            return Err("shell.args requires shell.program (arguments cannot be passed to the default shell)".to_string());
         }
         if !(0.0..=1.0).contains(&self.panes.inactive_dim) {
             return Err(format!(
-                "panes.inactive_dim debe estar entre 0 y 1 (recibió {})",
+                "panes.inactive_dim must be between 0 and 1 (got {})",
                 self.panes.inactive_dim
             ));
         }
@@ -395,14 +395,14 @@ impl Config {
             ("panes.float_height", self.panes.float_height),
         ] {
             if !(0.1..=1.0).contains(&value) {
-                return Err(format!("{name} debe estar entre 0,1 y 1 (recibió {value})"));
+                return Err(format!("{name} must be between 0.1 and 1 (got {value})"));
             }
         }
         if let Some(ansi) = &self.colors.ansi
             && ansi.len() > 256
         {
             return Err(format!(
-                "colors.ansi admite como máximo 256 colores (recibió {})",
+                "colors.ansi accepts at most 256 colors (got {})",
                 ansi.len()
             ));
         }
@@ -410,18 +410,18 @@ impl Config {
     }
 }
 
-/// Resultado de cargar la configuración al arrancar: nunca falla; si hay un error se usan los
-/// valores por defecto y el motivo viaja en `error` para mostrarlo.
+/// Result of loading the configuration at startup: it never fails; on error the defaults are
+/// used and the reason travels in `error` so it can be shown.
 pub struct Loaded {
     pub config: Config,
-    /// Teclas, hooks y el intérprete de Lua que los ejecuta
+    /// Keys, hooks and the Lua interpreter that runs them
     pub script: Script,
     pub error: Option<String>,
     pub path: Option<PathBuf>,
 }
 
-/// `TERMINAL_CONFIG`, o `%APPDATA%\terminal\config.lua` en Windows, o
-/// `$XDG_CONFIG_HOME`/`~/.config` + `terminal/config.lua` en el resto.
+/// `TERMINAL_CONFIG`, or `%APPDATA%\terminal\config.lua` on Windows, or
+/// `$XDG_CONFIG_HOME`/`~/.config` + `terminal/config.lua` elsewhere.
 pub fn config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("TERMINAL_CONFIG") {
         return Some(PathBuf::from(path));
@@ -449,7 +449,7 @@ pub fn load() -> Loaded {
             path,
         },
         Err(error) => {
-            let (config, script) = default_script().expect("no se pudo crear el intérprete de Lua");
+            let (config, script) = default_script().expect("failed to create the Lua interpreter");
             Loaded {
                 config,
                 script,
@@ -460,13 +460,13 @@ pub fn load() -> Loaded {
     }
 }
 
-/// La configuración de fábrica (la de un archivo que devuelve una tabla vacía): también con sus
-/// teclas por defecto y su prefijo
+/// The factory configuration (that of a file returning an empty table): including its
+/// default keys and its leader
 fn default_script() -> Result<(Config, Script), String> {
     parse_script("return {}", "config.lua", None)
 }
 
-/// Lee y evalúa un archivo de configuración. Si no existe, devuelve los valores por defecto.
+/// Reads and evaluates a configuration file. If it does not exist, returns the defaults.
 pub fn load_script_path(path: &Path) -> Result<(Config, Script), String> {
     match std::fs::read_to_string(path) {
         Ok(source) => {
@@ -477,18 +477,18 @@ pub fn load_script_path(path: &Path) -> Result<(Config, Script), String> {
             parse_script(&source, &name, path.parent())
         }
         Err(e) if e.kind() == ErrorKind::NotFound => default_script(),
-        Err(e) => Err(format!("no se pudo leer {}: {e}", path.display())),
+        Err(e) => Err(format!("could not read {}: {e}", path.display())),
     }
 }
 
-/// Solo la parte declarativa (sin teclas ni hooks); lo usan las pruebas
+/// Only the declarative part (no keys or hooks); used by tests
 #[cfg(test)]
 pub fn parse(source: &str, chunk_name: &str, dir: Option<&Path>) -> Result<Config, String> {
     parse_script(source, chunk_name, dir).map(|(config, _script)| config)
 }
 
-/// Evalúa `source` (el contenido de config.lua) y lo convierte en [`Config`] más el [`Script`]
-/// con sus teclas y hooks. `dir` es la carpeta desde la que `require` busca módulos.
+/// Evaluates `source` (the contents of config.lua) and turns it into [`Config`] plus the [`Script`]
+/// with its keys and hooks. `dir` is the folder `require` searches for modules.
 pub fn parse_script(
     source: &str,
     chunk_name: &str,
@@ -505,13 +505,13 @@ pub fn parse_script(
         .map_err(|e| lua_message(&e))?;
     let Value::Table(table) = value else {
         return Err(format!(
-            "{chunk_name} debe terminar con `return {{ ... }}` (devolvió {})",
+            "{chunk_name} must end with `return {{ ... }}` (returned {})",
             value.type_name()
         ));
     };
 
-    // `keys` y `events` llevan funciones, que serde no puede deserializar: se sacan de la tabla
-    // antes y se interpretan aparte
+    // `keys` and `events` hold functions, which serde cannot deserialize: they are taken out of the
+    // table first and interpreted separately
     let keys: Value = table.get("keys").map_err(|e| lua_message(&e))?;
     let events: Value = table.get("events").map_err(|e| lua_message(&e))?;
     let leader: Value = table.get("leader").map_err(|e| lua_message(&e))?;
@@ -542,8 +542,8 @@ pub fn parse_script(
     Ok((config, script))
 }
 
-/// Acciones nativas que se enlazan a una tecla desde config.lua (`terminal.action.Paste`...). Son
-/// tablas con la clave `action`, que `actions::parse_action` convierte en [`actions::Action`].
+/// Native actions bound to a key from config.lua (`terminal.action.Paste`...). They are
+/// tables with an `action` key, which `actions::parse_action` turns into [`actions::Action`].
 const ACTION_PRELUDE: &str = r#"
 local action = {}
 action.SendString = function(text) return { action = "SendString", text = text } end
@@ -568,7 +568,7 @@ end
 return action
 "#;
 
-/// Lo que `config.lua` tiene a mano además de la biblioteca estándar de Lua
+/// What `config.lua` has at hand besides the Lua standard library
 fn prepare(lua: &Lua, dir: Option<&Path>) -> mlua::Result<()> {
     let terminal = lua.create_table()?;
     terminal.set("os", std::env::consts::OS)?;
@@ -589,7 +589,7 @@ fn prepare(lua: &Lua, dir: Option<&Path>) -> mlua::Result<()> {
     if let Some(dir) = dir {
         let dir = dir.display().to_string().replace('\\', "/");
         terminal.set("config_dir", dir.clone())?;
-        // Para dividir la configuración en módulos con `require`
+        // To split the configuration into modules with `require`
         let package: Table = lua.globals().get("package")?;
         let current: String = package.get("path")?;
         package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua;{current}"))?;
@@ -621,9 +621,9 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.font.size, 16.0);
         assert_eq!(config.padding, 6.0);
-        // Sin tamaño pedido, la ventana conserva el que le da el sistema
+        // With no requested size, the window keeps the one the system gives it
         assert_eq!((config.window.columns, config.window.rows), (None, None));
-        // Sin título fijo, la ventana sigue al programa (y arranca con DEFAULT_TITLE)
+        // With no fixed title, the window follows the program (and starts with DEFAULT_TITLE)
         assert_eq!(config.window.title, None);
         assert_eq!(DEFAULT_TITLE, "Ghostty Rust Terminal Emulator");
         assert_eq!(config.scrollback, 10_000);
@@ -703,21 +703,20 @@ mod tests {
 
     #[test]
     fn wrong_type_reports_the_field_path() {
-        let error = parse_str(r#"return { font = { size = "grande" } }"#).unwrap_err();
+        let error = parse_str(r#"return { font = { size = "large" } }"#).unwrap_err();
         assert!(error.contains("font.size"), "{error}");
     }
 
     #[test]
     fn invalid_color_reports_path_and_value() {
-        let error =
-            parse_str(r#"return { colors = { foreground = "no-es-un-color" } }"#).unwrap_err();
+        let error = parse_str(r#"return { colors = { foreground = "not-a-color" } }"#).unwrap_err();
         assert!(error.contains("colors.foreground"), "{error}");
-        assert!(error.contains("no-es-un-color"), "{error}");
+        assert!(error.contains("not-a-color"), "{error}");
     }
 
     #[test]
     fn invalid_enum_value_lists_the_options() {
-        let error = parse_str(r#"return { cursor = { style = "rombo" } }"#).unwrap_err();
+        let error = parse_str(r#"return { cursor = { style = "diamond" } }"#).unwrap_err();
         assert!(error.contains("cursor.style"), "{error}");
         assert!(error.contains("block"), "{error}");
     }
@@ -789,7 +788,7 @@ mod tests {
 
     #[test]
     fn the_palette_can_go_past_the_sixteen_ansi_colors() {
-        // Kanagawa define los índices 16 y 17 además de los 16 ANSI
+        // Kanagawa defines indices 16 and 17 in addition to the 16 ANSI colors
         let config = parse_str(
             "local t = {} for i = 1, 16 do t[i] = '#000000' end t[17] = '#ffa066' t[18] = '#ff5d62' \
              return { colors = { ansi = t } }",
@@ -822,7 +821,7 @@ mod tests {
         assert!(
             parse_str(r#"return { shell = { program = "pwsh", args = { "-NoLogo" } } }"#).is_ok()
         );
-        // cwd y env sí valen con el shell por defecto
+        // cwd and env do work with the default shell
         assert!(parse_str(r#"return { shell = { cwd = "C:/", env = { A = "1" } } }"#).is_ok());
     }
 
@@ -858,7 +857,7 @@ mod tests {
         winit::keyboard::Key::Character(text.into())
     }
 
-    /// Pulsa una tecla ante el prefijo de un script; `mods` son los bits de `actions::*`
+    /// Presses a key against a script's leader; `mods` are the `actions::*` bits
     fn step(
         script: &Script,
         state: &mut actions::LeaderState,
@@ -877,23 +876,23 @@ mod tests {
         use actions::{Action, LeaderOutcome, LeaderState};
         let script = script_from("return {}").unwrap();
         let mut state = LeaderState::default();
-        // Sin el prefijo, el % es una tecla normal
+        // Without the leader, % is a normal key
         assert!(matches!(
             step(&script, &mut state, &char_key("%"), actions::SHIFT),
             LeaderOutcome::Normal
         ));
-        // Ctrl+B arma el prefijo y no llega al shell
+        // Ctrl+B arms the leader and does not reach the shell
         assert!(matches!(
             step(&script, &mut state, &char_key("b"), actions::CTRL),
             LeaderOutcome::Arm
         ));
         assert!(state.pending());
-        // % llega como Shift+5: el enlace es `%` con LEADER, sin SHIFT
+        // % arrives as Shift+5: the binding is `%` with LEADER, without SHIFT
         assert!(matches!(
             step(&script, &mut state, &char_key("%"), actions::SHIFT),
             LeaderOutcome::Run(Action::SplitRight)
         ));
-        assert!(!state.pending(), "el prefijo se consume con una tecla");
+        assert!(!state.pending(), "the leader is consumed by a key");
         assert!(matches!(
             step(&script, &mut state, &char_key("%"), actions::SHIFT),
             LeaderOutcome::Normal
@@ -962,7 +961,7 @@ mod tests {
                 amount: 2
             })
         ));
-        // w y W son distintas aunque se pruebe sin SHIFT cuando no hay enlace exacto
+        // w and W are distinct even though the lookup retries without SHIFT when there is no exact binding
         assert!(matches!(
             after(char_key("w"), 0),
             LeaderOutcome::Run(Action::ToggleFloats)
@@ -981,7 +980,7 @@ mod tests {
         let mut state = LeaderState::default();
         let now = std::time::Instant::now();
 
-        // Mantener Ctrl+B pulsado no lo arma dos veces ni lo reenvía
+        // Holding Ctrl+B down neither arms it twice nor forwards it
         assert!(matches!(
             step(&script, &mut state, &char_key("b"), actions::CTRL),
             LeaderOutcome::Arm
@@ -990,7 +989,7 @@ mod tests {
             script.leader_step(&mut state, &char_key("b"), actions::CTRL, true, now),
             LeaderOutcome::Ignore
         ));
-        // Pulsar Shift para escribir % no cancela
+        // Pressing Shift to type % does not cancel
         assert!(matches!(
             step(&script, &mut state, &named(NamedKey::Shift), actions::SHIFT),
             LeaderOutcome::Ignore
@@ -1001,21 +1000,21 @@ mod tests {
             LeaderOutcome::Run(_)
         ));
 
-        // Escape cancela y no hace nada más
+        // Escape cancels and does nothing else
         step(&script, &mut state, &char_key("b"), actions::CTRL);
         assert!(matches!(
             step(&script, &mut state, &named(NamedKey::Escape), 0),
             LeaderOutcome::Cancel
         ));
         assert!(!state.pending());
-        // Una tecla sin enlace cancela y se descarta
+        // An unbound key cancels and is discarded
         step(&script, &mut state, &char_key("b"), actions::CTRL);
         assert!(matches!(
             step(&script, &mut state, &char_key("q"), 0),
             LeaderOutcome::Cancel
         ));
         assert!(!state.pending());
-        // Con el prefijo ya cancelado, la siguiente tecla es normal
+        // With the leader already cancelled, the next key is normal
         assert!(matches!(
             step(&script, &mut state, &char_key("x"), 0),
             LeaderOutcome::Normal
@@ -1033,7 +1032,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!state.pending());
-        // Un prefijo que no es Ctrl+letra no tiene carácter que reenviar: solo cancela
+        // A leader that is not Ctrl+letter has no character to forward: it only cancels
         let script = script_from(r#"return { leader = { key = "Space", mods = "ALT" } }"#).unwrap();
         step(
             &script,
@@ -1068,11 +1067,11 @@ mod tests {
             state.deadline(),
             Some(start + std::time::Duration::from_millis(500))
         );
-        // El temporizador de la app lo cancela al vencer
+        // The app's timer cancels it when it expires
         assert!(!state.expire(start + std::time::Duration::from_millis(499)));
         assert!(state.expire(start + std::time::Duration::from_millis(500)));
         assert!(!state.pending());
-        // Y una pulsación tardía, aún sin que el temporizador haya corrido, es una tecla normal
+        // And a late key press, before the timer has run, is a normal key
         script.leader_step(&mut state, &char_key("b"), actions::CTRL, false, start);
         assert!(matches!(
             script.leader_step(
@@ -1162,11 +1161,11 @@ mod tests {
 
     #[test]
     fn leader_errors_explain_themselves() {
-        let error = script_from(r#"return { leader = { tecla = "b" } }"#)
+        let error = script_from(r#"return { leader = { letter = "b" } }"#)
             .err()
             .unwrap();
-        assert!(error.contains("tecla"), "{error}");
-        let error = script_from(r#"return { leader = { key = "NoExiste" } }"#)
+        assert!(error.contains("letter"), "{error}");
+        let error = script_from(r#"return { leader = { key = "DoesNotExist" } }"#)
             .err()
             .unwrap();
         assert!(error.contains("leader.key"), "{error}");
@@ -1184,17 +1183,17 @@ mod tests {
             assert!(error.contains("leader.timeout_ms"), "{error}");
         }
         let error = script_from("return { leader = 3 }").err().unwrap();
-        assert!(error.contains("leader debe ser"), "{error}");
-        // Una tecla de `keys` con la misma combinación que el prefijo: no se sabría cuál hacer
+        assert!(error.contains("leader must be"), "{error}");
+        // A key in `keys` with the same combination as the leader: it would be unclear which to do
         let error =
             script_from(r#"return { keys = { { key = "b", mods = "CTRL", action = "Paste" } } }"#)
                 .err()
                 .unwrap();
         assert!(
-            error.contains("leader") && error.contains("enlazada"),
+            error.contains("leader") && error.contains("already bound"),
             "{error}"
         );
-        // ...salvo que el prefijo esté desactivado
+        // ...unless the leader is disabled
         assert!(script_from(r#"return { leader = false, keys = { { key = "b", mods = "CTRL", action = "Paste" } } }"#).is_ok());
     }
 
@@ -1221,7 +1220,7 @@ mod tests {
     fn without_a_config_file_the_defaults_still_have_their_keys_and_leader() {
         use actions::{LeaderOutcome, LeaderState};
         let path = std::env::temp_dir()
-            .join("terminal-no-existe-2")
+            .join("terminal-does-not-exist-2")
             .join("config.lua");
         let (_config, script) = load_script_path(&path).unwrap();
         assert!(matches!(
@@ -1250,7 +1249,7 @@ mod tests {
         .unwrap();
         let key = |k: winit::keyboard::NamedKey| winit::keyboard::Key::Named(k);
 
-        // Con Shift la tecla llega en mayúscula y aun así coincide
+        // With Shift the key arrives uppercase and still matches
         assert!(matches!(
             script.binding(&char_key("V"), actions::CTRL | actions::SHIFT),
             Some(actions::Action::Paste)
@@ -1263,12 +1262,12 @@ mod tests {
             script.binding(&char_key("l"), actions::ALT),
             Some(actions::Action::SendString { text }) if text == "clear\r"
         ));
-        // La forma corta con el nombre de la acción
+        // The short form with the action name
         assert!(matches!(
             script.binding(&char_key("q"), actions::CTRL),
             Some(actions::Action::Quit)
         ));
-        // Los modificadores tienen que coincidir exactamente
+        // Modifiers must match exactly
         assert!(script.binding(&char_key("v"), actions::CTRL).is_none());
         assert!(
             script
@@ -1290,7 +1289,7 @@ mod tests {
         let Some(actions::Action::Lua(function)) =
             script.binding(&char_key("k"), actions::CTRL | actions::ALT)
         else {
-            panic!("debería ser una función de Lua");
+            panic!("should be a Lua function");
         };
         let commands = script.call(&function.clone(), vec![]);
         assert!(
@@ -1301,7 +1300,7 @@ mod tests {
     #[test]
     fn mouse_and_window_defaults_follow_the_chosen_behavior() {
         let config = Config::default();
-        assert!(config.mouse.copy_on_select, "copiar al seleccionar");
+        assert!(config.mouse.copy_on_select, "copy on select");
         assert_eq!(config.mouse.right_click, RightClick::Paste);
         assert_eq!(config.mouse.scroll_lines, 3);
         assert_eq!(
@@ -1312,7 +1311,7 @@ mod tests {
         assert_eq!(config.window.drag_modifiers, Modifiers(actions::ALT));
         assert!(
             config.window.rounded_corners,
-            "esquinas como las del sistema"
+            "corners as the system draws them"
         );
         assert_eq!(
             (
@@ -1354,7 +1353,7 @@ mod tests {
 
     #[test]
     fn bad_mouse_and_window_options_explain_themselves() {
-        let error = parse_str(r#"return { window = { decorations = "borde" } }"#).unwrap_err();
+        let error = parse_str(r#"return { window = { decorations = "border" } }"#).unwrap_err();
         assert!(
             error.contains("window.decorations") && error.contains("full"),
             "{error}"
@@ -1382,20 +1381,20 @@ mod tests {
 
     #[test]
     fn the_two_drag_gestures_cannot_be_empty_or_collide() {
-        // Arrastrar sin modificadores ya es seleccionar
+        // Dragging without modifiers is already selecting
         let error = parse_str(r#"return { mouse = { rectangle_modifiers = "" } }"#).unwrap_err();
         assert!(error.contains("mouse.rectangle_modifiers"), "{error}");
         let error =
             parse_str(r#"return { window = { decorations = "none", drag_modifiers = "" } }"#)
                 .unwrap_err();
         assert!(error.contains("window.drag_modifiers"), "{error}");
-        // Si son iguales no habría forma de saber cuál se pide
+        // If they are equal there would be no way to tell which one is meant
         let error = parse_str(
             r#"return { window = { decorations = "none", drag_modifiers = "CTRL|ALT" } }"#,
         )
         .unwrap_err();
-        assert!(error.contains("no pueden ser iguales"), "{error}");
-        // Con barra de título, el gesto de mover no se usa: no choca con nada
+        assert!(error.contains("cannot be the same"), "{error}");
+        // With a title bar the move gesture is unused: it conflicts with nothing
         assert!(parse_str(r#"return { window = { drag_modifiers = "CTRL|ALT" } }"#).is_ok());
     }
 
@@ -1428,7 +1427,7 @@ mod tests {
             script.binding(&named(NamedKey::PageDown), actions::SHIFT),
             Some(actions::Action::ScrollPages { amount: 1 })
         ));
-        // Ctrl+C sigue siendo para el programa
+        // Ctrl+C still belongs to the program
         assert!(script.binding(&char_key("c"), actions::CTRL).is_none());
     }
 
@@ -1441,7 +1440,7 @@ mod tests {
                 .is_none()
         );
 
-        // Con las de por defecto desactivadas, las del usuario siguen funcionando
+        // With the defaults disabled, the user's keys still work
         let only_mine = script_from(
             r#"return { disable_default_keys = true,
                         keys = { { key = "v", mods = "CTRL", action = "Paste" } } }"#,
@@ -1457,29 +1456,29 @@ mod tests {
                 .is_none()
         );
 
-        // Una tecla del usuario sustituye a la de por defecto con la misma combinación
+        // A user key replaces the default one with the same combination
         let overridden = script_from(
-            r#"return { keys = { { key = "c", mods = "CTRL|SHIFT", action = terminal.action.SendString("copiar\r") } } }"#,
+            r#"return { keys = { { key = "c", mods = "CTRL|SHIFT", action = terminal.action.SendString("copy\r") } } }"#,
         )
         .unwrap();
         assert!(matches!(
             overridden.binding(&char_key("c"), actions::CTRL | actions::SHIFT),
-            Some(actions::Action::SendString { text }) if text == "copiar\r"
+            Some(actions::Action::SendString { text }) if text == "copy\r"
         ));
-        // ...y el resto de las de por defecto se conservan
+        // ...and the rest of the defaults are kept
         assert!(matches!(
             overridden.binding(&char_key("v"), actions::CTRL | actions::SHIFT),
             Some(actions::Action::Paste)
         ));
 
-        // Dos teclas del usuario con la misma combinación siguen siendo un error
+        // Two user keys with the same combination are still an error
         let error = script_from(
             r#"return { keys = { { key = "c", mods = "CTRL|SHIFT", action = "Copy" },
                                  { key = "C", mods = "CTRL|SHIFT", action = "Quit" } } }"#,
         )
         .err()
         .unwrap();
-        assert!(error.contains("ya estaba enlazada"), "{error}");
+        assert!(error.contains("already bound"), "{error}");
     }
 
     #[test]
@@ -1489,8 +1488,8 @@ mod tests {
         let config =
             parse_str(r#"return { shell = { program = "pwsh", integration = false } }"#).unwrap();
         assert!(!config.shell.integration);
-        let error = parse_str(r#"return { shell = { integracion = true } }"#).unwrap_err();
-        assert!(error.contains("integracion"), "{error}");
+        let error = parse_str(r#"return { shell = { integrations = true } }"#).unwrap_err();
+        assert!(error.contains("integrations"), "{error}");
     }
 
     #[test]
@@ -1517,8 +1516,8 @@ mod tests {
                 parse_str(&format!("return {{ panes = {{ inactive_dim = {bad} }} }}")).unwrap_err();
             assert!(error.contains("panes.inactive_dim"), "{error}");
         }
-        let error = parse_str("return { panes = { borde = 1 } }").unwrap_err();
-        assert!(error.contains("borde"), "{error}");
+        let error = parse_str("return { panes = { border = 1 } }").unwrap_err();
+        assert!(error.contains("border"), "{error}");
     }
 
     #[test]
@@ -1631,11 +1630,11 @@ mod tests {
             "{error}"
         );
 
-        let error = script_from(r#"return { keys = { { key = "v", action = "Pegar" } } }"#)
+        let error = script_from(r#"return { keys = { { key = "v", action = "Pasting" } } }"#)
             .err()
             .unwrap();
         assert!(
-            error.contains("keys[1].action") && error.contains("Pegar"),
+            error.contains("keys[1].action") && error.contains("Pasting"),
             "{error}"
         );
 
@@ -1648,12 +1647,12 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            error.contains("keys[2]") && error.contains("ya estaba enlazada"),
+            error.contains("keys[2]") && error.contains("already bound"),
             "{error}"
         );
 
-        let error = script_from(r#"return { keys = "nada" }"#).err().unwrap();
-        assert!(error.contains("keys debe ser"), "{error}");
+        let error = script_from(r#"return { keys = "nothing" }"#).err().unwrap();
+        assert!(error.contains("keys must be"), "{error}");
     }
 
     #[test]
@@ -1666,18 +1665,15 @@ mod tests {
         assert!(script.has_handler(actions::EventKind::TitleChanged));
         assert!(!script.has_handler(actions::EventKind::ShellExit));
 
-        let error = script_from(r#"return { events = { ["campana"] = function() end } }"#)
+        let error = script_from(r#"return { events = { ["ring"] = function() end } }"#)
+            .err()
+            .unwrap();
+        assert!(error.contains("ring") && error.contains("bell"), "{error}");
+        let error = script_from(r#"return { events = { ["bell"] = "not a function" } }"#)
             .err()
             .unwrap();
         assert!(
-            error.contains("campana") && error.contains("bell"),
-            "{error}"
-        );
-        let error = script_from(r#"return { events = { ["bell"] = "no soy una función" } }"#)
-            .err()
-            .unwrap();
-        assert!(
-            error.contains("bell") && error.contains("función"),
+            error.contains("bell") && error.contains("function"),
             "{error}"
         );
     }
@@ -1687,21 +1683,21 @@ mod tests {
         let script = script_from(
             r#"
             return { events = { ["title-changed"] = function(ctx, title)
-              ctx:log("título: " .. title)
+              ctx:log("title: " .. title)
               ctx:send_text("echo " .. title .. "\r")
               ctx:perform(terminal.action.ScrollToTop)
             end } }
             "#,
         )
         .unwrap();
-        let commands = script.fire(actions::EventKind::TitleChanged, vec![script.text("hola")]);
+        let commands = script.fire(actions::EventKind::TitleChanged, vec![script.text("hello")]);
         assert!(matches!(
             commands.as_slice(),
             [
                 actions::Command::Log(log),
                 actions::Command::SendText(text),
                 actions::Command::Perform(actions::Action::ScrollToTop),
-            ] if log == "título: hola" && text == "echo hola\r"
+            ] if log == "title: hello" && text == "echo hello\r"
         ));
     }
 
@@ -1712,7 +1708,7 @@ mod tests {
                                   ["shell-exit"] = function(ctx) ctx:perform("Nope") end } }"#,
         )
         .unwrap();
-        // El error del hook se registra y no sale: lo que pidió antes de fallar es lo único que queda
+        // The hook's error is logged and does not propagate: what it requested before failing is all that remains
         assert!(script.fire(actions::EventKind::Bell, vec![]).is_empty());
         assert!(
             script
@@ -1725,7 +1721,7 @@ mod tests {
     fn an_infinite_loop_in_the_config_is_aborted_instead_of_freezing_startup() {
         let started = std::time::Instant::now();
         let error = script_from("while true do end").err().unwrap();
-        assert!(error.contains("demasiado"), "{error}");
+        assert!(error.contains("too long"), "{error}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
@@ -1735,21 +1731,21 @@ mod tests {
 
     #[test]
     fn the_example_config_is_valid() {
-        // El ejemplo documentado debe seguir siendo válido a medida que cambia el esquema
+        // The documented example must stay valid as the schema changes
         let (config, script) =
             parse_script(include_str!("../examples/config.lua"), "config.lua", None).unwrap();
         assert_eq!(config.colors.ansi.as_ref().map(Vec::len), Some(16));
-        // PowerShell solo en Windows; en el resto, el shell del sistema
+        // PowerShell only on Windows; elsewhere, the system shell
         let expected_shell = if cfg!(windows) { Some("pwsh") } else { None };
         assert_eq!(config.shell.program.as_deref(), expected_shell);
-        // Las teclas y los hooks del ejemplo también se interpretan sin errores
+        // The example's keys and hooks are also interpreted without errors
         assert!(matches!(
             script.binding(&char_key("v"), actions::CTRL | actions::SHIFT),
             Some(actions::Action::Paste)
         ));
         assert!(script.has_handler(actions::EventKind::ConfigReloaded));
-        // Lo documentado de ratón, ventana y cursor coincide con los valores por defecto, y las
-        // teclas de por defecto siguen ahí porque el ejemplo no las desactiva
+        // The documented mouse, window and cursor settings match the defaults, and the
+        // default keys are still there because the example does not disable them
         let defaults = Config::default();
         assert_eq!(config.mouse, defaults.mouse);
         assert_eq!(config.window.decorations, defaults.window.decorations);
@@ -1761,8 +1757,8 @@ mod tests {
             script.binding(&char_key("C"), actions::CTRL | actions::SHIFT),
             Some(actions::Action::Copy)
         ));
-        // Lo de paneles también: los valores documentados son los de por defecto, el prefijo
-        // arma con Ctrl+B y las teclas de paneles del ejemplo se interpretan
+        // Panes too: the documented values are the defaults, the leader
+        // arms with Ctrl+B and the example's pane keys are interpreted
         assert_eq!(config.panes, defaults.panes);
         let mut state = actions::LeaderState::default();
         assert!(matches!(
@@ -1790,7 +1786,7 @@ mod tests {
     #[test]
     fn missing_file_gives_defaults() {
         let path = std::env::temp_dir()
-            .join("terminal-no-existe")
+            .join("terminal-does-not-exist")
             .join("config.lua");
         let (config, _script) = load_script_path(&path).unwrap();
         assert_eq!(config, Config::default());
