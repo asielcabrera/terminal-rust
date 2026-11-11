@@ -1260,9 +1260,9 @@ mod tests {
         );
 
         let mut seen = Vec::new();
-        // 5s: a cold Windows CI can take several seconds to spawn cmd.exe, tear down ConPTY and
-        // ride out the exit-notice grace; the assertion only needs the order, not the timing
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // 10s: a cold Windows CI can take a while to spawn cmd.exe, tear down ConPTY and ride
+        // out the exit-notice grace; the assertion only needs the order, not the timing
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match events.recv_timeout(Duration::from_millis(50)) {
                 Ok(event) => seen.push(event),
@@ -1292,10 +1292,24 @@ mod tests {
         {
             assert!(output_pos > state_pos, "output arrived before the state");
         }
+        // Dump what the probe saw when the exit is missing: the events list is the diagnosis
+        let dump: Vec<String> = seen
+            .iter()
+            .map(|event| match event {
+                LayoutEvent::State(_, created) => match created {
+                    Some(created) => format!("State(created pane {:?})", created.pane),
+                    None => "State(no created)".to_string(),
+                },
+                LayoutEvent::LastPaneClosed => "LastPaneClosed".to_string(),
+                LayoutEvent::Error(error) => format!("Error({error})"),
+                LayoutEvent::PaneOutput(pane) => format!("PaneOutput({pane:?})"),
+                LayoutEvent::PaneExited(pane) => format!("PaneExited({pane:?})"),
+            })
+            .collect();
         let exit_pos = seen
             .iter()
             .position(|event| matches!(event, LayoutEvent::PaneExited(PaneId(1))))
-            .expect("the program exits");
+            .unwrap_or_else(|| panic!("the program exits; saw {dump:?}"));
         assert!(exit_pos > state_pos, "the exit arrived before the state");
     }
 
