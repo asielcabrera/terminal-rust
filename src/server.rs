@@ -654,11 +654,14 @@ mod tests {
         let server = Server::start();
         // Floods output and is never drained. Each line goes back to the top-left corner: the
         // screen never scrolls, which is slow in debug builds of libghostty.
-        let flood = running(
-            "yes \"$(printf 'flood\\033[H')\"",
-            // decodes to: while($true){[Console]::Out.Write(('flood' + [char]27 + '[H') * 40000)}
-            "powershell -NoProfile -EncodedCommand dwBoAGkAbABlACgAJAB0AHIAdQBlACkAewBbAEMAbwBuAHMAbwBsAGUAXQA6ADoATwB1AHQALgBXAHIAaQB0AGUAKAAoACcAZgBsAG8AbwBkACcAIAArACAAWwBjAGgAYQByAF0AMgA3ACAAKwAgACcAWwBIACcAKQAgACoAIAA0ADAAMAAwADAAKQB9AA==",
+        // windows: PowerShell's console writes only moved ~13KB in 10s through ConPTY, so flood
+        // with plain cmd echoes of one 8KB literal: at ~1600 echoes/s, 200 iterations (~1.6MB)
+        // finish quickly, and the raw ESC[H before each echo keeps the screen from scrolling.
+        let windows_flood = format!(
+            "for /L %i in (1,1,200) do @echo \u{1b}[H{}",
+            "y".repeat(8000)
         );
+        let flood = running("yes \"$(printf 'flood\\033[H')\"", &windows_flood);
         let (mut flooding, _, flood_events) = create(&server, &flood, true).unwrap();
         assert!(wait_for(&flood_events, IoEvent::Output));
         std::thread::sleep(Duration::from_millis(300));
