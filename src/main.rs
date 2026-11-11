@@ -21,13 +21,16 @@ use libghostty_vt::paste;
 use libghostty_vt::terminal::{Mode, ScrollViewport};
 use mlua::Value;
 use mouse::MouseState;
-use pane::{MAX_CHUNKS_PER_WAKE, Pane, apply_theme, with_integration};
+use pane::{MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, with_integration};
+use pane_io::{IoEvent, Notify};
 use renderer::{PaneView, Renderer};
 use server::{
-    AddFloatOp, CreatedPane, FocusDirOp, LayoutEvent, MoveFloatOp, Request, ResizeOp, Server,
-    ServerHandle, SplitOp,
+    AttachAnswer, ControlDown, IpcConn, IpcEndpoint, OpSender, wire,
+    wire::{WireEventKind, WireReplyKind, WireShell},
 };
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -55,7 +58,7 @@ const MIN_PANE_ROWS: u32 = 3;
 #[derive(Debug)]
 enum UserEvent {
     /// The server applied a layout mutation, or a pane's program wrote or exited
-    Layout(LayoutEvent),
+    Layout(WireEventKind),
     /// The configuration file changed on disk
     ConfigChanged,
 }
@@ -165,8 +168,56 @@ struct App {
     leader: LeaderState,
     key_encoder: Encoder<'static>,
     mods: Mods,
-    /// Owns the programs behind the panes
-    server: ServerHandle,
+    /// Owns the programs behind the panes, over the server-process connection
+    conn: IpcConn,
+    /// The op sender the mouse driver uses, shaped like the in-process handle it replaced
+    server: OpSender,
+    /// Wakes the UI loop from the reader thread when a pane's output arrives
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+/// How often a starting window retries the server connection after spawning (and spawning) it
+const CONNECT_RETRIES: usize = 50;
+
+/// Starts `terminal server` detached, when no server answered: its own process group (nothing
+/// dies with this window's process group), no console window on Windows, and no inherited output.
+fn spawn_detached_server() {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("[server] could not locate the executable: {error}");
+            return;
+        }
+    };
+    let mut command = ProcessCommand::new(exe);
+    command.arg("server");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    if let Err(error) = command.spawn() {
+        eprintln!("[server] could not start the server process: {error}");
+    }
+}
+
+/// Wakes the UI loop when a pane's data feed receives output (the connection's reader thread
+/// calls this, exactly like a local PTY's reader thread would)
+fn output_notify(proxy: EventLoopProxy<UserEvent>, pane: PaneId) -> Notify {
+    Arc::new(move |event| {
+        if let IoEvent::Output = event {
+            let _ = proxy.send_event(UserEvent::Layout(WireEventKind::PaneOutput { pane }));
+        }
+    })
 }
 
 impl App {
@@ -210,7 +261,7 @@ impl App {
         if self.layout.focus() == id {
             return;
         }
-        self.server.send(Request::LayoutSetFocus { pane: id });
+        self.conn.send_op(wire::WireOp::SetFocus { pane: id });
     }
 
     fn redraw_window(&self) {
@@ -269,20 +320,20 @@ impl App {
         if let Some(cwd) = cwd {
             shell.cwd = Some(cwd);
         }
-        self.server.send(Request::LayoutSplit(SplitOp {
+        self.conn.send_op(wire::WireOp::Split {
             pane: target,
             dir: match axis {
                 Axis::Horizontal => layout::Dir::Right,
                 Axis::Vertical => layout::Dir::Down,
             },
-            shell: with_integration(shell),
+            shell: WireShell::from_config(&with_integration(shell)),
             explicit: false,
             cols,
             rows,
             scrollback: self.config.scrollback,
             area,
             limits,
-        }));
+        });
     }
 
     /// Opens a floating pane and focuses it. With `program` it runs that program instead of the
@@ -314,15 +365,15 @@ impl App {
         if let Some(cwd) = cwd {
             shell.cwd = Some(cwd);
         }
-        self.server.send(Request::LayoutAddFloat(AddFloatOp {
-            shell: with_integration(shell),
+        self.conn.send_op(wire::WireOp::AddFloat {
+            shell: WireShell::from_config(&with_integration(shell)),
             explicit,
             width,
             height,
             cols,
             rows,
             scrollback: self.config.scrollback,
-        }));
+        });
     }
 
     /// Hides or shows the floating panes; if there are none, opens one
@@ -331,7 +382,7 @@ impl App {
             self.new_float(None, None, None, None);
             return;
         }
-        self.server.send(Request::LayoutToggleFloats);
+        self.conn.send_op(wire::WireOp::ToggleFloats);
     }
 
     /// Moves the focused floating pane `amount` cells toward `direction`
@@ -354,26 +405,26 @@ impl App {
             Direction::Up => (0, -vertical),
             Direction::Down => (0, vertical),
         };
-        self.server.send(Request::LayoutMoveFloat(MoveFloatOp {
+        self.conn.send_op(wire::WireOp::MoveFloat {
             pane: focus,
             dx,
             dy,
             window: area,
-        }));
+        });
     }
 
     fn focus_direction(&mut self, direction: Direction) {
         let Some(area) = self.window_area() else {
             return;
         };
-        self.server.send(Request::LayoutFocusDir(FocusDirOp {
+        self.conn.send_op(wire::WireOp::FocusDir {
             dir: layout_dir(direction),
             area,
-        }));
+        });
     }
 
     fn focus_cycle(&mut self, forward: bool) {
-        self.server.send(Request::LayoutFocusCycle { forward });
+        self.conn.send_op(wire::WireOp::FocusCycle { forward });
     }
 
     /// Moves the focused pane's border `amount` cells toward `direction`
@@ -388,13 +439,13 @@ impl App {
             Direction::Left | Direction::Right => cell_width,
             Direction::Up | Direction::Down => cell_height,
         };
-        self.server.send(Request::LayoutResize(ResizeOp {
+        self.conn.send_op(wire::WireOp::Resize {
             pane: self.layout.focus(),
             dir: layout_dir(direction),
             delta: u32::from(amount) * step,
             area,
             limits,
-        }));
+        });
     }
 
     /// Rectangles of the lines separating the tiled panes
@@ -413,13 +464,14 @@ impl App {
     /// Closes a pane. If it was the last tiled one, the server kills everything and tells the
     /// window to quit.
     fn close_pane(&mut self, id: PaneId) {
-        self.server.send(Request::LayoutClose { pane: id });
+        self.conn.send_op(wire::WireOp::Close { pane: id });
     }
 
     /// Rebuilds the projection from a server state event and syncs the panes with it
-    fn apply_state(&mut self, state: LayoutState, created: Option<CreatedPane>) {
+    fn apply_state(&mut self, state: LayoutState, created: Option<wire::IpcCreatedPane>) {
         self.layout = Layout::from_state(state);
-        // Panes the server removed are gone: dropping them kills their blocks
+        // Panes the server removed are gone: this window's panes do not hold blocks anymore (the
+        // shells live in the server process), dropping them only frees the view
         let gone: Vec<PaneId> = self
             .panes
             .iter()
@@ -432,12 +484,20 @@ impl App {
         }
         if let Some(created) = created {
             let pane_id = created.pane;
-            match Pane::from_block(&self.config, created, None, self.lua_tx.clone()) {
+            let notify = output_notify(self.proxy.clone(), pane_id);
+            let seed = PaneSeed {
+                pane: created.pane,
+                cols: created.cols,
+                rows: created.rows,
+                notice: created.notice,
+                io: Box::new(self.conn.open_block(created.block, notify)),
+            };
+            match Pane::from_source(&self.config, seed, None, self.lua_tx.clone()) {
                 Ok(pane) => self.panes.push(pane),
                 Err(error) => {
                     eprintln!("[panes] {error}");
                     // The window could not wrap the block: close the pane server-side too
-                    self.server.send(Request::LayoutClose { pane: pane_id });
+                    self.conn.send_op(wire::WireOp::Close { pane: pane_id });
                 }
             }
         }
@@ -577,7 +637,7 @@ impl App {
             Action::FocusNext => self.focus_cycle(true),
             Action::FocusPrevious => self.focus_cycle(false),
             Action::ResizePane { dir, amount } => self.resize_pane(dir, amount),
-            Action::ToggleZoom => self.server.send(Request::LayoutToggleZoom),
+            Action::ToggleZoom => self.conn.send_op(wire::WireOp::ToggleZoom),
             Action::NewFloat {
                 program,
                 args,
@@ -1062,18 +1122,22 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Layout(LayoutEvent::State(state, created)) => {
+            UserEvent::Layout(WireEventKind::State { state, created }) => {
                 self.apply_state(state, created);
             }
-            UserEvent::Layout(LayoutEvent::LastPaneClosed) => {
+            UserEvent::Layout(WireEventKind::LastPaneClosed) => {
                 for pane in &mut self.panes {
                     pane.kill();
                 }
                 event_loop.exit();
             }
-            UserEvent::Layout(LayoutEvent::Error(error)) => eprintln!("[panes] {error}"),
-            UserEvent::Layout(LayoutEvent::PaneOutput(id)) => self.drain_pty(event_loop, id),
-            UserEvent::Layout(LayoutEvent::PaneExited(id)) => self.shell_exited(event_loop, id),
+            UserEvent::Layout(WireEventKind::Error { message }) => eprintln!("[panes] {message}"),
+            UserEvent::Layout(WireEventKind::PaneOutput { pane: id }) => {
+                self.drain_pty(event_loop, id)
+            }
+            UserEvent::Layout(WireEventKind::PaneExited { pane: id }) => {
+                self.shell_exited(event_loop, id)
+            }
             UserEvent::ConfigChanged => self.reload_config(event_loop),
         }
     }
@@ -1103,9 +1167,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                for pane in &mut self.panes {
-                    pane.kill();
-                }
+                // The shells and the layout outlive the window: closing ends this session and
+                // leaves the blocks running headless; re-attaching rebuilds the projection
                 event_loop.exit();
             }
 
@@ -1179,49 +1242,131 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
-    // 0. Load config.lua. If it fails, defaults are used and the error is written to the
-    // first pane's grid once its terminal exists.
+    // 0. `terminal server` runs the headless server process and never returns to this window
+    match std::env::args().nth(1).as_deref() {
+        Some("server") => {
+            server::run_server_process();
+            unreachable!("the server process serves until it is killed");
+        }
+        // Reachable for future subcommands only; today the binary is the window and the server
+        Some(other) => {
+            eprintln!("unknown subcommand {other:?}; usage: terminal [server]");
+            std::process::exit(2);
+        }
+        None => {}
+    }
+
+    // 1. Load config.lua. If it fails, defaults are used and the error is written to the first
+    //    pane's grid once its terminal exists.
     let loaded = config::load();
     if let Some(error) = &loaded.error {
         eprintln!("[config] {error}");
     }
     let config = loaded.config;
 
-    // 1. Set the initial dimensions (`resumed` later fits them to the real window size)
+    // 2. Set the initial dimensions (`resumed` later fits them to the real window size)
     let cols = config.window.columns.unwrap_or(DEFAULT_COLUMNS);
     let rows = config.window.rows.unwrap_or(DEFAULT_ROWS);
 
-    // 2. Create the winit event loop (the window is created in `resumed`). It sleeps until
-    // an event arrives; each pane's threads wake it through the proxy.
+    // 3. Create the winit event loop (the window is created in `resumed`). It sleeps until
+    //    an event arrives; the connection's threads wake it through the proxy.
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    // 3. The server owns the layout and the blocks. The first pane is created through it, and
-    //    its events (layout state after every mutation, pane output and exits) wake the UI loop.
+    // 4. The server is its own process: connect (starting it detached if it is not running),
+    //    and attach. The connection's reader thread forwards events to the UI loop; it also
+    //    answers the asks (attach, the working directory) by rid.
     let (lua_tx, lua_events) = channel::<(PaneId, LuaEvent)>();
-    let (server, layout_events) = Server::start();
-    {
-        let proxy = proxy.clone();
-        thread::spawn(move || {
-            while let Ok(event) = layout_events.recv() {
-                if proxy.send_event(UserEvent::Layout(event)).is_err() {
+    let endpoint = IpcEndpoint::resolve();
+    let (conn, read) = match IpcConn::connect(&endpoint) {
+        Ok(connected) => connected,
+        Err(_) => {
+            spawn_detached_server();
+            let mut connected = None;
+            for _ in 0..CONNECT_RETRIES {
+                thread::sleep(Duration::from_millis(100));
+                if let Ok(connected_now) = IpcConn::connect(&endpoint) {
+                    connected = Some(connected_now);
                     break;
                 }
             }
+            connected.unwrap_or_else(|| panic!("could not start or reach the terminal server"))
+        }
+    };
+    {
+        let conn = conn.clone();
+        let reader_proxy = proxy.clone();
+        thread::spawn(move || {
+            conn.read_loop(read, move |down| match down {
+                ControlDown::Event(event) => {
+                    let _ = reader_proxy.send_event(UserEvent::Layout(event));
+                }
+                ControlDown::Reply(reply) => {
+                    // The attach and the directory asks are correlated by rid; the only
+                    // uncorrelated reply is the busy gate put up before this session existed
+                    if matches!(reply.reply, WireReplyKind::Busy) {
+                        eprintln!("[window] another window is driving this terminal server");
+                        std::process::exit(1);
+                    }
+                    if reply.v != wire::WIRE_VERSION {
+                        eprintln!(
+                            "[client] the server speaks protocol version {}; dropping it",
+                            reply.v
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            });
         });
     }
     let shell = with_integration(config.shell.clone());
-    let (state, created) = server
-        .init(&shell, cols, rows, config.scrollback)
+    let answer = conn
+        .attach(&shell, cols, rows, config.scrollback)
         .unwrap_or_else(|error| panic!("{error}"));
-    let pane = Pane::from_block(
-        &config,
-        created,
-        loaded.error.as_deref().map(|error| ("config", error)),
-        lua_tx.clone(),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let (state, panes) = match answer {
+        AttachAnswer::Fresh { state, pane } => {
+            let notify = output_notify(proxy.clone(), pane.pane);
+            let seed = PaneSeed {
+                pane: pane.pane,
+                cols: pane.cols,
+                rows: pane.rows,
+                notice: pane.notice,
+                io: Box::new(conn.open_block(pane.block, notify)),
+            };
+            let pane = Pane::from_source(
+                &config,
+                seed,
+                loaded.error.as_deref().map(|error| ("config", error)),
+                lua_tx.clone(),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            (state, vec![pane])
+        }
+        AttachAnswer::Existing { state, panes: list } => {
+            // Every live pane of the session rebuilds from the answer (its snapshot arrives on
+            // the data channel, before any of the block's live chunks)
+            let mut built = Vec::new();
+            for info in list {
+                let notify = output_notify(proxy.clone(), info.pane);
+                let seed = PaneSeed {
+                    pane: info.pane,
+                    cols: info.cols,
+                    rows: info.rows,
+                    notice: info.notice,
+                    io: Box::new(conn.open_block(info.block, notify)),
+                };
+                match Pane::from_source(&config, seed, None, lua_tx.clone()) {
+                    Ok(pane) => built.push(pane),
+                    Err(error) => {
+                        eprintln!("[panes] {error}");
+                        conn.send_op(wire::WireOp::Close { pane: info.pane });
+                    }
+                }
+            }
+            (state, built)
+        }
+    };
 
     // The configuration file is watched so it is reloaded on save
     if let Some(path) = &loaded.path {
@@ -1247,14 +1392,16 @@ fn main() {
         window: None,
         renderer: None,
         focused: true,
-        panes: vec![pane],
+        panes,
         layout: Layout::from_state(state),
         leader: LeaderState::default(),
         key_encoder: Encoder::new().unwrap(),
         mods: Mods::empty(),
-        server,
+        conn: conn.clone(),
+        server: OpSender::new(conn),
+        proxy,
     };
 
-    // 4. Main event loop
+    // 5. Main event loop
     let _ = event_loop.run_app(&mut app);
 }

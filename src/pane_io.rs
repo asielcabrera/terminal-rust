@@ -1,6 +1,6 @@
-//! Where a pane's bytes come from and go to: the program running in it. Today that is a local PTY
-//! ([`LocalPty`]); a connection to a terminal server can implement [`PaneIo`] later without the
-//! pane, which owns the libghostty terminal, noticing the difference.
+//! Where a pane's bytes come from and go to: the program running in it. A [`LocalPty`], or a
+//! server link (`ServerBlock` in-process, `IpcBlock` when the server is its own process): the
+//! pane, which owns the libghostty terminal, never notices the difference.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -52,7 +52,8 @@ pub(crate) const CHANNEL_CAPACITY: usize = 64;
 /// A program running in a PTY of this machine
 pub struct LocalPty {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Detached by [`LocalPty::take_writer`] when a dedicated writer thread owns the write end
+    writer: Option<Box<dyn Write + Send>>,
     rx: Receiver<Vec<u8>>,
     /// A chunk taken out by [`LocalPty::output_finished`] to not lose it
     stashed: Option<Vec<u8>>,
@@ -169,7 +170,7 @@ impl LocalPty {
 
         let pty = LocalPty {
             master: pair.master,
-            writer,
+            writer: Some(writer),
             stashed: None,
             rx,
             wake_pending,
@@ -182,8 +183,10 @@ impl LocalPty {
 
 impl PaneIo for LocalPty {
     fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Some(writer) = self.writer.as_mut() {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
     }
 
     fn try_read(&mut self) -> Option<Vec<u8>> {
@@ -225,6 +228,16 @@ impl PaneIo for LocalPty {
 }
 
 impl LocalPty {
+    /// Detaches the write end for a dedicated writer thread: writing to a full PTY pipe can
+    /// block, and the server loop must never block on one block's write. It hands the write end
+    /// to one thread per block, which also keeps the write order per block. After this only the
+    /// writer thread writes; [`LocalPty::write`] (tests, and a link-less pane) writes nothing.
+    pub(crate) fn take_writer(&mut self) -> Box<dyn Write + Send> {
+        self.writer
+            .take()
+            .expect("the PTY's write end was already detached")
+    }
+
     /// Whether the output really ended: the reader thread finished (the channel is disconnected)
     /// and nothing is left, so no chunk can arrive anymore. A chunk met on the way is stashed for
     /// the next [`LocalPty::try_read`].

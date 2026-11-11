@@ -331,6 +331,16 @@ pub struct LayoutState {
     pub history: Vec<PaneId>,
 }
 
+impl LayoutState {
+    /// Every pane in the state, tiled and floating
+    pub fn pane_ids(&self) -> Vec<PaneId> {
+        let mut ids = Vec::new();
+        self.root.leaves(&mut ids);
+        ids.extend(self.floats.iter().map(|pane| pane.id));
+        ids
+    }
+}
+
 /// What happened when closing a pane
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closed {

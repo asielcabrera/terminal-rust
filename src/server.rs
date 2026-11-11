@@ -7,14 +7,21 @@
 //! blocks, and reports one [`LayoutEvent::State`] per applied mutation so the window can rebuild
 //! its read-only projection.
 //!
+//! The server can also be its own process (`terminal server`), reached over local IPC: the wire
+//! section carries the same ops and events as JSON then, over a socket the window and the server
+//! process share, and a session thread plays the window's role server-side (see the
+//! "server process" section at the bottom of this file). The in-process link stays for tests.
+//!
 //! The server-side terminal never answers the program's queries: the client's terminal does,
 //! through [`PaneIo::write`], exactly as with a local PTY.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +33,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::ShellConfig;
 use crate::layout::{Closed, Dir, Edge, Layout, LayoutState, Limits, PaneId, Path, Rect};
 use crate::pane_io::{CHANNEL_CAPACITY, IoEvent, LocalPty, Notify, PaneIo};
+
+use self::wire::{
+    WIRE_VERSION, WireEvent, WireEventKind, WireOp, WireReply, WireReplyKind, WireRequest,
+};
 
 /// Identifies a block within its server
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,6 +169,15 @@ pub(crate) enum Request {
         scrollback: usize,
         reply: Sender<Result<(LayoutState, CreatedPane), String>>,
     },
+    /// Attaches a session: a fresh server runs init ("fresh server start behaves like Init");
+    /// an existing layout answers its state and its live panes with their block tokens
+    Attach {
+        shell: ShellConfig,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+        reply: Sender<AttachOutcome>,
+    },
     LayoutSplit(SplitOp),
     LayoutClose {
         pane: PaneId,
@@ -200,6 +220,27 @@ pub(crate) enum Request {
     Exited(BlockId),
     /// Every handle was dropped
     Shutdown,
+    /// A request handler that panics on purpose (the run loop must survive it)
+    #[cfg(test)]
+    Panic,
+}
+
+/// What a session is told for its attach: a fresh server ran init (the created pane's block view
+/// travels in the reply), an existing one reports its state and its live panes with their block
+/// tokens (the session pulls their block views from its own map)
+#[derive(Debug)]
+pub(crate) enum AttachOutcome {
+    Fresh(Result<(LayoutState, CreatedPane), String>),
+    Existing(LayoutState, Vec<AttachedPaneInfo>),
+}
+
+/// A live pane in an attach: the pane, its block token, and the size to start the pane at
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttachedPaneInfo {
+    pub pane: PaneId,
+    pub block: BlockId,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 impl fmt::Debug for Request {
@@ -207,6 +248,7 @@ impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Request::Init { .. } => "Init(..)",
+            Request::Attach { .. } => "Attach(..)",
             Request::LayoutSplit(_) => "LayoutSplit(..)",
             Request::LayoutClose { .. } => "LayoutClose{..}",
             Request::LayoutSetFocus { .. } => "LayoutSetFocus{..}",
@@ -230,6 +272,8 @@ impl fmt::Debug for Request {
             Request::Drain(_) => "Drain(..)",
             Request::Exited(_) => "Exited(..)",
             Request::Shutdown => "Shutdown",
+            #[cfg(test)]
+            Request::Panic => "Panic",
         })
     }
 }
@@ -252,6 +296,10 @@ struct Block {
     output: SyncSender<Vec<u8>>,
     /// The chunk that did not fit in `output`; it goes first when the client reads
     pending: Option<Vec<u8>>,
+    /// The PTY's write end, owned by this block's dedicated writer thread: writes queue in the
+    /// channel and are applied one by one, never blocking the server loop (one thread per block,
+    /// so the write order per block is preserved)
+    writer: Sender<Vec<u8>>,
     /// When the program's exit was noticed; the exit notice waits until every chunk was forwarded
     exit_requested: Option<Instant>,
     client: Client,
@@ -262,6 +310,9 @@ pub struct Server {
     blocks: HashMap<BlockId, Block>,
     /// Which pane of the layout each block belongs to
     pane_blocks: HashMap<PaneId, BlockId>,
+    /// The grid size each live pane was last spawned or resized at, for an attach's live pane
+    /// list. The server cannot derive a pane's grid from the layout: the window owns the pixels.
+    pane_grids: HashMap<PaneId, (u16, u16)>,
     next_id: u64,
     /// Pane ids are allocated here and never reused, not even after a rolled-back spawn
     next_pane_id: u32,
@@ -270,6 +321,8 @@ pub struct Server {
     requests: Sender<Request>,
     /// Layout events for the window (state after every applied mutation, pane output and exits)
     events: Sender<LayoutEvent>,
+    /// Set by `Shutdown`: the run loop keeps serving until the current request is handled
+    shutdown: bool,
 }
 
 impl Server {
@@ -286,11 +339,13 @@ impl Server {
                 let server = Server {
                     blocks: HashMap::new(),
                     pane_blocks: HashMap::new(),
+                    pane_grids: HashMap::new(),
                     next_id: 0,
                     next_pane_id: 0,
                     layout: None,
                     requests: own,
                     events,
+                    shutdown: false,
                 };
                 server.run(inbox);
             })
@@ -303,120 +358,165 @@ impl Server {
 
     fn run(mut self, inbox: Receiver<Request>) {
         while let Ok(request) = inbox.recv() {
-            match request {
-                Request::Init {
-                    shell,
-                    cols,
-                    rows,
-                    scrollback,
-                    reply,
-                } => {
-                    let _ = reply.send(self.init_layout(&shell, cols, rows, scrollback));
-                }
-                Request::LayoutSplit(op) => self.split_pane(op),
-                Request::LayoutClose { pane } => self.close_pane(pane),
-                Request::LayoutSetFocus { pane } => self.apply(|layout| layout.set_focus(pane)),
-                Request::LayoutFocusDir(op) => {
-                    self.apply(|layout| layout.focus_dir(op.dir, op.area))
-                }
-                Request::LayoutFocusCycle { forward } => {
-                    self.apply(|layout| layout.focus_cycle(forward));
-                }
-                Request::LayoutResize(op) => self
-                    .apply(|layout| layout.resize(op.pane, op.dir, op.delta, op.area, op.limits)),
-                Request::LayoutSetDivider(op) => self
-                    .apply(|layout| layout.set_divider(&op.path, op.boundary, op.area, op.limits)),
-                Request::LayoutToggleZoom => self.apply(Layout::toggle_zoom),
-                Request::LayoutAddFloat(op) => self.add_float(op),
-                Request::LayoutToggleFloats => self.apply(Layout::toggle_floats),
-                Request::LayoutMoveFloat(op) => {
-                    self.apply(|layout| layout.move_float(op.pane, op.dx, op.dy, op.window))
-                }
-                Request::LayoutResizeFloatEdge(op) => self.apply(|layout| {
-                    layout.resize_float_edge(op.pane, op.edge, op.dx, op.dy, op.window, op.limits)
-                }),
-                #[cfg(test)]
-                Request::Create {
-                    shell,
-                    explicit,
-                    cols,
-                    rows,
-                    scrollback,
-                    client,
-                    reply,
-                } => {
-                    let created = self.create(&shell, explicit, cols, rows, scrollback, client);
-                    let _ = reply.send(created);
-                }
-                Request::Write(id, bytes) => {
-                    if let Some(block) = self.blocks.get_mut(&id) {
-                        block.pty.write(&bytes);
-                    }
-                }
-                Request::Resize(id, cols, rows) => {
-                    if let Some(block) = self.blocks.get_mut(&id) {
-                        block.pty.resize(cols, rows);
-                        // The server has no pixels: 1×1 cells
-                        let _ = block.terminal.resize(cols, rows, 1, 1);
-                    }
-                }
-                Request::Kill(id) => {
-                    if let Some(block) = self.blocks.get_mut(&id) {
-                        block.pty.kill();
-                    }
-                }
-                Request::Close(id) => {
-                    if let Some(mut block) = self.blocks.remove(&id) {
-                        block.pty.kill();
-                        self.pane_blocks.retain(|_, &mut block_id| block_id != id);
-                    }
-                }
-                Request::ForegroundDir(id, reply) => {
-                    let dir = self
-                        .blocks
-                        .get(&id)
-                        .and_then(|block| block.pty.foreground_dir());
-                    let _ = reply.send(dir);
-                }
-                Request::Snapshot(id, reply) => {
-                    let bytes = self
-                        .blocks
-                        .get(&id)
-                        .map(|block| snapshot(&block.terminal))
-                        .unwrap_or_default();
-                    let _ = reply.send(bytes);
-                }
-                Request::Drain(id) => {
-                    let finished = self.drain(id);
-                    self.maybe_exit(id, finished);
-                }
-                Request::Exited(id) => {
-                    // The last thing the program wrote goes before the exit: the notice waits
-                    // until every chunk was forwarded
-                    if let Some(block) = self.blocks.get_mut(&id)
-                        && block.exit_requested.is_none()
-                    {
-                        block.exit_requested = Some(Instant::now());
-                    } // The reader usually closes right after the child dies, which fires the exit
-                    // on the next drain. ConPTY can keep the pipe open forever, so wait a bounded
-                    // grace for it while the block is drained
-                    let grace = Instant::now() + EXIT_GRACE;
-                    loop {
-                        let finished = self.drain(id);
-                        if self.maybe_exit(id, finished) || !finished {
-                            break; // reported, or paused: a later drain (a client read) re-checks
-                        }
-                        if Instant::now() >= grace {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                }
-                Request::Shutdown => break,
+            // A panicking request handler must not take the whole server down: the panic is
+            // contained here and the thread keeps serving (advisory A4 of the review). The
+            // reply channels die with the request, which every ask path already treats as
+            // "the request did not go through".
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(request)));
+            if outcome.is_err() {
+                eprintln!("[server] a request panicked; the server keeps serving");
+            }
+            if self.shutdown {
+                break;
             }
         }
         for block in self.blocks.values_mut() {
             block.pty.kill();
+        }
+    }
+
+    /// Handles one request: the single-transaction body of the run loop, wrapped in
+    /// a panic guard (see `run`). `Shutdown` is remembered in `shutdown`.
+    fn handle(&mut self, request: Request) {
+        match request {
+            Request::Init {
+                shell,
+                cols,
+                rows,
+                scrollback,
+                reply,
+            } => {
+                let _ = reply.send(self.init_layout(&shell, cols, rows, scrollback));
+            }
+            Request::Attach {
+                shell,
+                cols,
+                rows,
+                scrollback,
+                reply,
+            } => {
+                // A fresh start behaves like init; an existing layout is handed over whole
+                let outcome = match self.layout.as_ref() {
+                    Some(layout) => AttachOutcome::Existing(layout.state(), self.live_panes()),
+                    None => AttachOutcome::Fresh(self.init_layout(&shell, cols, rows, scrollback)),
+                };
+                let _ = reply.send(outcome);
+            }
+            Request::LayoutSplit(op) => self.split_pane(op),
+            Request::LayoutClose { pane } => self.close_pane(pane),
+            Request::LayoutSetFocus { pane } => self.apply(|layout| layout.set_focus(pane)),
+            Request::LayoutFocusDir(op) => self.apply(|layout| layout.focus_dir(op.dir, op.area)),
+            Request::LayoutFocusCycle { forward } => {
+                self.apply(|layout| layout.focus_cycle(forward));
+            }
+            Request::LayoutResize(op) => {
+                self.apply(|layout| layout.resize(op.pane, op.dir, op.delta, op.area, op.limits))
+            }
+            Request::LayoutSetDivider(op) => {
+                self.apply(|layout| layout.set_divider(&op.path, op.boundary, op.area, op.limits))
+            }
+            Request::LayoutToggleZoom => self.apply(Layout::toggle_zoom),
+            Request::LayoutAddFloat(op) => self.add_float(op),
+            Request::LayoutToggleFloats => self.apply(Layout::toggle_floats),
+            Request::LayoutMoveFloat(op) => {
+                self.apply(|layout| layout.move_float(op.pane, op.dx, op.dy, op.window))
+            }
+            Request::LayoutResizeFloatEdge(op) => self.apply(|layout| {
+                layout.resize_float_edge(op.pane, op.edge, op.dx, op.dy, op.window, op.limits)
+            }),
+            #[cfg(test)]
+            Request::Create {
+                shell,
+                explicit,
+                cols,
+                rows,
+                scrollback,
+                client,
+                reply,
+            } => {
+                let created = self.create(&shell, explicit, cols, rows, scrollback, client);
+                let _ = reply.send(created);
+            }
+            Request::Write(id, bytes) => {
+                if let Some(block) = self.blocks.get_mut(&id) {
+                    // The block's own writer thread does the PTY write: it can block on a
+                    // full pipe, and no block may stall the loop or the others (and one
+                    // thread per block keeps the write order)
+                    let _ = block.writer.send(bytes);
+                }
+            }
+            Request::Resize(id, cols, rows) => {
+                if let Some(block) = self.blocks.get_mut(&id) {
+                    block.pty.resize(cols, rows);
+                    // The server has no pixels: 1×1 cells
+                    let _ = block.terminal.resize(cols, rows, 1, 1);
+                    // Remember the size for a later attach's live pane list
+                    if let Some(pane) = self
+                        .pane_blocks
+                        .iter()
+                        .find(|(_, block)| **block == id)
+                        .map(|(pane, _)| *pane)
+                    {
+                        self.pane_grids.insert(pane, (cols, rows));
+                    }
+                }
+            }
+            Request::Kill(id) => {
+                if let Some(block) = self.blocks.get_mut(&id) {
+                    block.pty.kill();
+                }
+            }
+            Request::Close(id) => {
+                if let Some(mut block) = self.blocks.remove(&id) {
+                    block.pty.kill();
+                    self.pane_blocks.retain(|_, &mut block_id| block_id != id);
+                }
+            }
+            Request::ForegroundDir(id, reply) => {
+                let dir = self
+                    .blocks
+                    .get(&id)
+                    .and_then(|block| block.pty.foreground_dir());
+                let _ = reply.send(dir);
+            }
+            Request::Snapshot(id, reply) => {
+                let bytes = self
+                    .blocks
+                    .get(&id)
+                    .map(|block| snapshot(&block.terminal))
+                    .unwrap_or_default();
+                let _ = reply.send(bytes);
+            }
+            Request::Drain(id) => {
+                let finished = self.drain(id);
+                self.maybe_exit(id, finished);
+            }
+            Request::Exited(id) => {
+                // The last thing the program wrote goes before the exit: the notice waits
+                // until every chunk was forwarded
+                if let Some(block) = self.blocks.get_mut(&id)
+                    && block.exit_requested.is_none()
+                {
+                    block.exit_requested = Some(Instant::now());
+                } // The reader usually closes right after the child dies, which fires the exit
+                // on the next drain. ConPTY can keep the pipe open forever, so wait a bounded
+                // grace for it while the block is drained
+                let grace = Instant::now() + EXIT_GRACE;
+                loop {
+                    let finished = self.drain(id);
+                    if self.maybe_exit(id, finished) || !finished {
+                        break; // reported, or paused: a later drain (a client read) re-checks
+                    }
+                    if Instant::now() >= grace {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Request::Shutdown => self.shutdown = true,
+            #[cfg(test)]
+            Request::Panic => panic!("the server handled a deliberate panic"),
         }
     }
 
@@ -452,6 +552,19 @@ impl Server {
             }
         };
         let (output, receiver) = sync_channel(CHANNEL_CAPACITY);
+        let (writer, writer_inbox) = channel::<Vec<u8>>();
+        let mut pty_writer = pty.take_writer();
+        thread::Builder::new()
+            .name(format!("terminal-block-writer-{id:?}"))
+            .spawn(move || {
+                // Writes are applied one by one; a write that fails (the program is gone, or the
+                // PTY was killed) is dropped: the block's kill path is already on its way
+                while let Ok(bytes) = writer_inbox.recv() {
+                    let _ = pty_writer.write_all(&bytes);
+                    let _ = pty_writer.flush();
+                }
+            })
+            .expect("could not start a block writer thread");
         self.blocks.insert(
             id,
             Block {
@@ -459,6 +572,7 @@ impl Server {
                 terminal,
                 output,
                 pending: None,
+                writer,
                 exit_requested: None,
                 client,
             },
@@ -483,6 +597,7 @@ impl Server {
         self.next_pane_id += 1;
         match self.spawn_pane_block(pane, shell, false, cols, rows, scrollback) {
             Ok((block, notice)) => {
+                self.pane_grids.insert(pane, (cols, rows));
                 let state = self.layout.as_ref().unwrap().state();
                 Ok((
                     state,
@@ -501,6 +616,26 @@ impl Server {
                 Err(error)
             }
         }
+    }
+
+    /// The build fact every live pane carries, for an attach (only panes with a block: a pane
+    /// whose block failed to spawn was rolled back and is not live). Pane order, so the wire
+    /// list is stable.
+    fn live_panes(&self) -> Vec<AttachedPaneInfo> {
+        let mut panes: Vec<AttachedPaneInfo> = self
+            .pane_grids
+            .iter()
+            .filter_map(|(pane, (cols, rows))| {
+                self.pane_blocks.get(pane).map(|block| AttachedPaneInfo {
+                    pane: *pane,
+                    block: *block,
+                    cols: *cols,
+                    rows: *rows,
+                })
+            })
+            .collect();
+        panes.sort_unstable_by_key(|pane| pane.pane);
+        panes
     }
 
     /// Starts `shell` in a new block for `pane`. The block's output and exit reach the window
@@ -580,6 +715,7 @@ impl Server {
             op.scrollback,
         ) {
             Ok((block, notice)) => {
+                self.pane_grids.insert(pane, (op.cols, op.rows));
                 self.broadcast(
                     state,
                     Some(CreatedPane {
@@ -614,6 +750,7 @@ impl Server {
             op.scrollback,
         ) {
             Ok((block, notice)) => {
+                self.pane_grids.insert(pane, (op.cols, op.rows));
                 self.broadcast(
                     state,
                     Some(CreatedPane {
@@ -649,13 +786,19 @@ impl Server {
                 for block in self.blocks.values_mut() {
                     block.pty.kill();
                 }
+                self.blocks.clear();
+                self.pane_blocks.clear();
+                self.pane_grids.clear();
+                self.layout = None;
+                // A session that attaches after this gets a fresh server: the old one is gone
                 let _ = self.events.send(LayoutEvent::LastPaneClosed);
             }
             Closed::Pane => {
-                if let Some(id) = self.pane_blocks.remove(&pane)
-                    && let Some(mut block) = self.blocks.remove(&id)
-                {
-                    block.pty.kill();
+                if let Some(id) = self.pane_blocks.remove(&pane) {
+                    self.pane_grids.remove(&pane);
+                    if let Some(mut block) = self.blocks.remove(&id) {
+                        block.pty.kill();
+                    }
                 }
                 let state = layout.state();
                 self.broadcast(state, None);
@@ -849,15 +992,8 @@ fn exported_scrolling_region(bytes: &[u8]) -> (u16, u16) {
 // ---- The wire format (stage 3) -----------------------------------------------------------
 
 /// The wire format of the control channel: length-prefixed JSON, versioned, carrying the same
-/// ops and events the in-process channel carries today. Only the mapping lives here (framing
-/// included); the transport joins in stage 3. Everything in this module is dead until then.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the wire format goes live when the server process arrives in stage 3"
-    )
-)]
+/// ops and events the in-process channel carries. Only the mapping lives here; the transport
+/// (socket and sessions) is the server process section below.
 pub(crate) mod wire {
     use std::collections::BTreeMap;
     use std::fmt;
@@ -868,7 +1004,10 @@ pub(crate) mod wire {
     use crate::config::ShellConfig;
     use crate::layout::{Dir, Edge, LayoutState, Limits, PaneId, Path, Rect};
 
-    use super::{BlockId, CreatedPane, LayoutEvent, Request};
+    use super::{
+        AddFloatOp, AttachedPaneInfo, BlockId, CreatedPane, FocusDirOp, LayoutEvent, MoveFloatOp,
+        Request, ResizeFloatEdgeOp, ResizeOp, SetDividerOp, SplitOp,
+    };
 
     /// `v` of the protocol; a client and a server whose versions differ refuse to talk
     pub(crate) const WIRE_VERSION: u32 = 1;
@@ -877,22 +1016,18 @@ pub(crate) mod wire {
     /// with room to spare; anything larger is a corrupt length prefix, never a message.
     pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
-    /// One request for the server, versioned. `rid` names the sender's correlation id for the
-    /// requests that answer (foreground_dir, snapshot, init); the rest send `None`.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    pub(crate) struct WireRequest {
-        pub v: u32,
-        pub rid: Option<u64>,
-        pub op: WireOp,
-    }
-
-    /// What a request asks. Mirrors the in-process [`Request`] ops: the same layout mutations,
-    /// the block ops, and `Init`; the server-internal traffic (drains, exit notices,
-    /// shutdown, the test-only create) never travels, and a reply needs no request field.
+    /// One request. A session (or a window) sends exactly one of these per wire op; attach is
+    /// the one the wire adds: a fresh server runs init, an attached one hands over its state
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "op", rename_all = "snake_case")]
     pub(crate) enum WireOp {
         Init {
+            shell: WireShell,
+            cols: u16,
+            rows: u16,
+            scrollback: usize,
+        },
+        Attach {
             shell: WireShell,
             cols: u16,
             rows: u16,
@@ -983,6 +1118,15 @@ pub(crate) mod wire {
         },
     }
 
+    /// One request for the server, versioned. `rid` names the sender's correlation id for the
+    /// requests that answer (attach/init, foreground_dir, snapshot); the rest send `None`.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct WireRequest {
+        pub v: u32,
+        pub rid: Option<u64>,
+        pub op: WireOp,
+    }
+
     impl WireOp {
         /// The wire form of a request that travels. Server-internal traffic (drains, exit
         /// notices, shutdown) and the test-only create stay in the process.
@@ -1071,10 +1215,120 @@ pub(crate) mod wire {
                 Request::Snapshot(id, _) => Self::Snapshot { block: *id },
                 // Not on the wire: the server's own plumbing and the test-only create
                 Request::Drain(_) | Request::Exited(_) | Request::Shutdown => return None,
+                Request::Attach { .. } => return None,
                 #[cfg(test)]
-                Request::Create { .. } => return None,
+                Request::Panic | Request::Create { .. } => return None,
             };
             Some(op)
+        }
+
+        /// The in-process request for a fire-and-forget wire op, for a session to hand to the
+        /// server thread. Ops that carry a reply (attach/init, foreground directory, snapshot)
+        /// answer through their own paths and are not mapped here.
+        pub(crate) fn into_request(self) -> Option<Request> {
+            let request = match self {
+                Self::Init { .. } | Self::Attach { .. } => return None,
+                Self::Split {
+                    pane,
+                    dir,
+                    shell,
+                    explicit,
+                    cols,
+                    rows,
+                    scrollback,
+                    area,
+                    limits,
+                } => Request::LayoutSplit(SplitOp {
+                    pane,
+                    dir,
+                    shell: shell.into_config(),
+                    explicit,
+                    cols,
+                    rows,
+                    scrollback,
+                    area,
+                    limits,
+                }),
+                Self::Close { pane } => Request::LayoutClose { pane },
+                Self::SetFocus { pane } => Request::LayoutSetFocus { pane },
+                Self::FocusDir { dir, area } => Request::LayoutFocusDir(FocusDirOp { dir, area }),
+                Self::FocusCycle { forward } => Request::LayoutFocusCycle { forward },
+                Self::Resize {
+                    pane,
+                    dir,
+                    delta,
+                    area,
+                    limits,
+                } => Request::LayoutResize(ResizeOp {
+                    pane,
+                    dir,
+                    delta,
+                    area,
+                    limits,
+                }),
+                Self::SetDivider {
+                    path,
+                    boundary,
+                    area,
+                    limits,
+                } => Request::LayoutSetDivider(SetDividerOp {
+                    path,
+                    boundary,
+                    area,
+                    limits,
+                }),
+                Self::ToggleZoom => Request::LayoutToggleZoom,
+                Self::AddFloat {
+                    shell,
+                    explicit,
+                    width,
+                    height,
+                    cols,
+                    rows,
+                    scrollback,
+                } => Request::LayoutAddFloat(AddFloatOp {
+                    shell: shell.into_config(),
+                    explicit,
+                    width,
+                    height,
+                    cols,
+                    rows,
+                    scrollback,
+                }),
+                Self::ToggleFloats => Request::LayoutToggleFloats,
+                Self::MoveFloat {
+                    pane,
+                    dx,
+                    dy,
+                    window,
+                } => Request::LayoutMoveFloat(MoveFloatOp {
+                    pane,
+                    dx,
+                    dy,
+                    window,
+                }),
+                Self::ResizeFloatEdge {
+                    pane,
+                    edge,
+                    dx,
+                    dy,
+                    window,
+                    limits,
+                } => Request::LayoutResizeFloatEdge(ResizeFloatEdgeOp {
+                    pane,
+                    edge,
+                    dx,
+                    dy,
+                    window,
+                    limits,
+                }),
+                Self::Write { block, bytes } => Request::Write(block, bytes),
+                Self::ResizeBlock { block, cols, rows } => Request::Resize(block, cols, rows),
+                Self::Kill { block } => Request::Kill(block),
+                Self::CloseBlock { block } => Request::Close(block),
+                Self::ForegroundDir { .. } | Self::Snapshot { .. } => return None,
+            };
+            Some(request)
         }
     }
 
@@ -1101,10 +1355,6 @@ pub(crate) mod wire {
         }
 
         /// Rebuilds the shell config on the server side
-        #[cfg_attr(
-            test,
-            expect(dead_code, reason = "the server side rebuilds shells in stage 3")
-        )]
         pub(crate) fn into_config(self) -> ShellConfig {
             ShellConfig {
                 program: self.program,
@@ -1116,12 +1366,14 @@ pub(crate) mod wire {
         }
     }
 
-    /// A pane the server just created, as it travels: the pane id, the size it was spawned at
-    /// and the fallback notice. The block itself does not ride the control channel: its token
-    /// and the screen snapshot arrive over the data channel (stage 3).
+    /// A pane the server just created or is handing over attached, as it travels: the pane id,
+    /// its block token (data frames for it arrive under the same token), the size it was spawned
+    /// at, and the fallback notice. The block itself does not ride the control channel: its
+    /// screen snapshot arrives over the data channel before its live chunks.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub(crate) struct IpcCreatedPane {
         pub pane: PaneId,
+        pub block: BlockId,
         pub cols: u16,
         pub rows: u16,
         pub notice: Option<String>,
@@ -1132,9 +1384,21 @@ pub(crate) mod wire {
         pub(crate) fn from_created(created: &CreatedPane) -> Self {
             Self {
                 pane: created.pane,
+                block: created.block.block_id(),
                 cols: created.cols,
                 rows: created.rows,
                 notice: created.notice.clone(),
+            }
+        }
+
+        /// The wire form of a live pane handed to a session that attached over the wire
+        pub(crate) fn from_attached(info: AttachedPaneInfo) -> Self {
+            Self {
+                pane: info.pane,
+                block: info.block,
+                cols: info.cols,
+                rows: info.rows,
+                notice: None,
             }
         }
     }
@@ -1149,7 +1413,7 @@ pub(crate) mod wire {
 
     impl WireReply {
         /// Wraps any answer with the protocol version
-        fn new(rid: u64, reply: WireReplyKind) -> Self {
+        pub(crate) fn new(rid: u64, reply: WireReplyKind) -> Self {
             Self {
                 v: WIRE_VERSION,
                 rid,
@@ -1158,6 +1422,13 @@ pub(crate) mod wire {
         }
 
         /// The answer to `Init`: the first pane's state and its created pane, or why it refused
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the session builds its attach replies inline; init stays for the wire tests"
+            )
+        )]
         pub(crate) fn init(
             rid: u64,
             result: Result<(LayoutState, Option<CreatedPane>), String>,
@@ -1178,8 +1449,8 @@ pub(crate) mod wire {
             Self::new(rid, WireReplyKind::ForegroundDir { dir })
         }
 
-        /// The answer to `Snapshot` (stage 3 carries it over the data channel instead, but the
-        /// shape is here so the control path can be tested end to end)
+        /// The answer to `Snapshot` (a session replying to the wire op; an attach carries its
+        /// snapshots over the data channel instead, but the control shape stays for simple asks)
         pub(crate) fn snapshot(rid: u64, bytes: Vec<u8>) -> Self {
             Self::new(rid, WireReplyKind::Snapshot { bytes })
         }
@@ -1196,6 +1467,14 @@ pub(crate) mod wire {
         InitFailed {
             error: String,
         },
+        /// The answer to `Attach` on a server that already had a layout: its state and its live
+        /// panes (their snapshots go over the data channel right before the reply)
+        Attached {
+            state: LayoutState,
+            panes: Vec<IpcCreatedPane>,
+        },
+        /// A second window tried to attach: the first session is unaffected
+        Busy,
         ForegroundDir {
             dir: Option<PathBuf>,
         },
@@ -1256,6 +1535,13 @@ pub(crate) mod wire {
 
     /// What decoding a frame can answer with
     #[derive(Debug)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the socket reads a frame at a time; the buffer framing stays for the tests"
+        )
+    )]
     pub(crate) enum WireError {
         /// The length prefix is not a frame this protocol carries
         Frame,
@@ -1283,6 +1569,13 @@ pub(crate) mod wire {
     }
 
     /// Reads the first framed message out of `buf`
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the socket reads a frame at a time; the buffer framing stays for the tests"
+        )
+    )]
     pub(crate) fn deframe(buf: &[u8]) -> Deframed {
         let Some(len) = buf
             .first_chunk::<4>()
@@ -1304,6 +1597,13 @@ pub(crate) mod wire {
 
     /// What [`deframe`] found in the buffer
     #[derive(Debug, PartialEq, Eq)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the socket reads a frame at a time; the buffer framing stays for the tests"
+        )
+    )]
     pub(crate) enum Deframed {
         /// One complete message, plus how many bytes of the buffer it took
         Message { bytes: Vec<u8>, consumed: usize },
@@ -1322,6 +1622,13 @@ pub(crate) mod wire {
 
     /// Decodes the next JSON control message out of `buf`, if a whole framed message is there;
     /// whatever follows stays for the next call
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the socket reads a frame at a time; the buffer framing stays for the tests"
+        )
+    )]
     pub(crate) fn deframe_json<T: serde::de::DeserializeOwned>(
         buf: &[u8],
     ) -> Result<Option<(T, usize)>, WireError> {
@@ -1368,6 +1675,13 @@ impl ServerLink {
 
     /// The boundary for `Init`: creates the first pane and the authoritative layout. `None`
     /// when the server is gone; the caller words that error.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the window attaches over the wire; in-process init stays for the tests"
+        )
+    )]
     fn ask_init(
         &self,
         shell: &ShellConfig,
@@ -1439,6 +1753,13 @@ impl ServerHandle {
 
     /// Creates the first pane and the authoritative layout. Called once, before the event loop
     /// runs; the window builds its projection and its pane from the answer.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the window attaches over the wire; in-process init stays for the tests"
+        )
+    )]
     pub fn init(
         &self,
         shell: &ShellConfig,
@@ -1496,6 +1817,1539 @@ impl ServerHandle {
     }
 }
 
+// ---- The server process -------------------------------------------------------------------
+//
+// The server can be its own process (`terminal server`), reached over local IPC. The single local
+// connection carries both channels of a session, told apart by a one-byte frame type per frame —
+// the simpler of the two shapes this stage could take: one accept loop, one session table and one
+// socket to keep alive, at the cost of a byte per frame.
+//
+// * `0` — control: the [`wire`] format, length-prefixed JSON (`wire::frame`), carrying requests,
+//   replies and events;
+// * `1` — data: `[length][u32 block token][bytes]`, the live output of a block;
+// * `2` — data snapshot: the same shape, a block's screen as it was when its pane attached; the
+//   server queues these before the block's live chunks, so the client replays the screen first.
+//
+// The client sends only control frames; the server answers with all three.
+//
+// One window drives the server at a time: a second connection is answered with a `Busy` reply and
+// closed, and the first session is untouched. A session (below) plays the window's role on the
+// server side: it takes the events the window would have received, drains the blocks' output onto
+// the socket, and hands the block views back when it ends — the blocks and the layout outlive the
+// window, so a window that closed can re-attach to the same shells.
+
+/// The control frame's type byte
+pub(crate) const FRAME_CONTROL: u8 = 0;
+/// The live-data frame's type byte
+pub(crate) const FRAME_DATA: u8 = 1;
+/// The attach-snapshot frame's type byte
+pub(crate) const FRAME_SNAPSHOT: u8 = 2;
+
+/// One frame read (or ready to write) on the shared connection
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WireFrame {
+    /// A control message's JSON bytes (request, reply or event)
+    Control(Vec<u8>),
+    /// A block's live output
+    Data(u32, Vec<u8>),
+    /// A block's screen at attach time
+    Snapshot(u32, Vec<u8>),
+}
+
+use std::io::{self, Read, Write};
+
+/// Reads one typed frame, blocking
+pub(crate) fn read_typed_frame(read: &mut dyn Read) -> io::Result<WireFrame> {
+    let kind = &mut [0u8; 1];
+    read.read_exact(kind)?;
+    let length = &mut [0u8; 4];
+    read.read_exact(length)?;
+    let length = u32::from_le_bytes(*length) as usize;
+    if length > wire::MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a frame exceeded the protocol's length limit",
+        ));
+    }
+    match kind[0] {
+        FRAME_CONTROL => {
+            let mut json = vec![0u8; length];
+            read.read_exact(&mut json)?;
+            Ok(WireFrame::Control(json))
+        }
+        // Data and snapshot frames both carry a block token first, so one length check covers
+        // both; the four token bytes are part of the frame
+        FRAME_DATA | FRAME_SNAPSHOT => {
+            if length < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a data frame is shorter than its block token",
+                ));
+            }
+            let mut payload = vec![0u8; length];
+            read.read_exact(&mut payload)?;
+            let token =
+                u32::from_le_bytes(payload[..4].try_into().expect("the token was just read"));
+            let payload = payload.split_off(4);
+            if kind[0] == FRAME_DATA {
+                Ok(WireFrame::Data(token, payload))
+            } else {
+                Ok(WireFrame::Snapshot(token, payload))
+            }
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown frame type: {other}"),
+        )),
+    }
+}
+
+/// Frames live output (or a snapshot) of a block
+fn data_frame(kind: u8, block: BlockId, bytes: Vec<u8>) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + 4 + 4 + bytes.len());
+    frame.push(kind);
+    frame.extend_from_slice(&((4 + bytes.len()) as u32).to_le_bytes());
+    // The token fits u32 for as long as a session can create blocks
+    frame.extend_from_slice(&(block.0 as u32).to_le_bytes());
+    frame.extend_from_slice(&bytes);
+    frame
+}
+
+/// Frames a control message for the shared connection
+fn control_frame<T: serde::Serialize>(message: &T) -> Vec<u8> {
+    let mut frame = vec![FRAME_CONTROL];
+    if let Ok(json) = wire::frame_json(message) {
+        frame.extend_from_slice(&json);
+    }
+    frame
+}
+
+/// Where the endpoint lives: macOS keeps it under `~/Library/Application Support/terminal`,
+/// Linux under `$XDG_RUNTIME_DIR/terminal` (falling back to `~/.cache/terminal`), and Windows
+/// names a local named pipe.
+#[derive(Debug, Clone)]
+pub enum IpcEndpoint {
+    #[cfg(unix)]
+    Socket(PathBuf),
+    #[cfg(windows)]
+    Pipe(String),
+}
+
+impl IpcEndpoint {
+    pub fn resolve() -> Self {
+        #[cfg(unix)]
+        {
+            Self::Socket(socket_dir().join("server.sock"))
+        }
+        #[cfg(windows)]
+        {
+            Self::Pipe(r"\\.\pipe\terminal-rs".to_string())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn socket_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/terminal"))
+            .unwrap_or_else(|| PathBuf::from("terminal"))
+    } else {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|dir| PathBuf::from(dir).join("terminal"))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/terminal"))
+            })
+            .unwrap_or_else(|| PathBuf::from("terminal"))
+    }
+}
+
+/// A connected endpoint, in read and write halves so a session's reader and writer threads do
+/// not fight over one handle's buffering
+pub(crate) enum IpcStream {
+    #[cfg(unix)]
+    Socket(UnixStream),
+    #[cfg(windows)]
+    Pipe(Box<dyn Read + Send>, Box<dyn Write + Send>),
+}
+
+impl IpcStream {
+    /// Splits into independent read and write halves
+    pub(crate) fn into_halves(self) -> (Box<dyn Read + Send>, Box<dyn Write + Send>) {
+        match self {
+            #[cfg(unix)]
+            IpcStream::Socket(stream) => {
+                let read = stream
+                    .try_clone()
+                    .expect("could not clone the socket for its reader half");
+                (Box::new(read), Box::new(stream))
+            }
+            #[cfg(windows)]
+            IpcStream::Pipe(read, write) => (read, write),
+        }
+    }
+}
+
+/// A listening endpoint: unix sockets on macOS and Linux, named pipes on Windows
+pub(crate) enum IpcListener {
+    #[cfg(unix)]
+    Socket(UnixListener),
+    #[cfg(windows)]
+    Pipe(windows_pipe::PipeListener),
+}
+
+impl IpcListener {
+    /// Binds the endpoint. A local stale socket file is probed with a connection first: a live
+    /// server answers (reported as already running), a dead one is unlinked and rebound. Windows
+    /// named pipes live in the kernel's namespace, so there is nothing to clean up or probe there
+    /// beyond the wait a pipe name answers.
+    pub(crate) fn bind(endpoint: &IpcEndpoint) -> io::Result<Self> {
+        match endpoint {
+            #[cfg(unix)]
+            IpcEndpoint::Socket(path) => unix_listen(path).map(Self::Socket),
+            #[cfg(windows)]
+            IpcEndpoint::Pipe(name) => windows_pipe::PipeListener::bind(name).map(Self::Pipe),
+        }
+    }
+
+    /// Waits for one connection
+    pub(crate) fn accept(&self) -> io::Result<IpcStream> {
+        match self {
+            #[cfg(unix)]
+            IpcListener::Socket(listener) => listener
+                .accept()
+                .map(|(stream, _)| IpcStream::Socket(stream)),
+            #[cfg(windows)]
+            IpcListener::Pipe(listener) => listener
+                .accept()
+                .map(|(read, write)| IpcStream::Pipe(Box::new(read), Box::new(write))),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_listen(path: &std::path::Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    match UnixListener::bind(path) {
+        Ok(listener) => {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            Ok(listener)
+        }
+        // A socket file exists: a live server answers the probe, a stale one is removed
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => match UnixStream::connect(path) {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a terminal server is already running",
+            )),
+            Err(_) => {
+                eprintln!("[server] removing the stale socket at {}", path.display());
+                std::fs::remove_file(path)?;
+                let listener = UnixListener::bind(path)?;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                Ok(listener)
+            }
+        },
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+
+#[cfg(windows)]
+mod windows_pipe {
+    //! Named pipes over the `kernel32` bindings: std has no named-pipe API, and the server must
+    //! stay dependency-free. Only byte mode, blocking calls, and handle duplication are used.
+
+    use std::ffi::OsStr;
+    use std::io::{self, Read, Write};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    type Handle = isize;
+
+    const INVALID_HANDLE: Handle = -1;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+    // Byte mode, blocking: 0
+    const PIPE_MODE_BYTE_WAIT: u32 = 0;
+    const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+    const BUFFER_BYTES: u32 = 64 * 1024;
+    const ERROR_PIPE_CONNECTED: u32 = 535;
+    const ERROR_PIPE_BUSY: u32 = 231;
+    const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+    const WAIT_BUSY_MS: u32 = 2_000;
+
+    extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            instances: u32,
+            out_bytes: u32,
+            in_bytes: u32,
+            default_timeout_ms: u32,
+            security: *const core::ffi::c_void,
+        ) -> Handle;
+        fn ConnectNamedPipe(handle: Handle, overlapped: *const core::ffi::c_void) -> i32;
+        fn DisconnectNamedPipe(handle: Handle) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *const core::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+        fn WaitNamedPipeW(name: *const u16, timeout_ms: u32) -> i32;
+        fn ReadFile(
+            handle: Handle,
+            buffer: *mut u8,
+            count: u32,
+            read: *mut u32,
+            overlapped: *const core::ffi::c_void,
+        ) -> i32;
+        fn WriteFile(
+            handle: Handle,
+            buffer: *const u8,
+            count: u32,
+            written: *mut u32,
+            overlapped: *const core::ffi::c_void,
+        ) -> i32;
+        fn FlushFileBuffers(handle: Handle) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+        fn GetCurrentProcess() -> Handle;
+        fn DuplicateHandle(
+            source_process: Handle,
+            source: Handle,
+            target_process: Handle,
+            target: *mut Handle,
+            access: u32,
+            inherit: i32,
+            options: u32,
+        ) -> i32;
+    }
+
+    /// A kernel handle closed on drop. Named pipes only serve the machine's own user namespace,
+    /// mirroring the unix socket's 0600
+    struct PipeHandle(Handle);
+
+    unsafe impl Send for PipeHandle {}
+    unsafe impl Sync for PipeHandle {}
+
+    impl Drop for PipeHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Duplicates a handle so the reader and the writer threads work on independent ones
+    fn duplicate(handle: Handle) -> io::Result<PipeHandle> {
+        let process = unsafe { GetCurrentProcess() };
+        let mut target = 0 as Handle;
+        let ok = unsafe {
+            DuplicateHandle(
+                process,
+                handle,
+                process,
+                &mut target,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        Ok(PipeHandle(target))
+    }
+
+    fn last_error() -> io::Error {
+        io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        OsStr::new(text).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// The read half of a pipe
+    pub(crate) struct PipeReader(PipeHandle);
+
+    impl Read for PipeReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let mut read = 0u32;
+            let ok = unsafe {
+                ReadFile(
+                    self.0.0,
+                    buffer.as_mut_ptr(),
+                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    &mut read,
+                    std::ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(last_error());
+            }
+            Ok(read as usize)
+        }
+    }
+
+    /// The write half of a pipe
+    pub(crate) struct PipeWriter(PipeHandle);
+
+    impl Write for PipeWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let mut written = 0u32;
+            let ok = unsafe {
+                WriteFile(
+                    self.0.0,
+                    buffer.as_ptr(),
+                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    &mut written,
+                    std::ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(last_error());
+            }
+            Ok(written as usize)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            unsafe {
+                FlushFileBuffers(self.0.0);
+            }
+            Ok(())
+        }
+    }
+
+    pub(crate) struct PipeListener {
+        name: String,
+    }
+
+    impl PipeListener {
+        /// Readsies the named pipe. A live server already instances the name: its probe answers
+        pub(crate) fn bind(full_name: &str) -> io::Result<Self> {
+            if server_is_listening(full_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a terminal server is already running",
+                ));
+            }
+            Ok(Self {
+                name: full_name.to_string(),
+            })
+        }
+
+        /// Creates one pipe instance and waits for a client on it, like a unix accept. A client
+        /// that arrives while no instance exists fails with a busy error that the client waits on
+        pub(crate) fn accept(&self) -> io::Result<(PipeReader, PipeWriter)> {
+            let wide = wide(&self.name);
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    wide.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_MODE_BYTE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    BUFFER_BYTES,
+                    BUFFER_BYTES,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if handle == INVALID_HANDLE {
+                return Err(last_error());
+            }
+            let owned = PipeHandle(handle);
+            let connected = unsafe { ConnectNamedPipe(owned.0, std::ptr::null()) };
+            if connected == 0 {
+                // ERROR_PIPE_CONNECTED: the client connected between the two calls
+                if unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
+                    return Err(last_error());
+                }
+            }
+            let write = duplicate(owned.0)?;
+            Ok((PipeReader(owned), write))
+        }
+    }
+
+    /// Whether the name has a server behind it: instances exist even when all of them are busy
+    fn server_is_listening(full_name: &str) -> bool {
+        let wide = wide(full_name);
+        let ok = unsafe { WaitNamedPipeW(wide.as_ptr(), 5) };
+        ok != 0 || unsafe { GetLastError() } == ERROR_PIPE_BUSY
+    }
+
+    /// Connects as a client, waiting out a busy server like CreateFileW callers do
+    pub(crate) fn connect_client(full_name: &str) -> io::Result<(PipeReader, PipeWriter)> {
+        let wide = wide(full_name);
+        let mut waits = 0u32;
+        loop {
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                )
+            };
+            if handle != INVALID_HANDLE {
+                let write = duplicate(handle)?;
+                return Ok((PipeReader(PipeHandle(handle)), write));
+            }
+            if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+                waits += 1;
+                if waits > 50 {
+                    return Err(last_error());
+                }
+                unsafe {
+                    WaitNamedPipeW(wide.as_ptr(), WAIT_BUSY_MS);
+                }
+                continue;
+            }
+            return Err(last_error());
+        }
+    }
+}
+
+/// What a session's coordinator is told. It owns the socket writer and every block view of its
+/// session, and it must return the views when it ends: the shells outlive the window.
+enum SessionMsg {
+    /// A request read off the socket
+    Wire(WireRequest),
+    /// A wire event the window would have received (the router precomputes it, so the block
+    /// views stay owned by the process' map and the session pulls them at event time)
+    Event(WireEvent),
+    /// The writer flushed the data queue: stalled panes may go on
+    Resume,
+    /// The client closed the connection (or sent something unusable)
+    Stop,
+}
+
+/// State one server process shares across sessions, for the handoff between a session that
+/// ended and the one that attaches next
+pub(crate) struct ProcessShared {
+    slot: Mutex<Option<Sender<SessionMsg>>>,
+    /// Block views held between sessions (the pane keeps running headless, and its output channel
+    /// must stay connected for the session that re-attaches to read it)
+    views: Mutex<HashMap<PaneId, ServerBlock>>,
+}
+
+impl Default for ProcessShared {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            views: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Frames of live data queued for the socket before the coordinator stops draining more (the
+/// blocks pause server-side, which is the backpressure that ends up on the PTY)
+const HIGH_WATER_FRAMES: usize = 256;
+
+/// The one writer of a session's socket. Control frames jump ahead of queued data; the writer
+/// flushes what is queued, and when the coordinator stalled it asks it
+/// (once per stall) to resume the panes' output.
+struct SessionWriter {
+    shared: Arc<SessionWriterShared>,
+}
+
+struct SessionWriterShared {
+    queues: Mutex<SessionQueues>,
+    available: Condvar,
+}
+
+#[derive(Default)]
+struct SessionQueues {
+    control: VecDeque<Vec<u8>>,
+    data: VecDeque<Vec<u8>>,
+    /// The coordinator stopped at the high-water mark
+    stalled: bool,
+    /// One resume in flight at a time
+    resume_wanted: bool,
+    stopping: bool,
+}
+
+impl SessionWriter {
+    fn spawn(write: Box<dyn Write + Send>, msgs: Sender<SessionMsg>) -> Self {
+        let shared = Arc::new(SessionWriterShared {
+            queues: Mutex::new(SessionQueues::default()),
+            available: Condvar::new(),
+        });
+        let queues = shared.clone();
+        thread::Builder::new()
+            .name("terminal-session-writer".to_string())
+            .spawn(move || {
+                let shared = queues;
+                let mut write = write;
+                let mut queues = shared.queues.lock().unwrap();
+                loop {
+                    if queues.control.is_empty() && queues.data.is_empty() {
+                        if queues.stopping {
+                            return;
+                        }
+                        // Even with nothing to flush, a stall that happened after the last
+                        // flush must not strand the panes (the stall flag is rechecked here)
+                        if queues.stalled && !queues.resume_wanted {
+                            queues.resume_wanted = true;
+                            let _ = msgs.send(SessionMsg::Resume);
+                        }
+                        let (waited, _) = shared
+                            .available
+                            .wait_timeout(queues, Duration::from_millis(500))
+                            .unwrap();
+                        queues = waited;
+                        continue;
+                    }
+                    let controls: Vec<Vec<u8>> = queues.control.drain(..).collect();
+                    let datas: Vec<Vec<u8>> = queues.data.drain(..).collect();
+                    let resume = queues.stalled && !queues.resume_wanted;
+                    if resume {
+                        queues.resume_wanted = true;
+                    }
+                    drop(queues);
+                    for frame in controls.iter().chain(datas.iter()) {
+                        if write.write_all(frame).is_err() {
+                            return; // the client is gone
+                        }
+                    }
+                    let _ = write.flush();
+                    if resume {
+                        let _ = msgs.send(SessionMsg::Resume);
+                    }
+                    queues = shared.queues.lock().unwrap();
+                }
+            })
+            .expect("could not start the session writer thread");
+        Self { shared }
+    }
+
+    fn push_control(&self, frame: Vec<u8>) {
+        let mut queues = self.shared.queues.lock().unwrap();
+        queues.control.push_back(frame);
+        self.shared.available.notify_one();
+    }
+
+    /// Whether the frame went out, or the high-water mark stopped the drain
+    fn push_data(&self, frame: Vec<u8>) -> bool {
+        let mut queues = self.shared.queues.lock().unwrap();
+        if queues.data.len() >= HIGH_WATER_FRAMES {
+            queues.stalled = true;
+            return false;
+        }
+        queues.data.push_back(frame);
+        self.shared.available.notify_one();
+        true
+    }
+
+    /// Marks the resume in flight as answered
+    fn clear_resume(&self) {
+        let mut queues = self.shared.queues.lock().unwrap();
+        queues.resume_wanted = false;
+    }
+
+    fn stop(&self) {
+        let mut queues = self.shared.queues.lock().unwrap();
+        queues.stopping = true;
+        self.shared.available.notify_one();
+    }
+}
+
+/// The window's counterpart on the server side of one session: requests in, events and pane
+/// output out. It holds every block view of its session.
+struct Session {
+    handle: ServerHandle,
+    shared: Arc<ProcessShared>,
+    views: HashMap<PaneId, ServerBlock>,
+    writer: SessionWriter,
+    stalled: bool,
+}
+
+/// How long a request-with-reply may take. An attach can spawn a shell; the rest are quick
+const SESSION_ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl Session {
+    /// Runs until the client disconnects. A panic here must not strand the panes' views (their
+    /// output channels would disconnect and the next session could not read those blocks): the
+    /// caller hands every block view back once this returns, panic or not.
+    fn pump(&mut self, inbox: Receiver<SessionMsg>) {
+        while let Ok(msg) = inbox.recv() {
+            match msg {
+                SessionMsg::Wire(request) => {
+                    if !self.on_wire(request) {
+                        return;
+                    }
+                }
+                SessionMsg::Event(event) => self.on_event(event),
+                SessionMsg::Resume => self.resume(),
+                SessionMsg::Stop => return,
+            }
+        }
+    }
+
+    /// The session ended: the views go back to the process so the next session can read the
+    /// same blocks, and the session slot opens for the next window
+    fn teardown(self) {
+        self.writer.stop();
+        *self.shared.slot.lock().unwrap() = None;
+        let Self { shared, views, .. } = self;
+        shared.views.lock().unwrap().extend(views);
+    }
+
+    fn on_wire(&mut self, request: WireRequest) -> bool {
+        if request.v != WIRE_VERSION {
+            eprintln!(
+                "[server] a session spoke protocol version {}; dropping it",
+                request.v
+            );
+            self.writer.push_control(control_frame(&WireReply::new(
+                request.rid.unwrap_or(0),
+                WireReplyKind::InitFailed {
+                    error: "protocol version mismatch".to_string(),
+                },
+            )));
+            return false;
+        }
+        let rid = request.rid.unwrap_or(0);
+        match request.op {
+            // A fresh start behaves like init, so the same path serves both ops
+            WireOp::Init {
+                shell,
+                cols,
+                rows,
+                scrollback,
+            }
+            | WireOp::Attach {
+                shell,
+                cols,
+                rows,
+                scrollback,
+            } => self.attach(rid, shell, cols, rows, scrollback),
+            WireOp::ForegroundDir { block } => {
+                let (reply, answer) = channel();
+                self.handle.send(Request::ForegroundDir(block, reply));
+                let dir = match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                    Ok(dir) => dir,
+                    Err(_) => {
+                        eprintln!("[server] a session request did not answer");
+                        return false;
+                    }
+                };
+                self.writer
+                    .push_control(control_frame(&WireReply::foreground_dir(rid, dir)));
+                true
+            }
+            WireOp::Snapshot { block } => {
+                let (reply, answer) = channel();
+                self.handle.send(Request::Snapshot(block, reply));
+                let bytes = match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        eprintln!("[server] a session request did not answer");
+                        return false;
+                    }
+                };
+                self.writer
+                    .push_control(control_frame(&WireReply::snapshot(rid, bytes)));
+                true
+            }
+            op => {
+                if let Some(request) = op.into_request() {
+                    self.handle.send(request);
+                }
+                true
+            }
+        }
+    }
+
+    /// The attach flow: a fresh server runs init ("fresh behaves like init"); an existing layout
+    /// hands its state and live panes over whole. Snapshots for the live panes are queued on the
+    /// data channel before the reply, so the client replays their screens before any live chunk.
+    fn attach(
+        &mut self,
+        rid: u64,
+        shell: wire::WireShell,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> bool {
+        let (reply, answer) = channel();
+        self.handle.send(Request::Attach {
+            shell: shell.into_config(),
+            cols,
+            rows,
+            scrollback,
+            reply,
+        });
+        let Ok(outcome) = answer.recv_timeout(SESSION_ASK_TIMEOUT) else {
+            eprintln!("[server] an attach request did not answer");
+            return false;
+        };
+        let outcome = match outcome {
+            AttachOutcome::Fresh(Ok((state, created))) => {
+                let pane = wire::IpcCreatedPane::from_created(&created);
+                self.views.insert(created.pane, created.block);
+                WireReply::new(
+                    rid,
+                    WireReplyKind::Init {
+                        state,
+                        created: Some(pane),
+                    },
+                )
+            }
+            AttachOutcome::Fresh(Err(error)) => {
+                WireReply::new(rid, WireReplyKind::InitFailed { error })
+            }
+            AttachOutcome::Existing(state, panes) => {
+                // Keep only the live panes' views: views of blocks that died while headless go
+                // back to nothing
+                let live: Vec<PaneId> = panes.iter().map(|pane| pane.pane).collect();
+                self.views.retain(|pane, _| live.contains(pane));
+                // The pending chunks predate the snapshots (their effect is already on the
+                // server-side screens the snapshots export), so they are dropped instead of
+                // replayed. This never asks for a drain: a block paused while headless stays
+                // paused until below.
+                for info in &panes {
+                    if let Some(view) = self.views.get(&info.pane) {
+                        view.discard_pending();
+                    }
+                }
+                for info in &panes {
+                    let (reply, answer) = channel();
+                    self.handle.send(Request::Snapshot(info.block, reply));
+                    let bytes = answer.recv_timeout(SESSION_ASK_TIMEOUT).unwrap_or_default();
+                    self.writer
+                        .push_data(data_frame(FRAME_SNAPSHOT, info.block, bytes));
+                }
+                // Resume the blocks the session may have paused (and learn about pending exits):
+                // the wake reaches this session's event stream and a drain follows
+                for info in &panes {
+                    if let Some(view) = self.views.get(&info.pane) {
+                        view.notify_again();
+                    }
+                }
+                WireReply::new(
+                    rid,
+                    WireReplyKind::Attached {
+                        state,
+                        panes: panes
+                            .into_iter()
+                            .map(wire::IpcCreatedPane::from_attached)
+                            .collect(),
+                    },
+                )
+            }
+        };
+        self.writer.push_control(control_frame(&outcome));
+        true
+    }
+
+    fn on_event(&mut self, event: WireEvent) {
+        match event.event {
+            WireEventKind::State { state, created } => {
+                // Panes that left lose their views (the server closed their blocks); the view
+                // of a just-created pane moves from the process' map into this session's
+                let live = state.pane_ids();
+                self.views.retain(|pane, _| live.contains(pane));
+                if let Some(ref created) = created {
+                    match self.shared.views.lock().unwrap().remove(&created.pane) {
+                        Some(view) => {
+                            self.views.insert(created.pane, view);
+                        }
+                        None => eprintln!("[server] no block view arrived for pane {created:?}"),
+                    }
+                }
+                self.writer.push_control(control_frame(&WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::State { state, created },
+                }));
+            }
+            WireEventKind::LastPaneClosed => {
+                self.writer.push_control(control_frame(&WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::LastPaneClosed,
+                }));
+            }
+            WireEventKind::Error { message } => {
+                self.writer.push_control(control_frame(&WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::Error { message },
+                }));
+            }
+            // The wire event goes out too: the client's data feed wakes the UI loop itself, but
+            // the events stay symmetric with the in-process link
+            WireEventKind::PaneOutput { pane } => {
+                self.writer.push_control(control_frame(&WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::PaneOutput { pane },
+                }));
+                self.forward_output(pane);
+            }
+            WireEventKind::PaneExited { pane } => {
+                self.writer.push_control(control_frame(&WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::PaneExited { pane },
+                }));
+            }
+        }
+    }
+
+    /// Drains a block onto the socket, playing the client of the in-process link: re-arms the
+    /// wake first, reads while there is something, and stops at the high-water mark (staying
+    /// stalled; the writer un-stalls it). The server-side pause handshake stays exactly as it
+    /// was, so the PTY backpressure does too.
+    fn forward_output(&mut self, pane: PaneId) {
+        let Some(view) = self.views.get_mut(&pane) else {
+            return;
+        };
+        view.rearm();
+        loop {
+            match view.try_read() {
+                Some(chunk) => {
+                    if !self
+                        .writer
+                        .push_data(data_frame(FRAME_DATA, view.block_id(), chunk))
+                    {
+                        self.stalled = true;
+                        return;
+                    }
+                }
+                None => return,
+            }
+        }
+    }
+
+    /// The writer emptied the data queue: the panes stalled at the high-water mark may drain on
+    fn resume(&mut self) {
+        self.writer.clear_resume();
+        if !self.stalled {
+            return;
+        }
+        self.stalled = false;
+        for pane in self.views.keys().copied().collect::<Vec<_>>() {
+            if let Some(view) = self.views.get_mut(&pane) {
+                view.notify_again();
+            }
+        }
+    }
+}
+
+/// Reads the server's layout events for the whole process, session or not: every event becomes
+/// its wire form (which only borrows), and a block view that a creation carried waits in the
+/// process' map for whichever session claims it at event time. Nothing here ever drops a view:
+/// that would disconnect the block's output channel for good.
+fn route_events(events: Receiver<LayoutEvent>, shared: Arc<ProcessShared>) {
+    while let Ok(event) = events.recv() {
+        let wire_event =
+            wire::WireEvent::from_layout_event(&event).expect("every layout event travels");
+        if let LayoutEvent::State(_, Some(created)) = event {
+            shared
+                .views
+                .lock()
+                .unwrap()
+                .insert(created.pane, created.block);
+        }
+        let slot = shared.slot.lock().unwrap();
+        if let Some(session) = slot.as_ref()
+            && session.send(SessionMsg::Event(wire_event)).is_err()
+        {
+            eprintln!("[server] the session went away mid-event");
+        }
+    }
+}
+
+/// Reads a session's request frames off the socket; anything not a control frame ends it
+fn socket_reader(mut read: Box<dyn Read + Send>, msgs: Sender<SessionMsg>) {
+    loop {
+        let frame = match read_typed_frame(&mut *read) {
+            Ok(frame) => frame,
+            Err(_) => {
+                let _ = msgs.send(SessionMsg::Stop);
+                return;
+            }
+        };
+        match frame {
+            WireFrame::Control(json) => match serde_json::from_slice::<WireRequest>(&json) {
+                Ok(request) => {
+                    if msgs.send(SessionMsg::Wire(request)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[server] a request did not decode: {error}");
+                    let _ = msgs.send(SessionMsg::Stop);
+                    return;
+                }
+            },
+            // The client only sends control frames
+            frame => {
+                eprintln!("[server] the client sent a {frame:?} frame; dropping the session");
+                let _ = msgs.send(SessionMsg::Stop);
+                return;
+            }
+        }
+    }
+}
+
+/// Accepts windows one after another and serves exactly one of them: the second connection gets
+/// a `Busy` reply and is closed, and the first session is unaffected
+fn start_session(stream: IpcStream, handle: &ServerHandle, shared: &Arc<ProcessShared>) {
+    let mut slot = shared.slot.lock().unwrap();
+    if slot.is_some() {
+        drop(slot);
+        let (read, mut write) = stream.into_halves();
+        std::mem::drop(read);
+        let _ = write.write_all(&control_frame(&WireReply {
+            v: WIRE_VERSION,
+            rid: 0,
+            reply: WireReplyKind::Busy,
+        }));
+        let _ = write.flush();
+        eprintln!("[server] refused a second session: one is already attached");
+        return;
+    }
+    let (msgs, inbox) = channel::<SessionMsg>();
+    let (read_half, write_half) = stream.into_halves();
+    let writer = SessionWriter::spawn(write_half, msgs.clone());
+    // The session takes the block views over whole: while it runs, no other session exists
+    let views = std::mem::take(&mut *shared.views.lock().unwrap());
+    let session = Session {
+        handle: handle.clone(),
+        shared: shared.clone(),
+        views,
+        writer,
+        stalled: false,
+    };
+    *slot = Some(msgs.clone());
+    drop(slot);
+    thread::Builder::new()
+        .name("terminal-session".to_string())
+        .spawn(move || run_session(session, inbox))
+        .expect("could not start the session thread");
+    thread::Builder::new()
+        .name("terminal-session-reader".to_string())
+        .spawn(move || socket_reader(read_half, msgs))
+        .expect("could not start the session reader thread");
+}
+
+fn run_session(mut session: Session, inbox: Receiver<SessionMsg>) {
+    // A panic here must not strand the panes' views: see `Session::pump`
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.pump(inbox)));
+    if outcome.is_err() {
+        eprintln!("[server] a session panicked; the session ended");
+    }
+    session.teardown();
+}
+
+/// Accepts windows one after another; called from `run_server_process`, and reachable directly
+/// for tests that bind their own endpoint
+fn accept_sessions(listener: IpcListener, handle: ServerHandle, shared: Arc<ProcessShared>) {
+    loop {
+        match listener.accept() {
+            Ok(stream) => start_session(stream, &handle, &shared),
+            Err(error) => {
+                eprintln!("[server] accept failed: {error}");
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// The entry point of `terminal server`: binds the endpoint (refusing when a server already
+/// runs), keeps the server thread alive, and serves one session at a time until killed. The
+/// shells inside its blocks outlive every window; closing a window only ends its session.
+pub fn run_server_process() {
+    let endpoint = IpcEndpoint::resolve();
+    let listener = match IpcListener::bind(&endpoint) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("[server] a terminal server is already listening on {endpoint:?}");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("[server] could not listen on {endpoint:?}: {error}");
+            std::process::exit(1);
+        }
+    };
+    let (handle, events) = Server::start();
+    let shared = Arc::new(ProcessShared::default());
+    let router_shared = shared.clone();
+    thread::Builder::new()
+        .name("terminal-events".to_string())
+        .spawn(move || route_events(events, router_shared))
+        .expect("could not start the event router thread");
+    accept_sessions(listener, handle, shared);
+}
+
+// ---- The client side of the server process --------------------------------------------------
+//
+// The window connects to the endpoint (or starts `terminal server` first; that part lives in
+// `main`), sends one `Attach` and then drives its panes purely locally: each pane gets an
+// [`IpcBlock`], whose queue the connection's reader thread feeds with that block's frames.
+
+/// What the reader thread (the window's end of the connection) forwards out of the control
+/// channel: replies correlated by rid, and uncorrelated ones (like the `Busy` a second window
+/// gets) and events
+#[derive(Debug)]
+pub(crate) enum ControlDown {
+    Reply(WireReply),
+    Event(WireEventKind),
+}
+
+/// The client-side half of a block over the shared connection: everything the reader thread
+/// already received for it (its attach snapshot and its queued chunks) plus the wake state
+pub struct BlockFeed {
+    queue: Mutex<VecDeque<Vec<u8>>>,
+    snapshot: Mutex<Option<Vec<u8>>>,
+    wake_pending: Arc<AtomicBool>,
+    notify: Notify,
+}
+
+/// A chunk queued for a block before its pane registered it (the pane is built right after the
+/// attach replies; output does not wait for it). Order per block is kept.
+enum QueuedChunk {
+    Data(Vec<u8>),
+    Snapshot(Vec<u8>),
+}
+
+struct ClientShared {
+    write: Mutex<ConnWrite>,
+    next_rid: AtomicU64,
+    pending: Mutex<HashMap<u64, Sender<WireReply>>>,
+    feeds: Mutex<HashMap<BlockId, Arc<BlockFeed>>>,
+    /// Chunks that arrived for blocks no pane claimed yet
+    orphan: Mutex<HashMap<BlockId, Vec<QueuedChunk>>>,
+}
+
+/// The write half of the connection, concrete enough to be shut down from another thread: the
+/// reader thread keeps its own half for as long as it lives, and on a unix socket a `Shutdown`
+/// from the writer side ends both directions
+enum ConnWrite {
+    #[cfg(unix)]
+    Socket(UnixStream),
+    #[cfg(windows)]
+    Pipe(Box<dyn Write + Send>),
+}
+
+impl ConnWrite {
+    fn send_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Socket(stream) => stream.write_all(frame).and_then(|()| stream.flush()),
+            #[cfg(windows)]
+            Self::Pipe(pipe) => pipe.write_all(frame).and_then(|()| pipe.flush()),
+        }
+    }
+
+    /// Ends the connection: the session's reader gets an end-of-file and the reader thread of
+    /// this very connection stops with it (a unix `Shutdown` from the writer side ends both
+    /// directions). Windows pipes only end with the client process (the session's asks time
+    /// out meanwhile).
+    fn shutdown(&self) {
+        match self {
+            #[cfg(unix)]
+            Self::Socket(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            #[cfg(windows)]
+            Self::Pipe(_) => {}
+        }
+    }
+}
+
+impl Drop for ClientShared {
+    fn drop(&mut self) {
+        self.write.lock().unwrap().shutdown();
+    }
+}
+
+/// The window's connection to the server process: it sends control frames and feeds panes
+#[derive(Clone)]
+pub struct IpcConn {
+    shared: Arc<ClientShared>,
+}
+
+/// What an attach answered
+#[derive(Debug)]
+pub enum AttachAnswer {
+    /// The server was fresh: it ran init, and the created pane's block travels by token
+    Fresh {
+        state: LayoutState,
+        pane: wire::IpcCreatedPane,
+    },
+    /// The server already had a layout; the client rebuilds every pane from the answer
+    Existing {
+        state: LayoutState,
+        panes: Vec<wire::IpcCreatedPane>,
+    },
+}
+
+/// How long an ask (attach, foreground dir, snapshot) may take. An attach can spawn a shell; the
+/// rest are quick
+const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl IpcConn {
+    /// Connects. The read half is returned for the connection's reader thread, which the caller
+    /// spawns (it needs the event loop's wakeups, which this crate knows nothing about)
+    pub fn connect(endpoint: &IpcEndpoint) -> io::Result<(Self, Box<dyn Read + Send>)> {
+        #[cfg(unix)]
+        let (read, write) = match endpoint {
+            IpcEndpoint::Socket(path) => {
+                let stream = UnixStream::connect(path)?;
+                // Both halves of one socket: the writer half stays with the connection (so it can
+                // be shut down), the reader half goes to the caller's reader thread
+                let read = stream
+                    .try_clone()
+                    .expect("could not clone the socket for its reader half");
+                (
+                    Box::new(read) as Box<dyn Read + Send>,
+                    ConnWrite::Socket(stream),
+                )
+            }
+        };
+        #[cfg(windows)]
+        let (read, write) = match endpoint {
+            IpcEndpoint::Pipe(name) => {
+                let (read, write) = windows_pipe::connect_client(name)?;
+                (
+                    Box::new(read) as Box<dyn Read + Send>,
+                    ConnWrite::Pipe(Box::new(write)),
+                )
+            }
+        };
+        let conn = Self {
+            shared: Arc::new(ClientShared {
+                write: Mutex::new(write),
+                next_rid: AtomicU64::new(0),
+                pending: Mutex::new(HashMap::new()),
+                feeds: Mutex::new(HashMap::new()),
+                orphan: Mutex::new(HashMap::new()),
+            }),
+        };
+        Ok((conn, read))
+    }
+
+    /// Spawns no thread itself; the caller does, after wiring the event proxy:
+    /// ```ignore
+    /// let (conn, read) = IpcConn::connect(&endpoint)?;
+    /// thread::spawn(move || conn.read_loop(read, |down| { ... }));
+    /// ```
+    /// Frames arrive in order on one socket: a control frame is a reply (delivered to the ask
+    /// that waits for it, or forwarded uncorrelated — the `Busy` gate a second window gets) or
+    /// an event; a data or snapshot frame is queued for its block and wakes the pane.
+    pub fn read_loop(
+        &self,
+        mut read: Box<dyn Read + Send>,
+        mut on: impl FnMut(ControlDown) + Send,
+    ) {
+        loop {
+            let frame = match read_typed_frame(&mut *read) {
+                Ok(frame) => frame,
+                Err(_) => return, // the server (or the session) is gone
+            };
+            match frame {
+                WireFrame::Control(json) => match serde_json::from_slice::<DownControl>(&json) {
+                    Ok(DownControl::Reply(reply)) => {
+                        let sender = self.shared.pending.lock().unwrap().remove(&reply.rid);
+                        match sender {
+                            Some(sender) => {
+                                let _ = sender.send(reply);
+                            }
+                            None => on(ControlDown::Reply(reply)),
+                        }
+                    }
+                    Ok(DownControl::Event(event)) => {
+                        if event.v != WIRE_VERSION {
+                            eprintln!(
+                                "[client] the server speaks protocol version {}; dropping it",
+                                event.v
+                            );
+                            return;
+                        }
+                        on(ControlDown::Event(event.event));
+                    }
+                    Err(error) => {
+                        eprintln!("[client] a control frame did not decode: {error}");
+                        return;
+                    }
+                },
+                WireFrame::Data(token, bytes) => {
+                    self.feed_block(token, QueuedChunk::Data(bytes));
+                }
+                WireFrame::Snapshot(token, bytes) => {
+                    self.feed_block(token, QueuedChunk::Snapshot(bytes));
+                }
+            }
+        }
+    }
+
+    /// Queues a chunk for its block, or for the orphan shelf when the pane has not claimed it yet
+    fn feed_block(&self, token: u32, chunk: QueuedChunk) {
+        let token = BlockId(u64::from(token));
+        let feed = self.shared.feeds.lock().unwrap().get(&token).cloned();
+        if let Some(feed) = feed {
+            // Arrival order on the socket already puts the snapshot before any live chunk
+            match chunk {
+                QueuedChunk::Data(bytes) => {
+                    feed.queue.lock().unwrap().push_back(bytes);
+                }
+                QueuedChunk::Snapshot(bytes) => {
+                    *feed.snapshot.lock().unwrap() = Some(bytes);
+                }
+            }
+            if !feed.wake_pending.swap(true, Ordering::AcqRel) {
+                (feed.notify)(IoEvent::Output);
+            }
+            return;
+        }
+        self.shared
+            .orphan
+            .lock()
+            .unwrap()
+            .entry(token)
+            .or_default()
+            .push(chunk);
+    }
+
+    /// Registers a block's feed for the pane built over it. Chunks that arrived for the token
+    /// while the pane was being built come across first, snapshot before live data, in order.
+    pub fn open_block(&self, token: BlockId, notify: Notify) -> IpcBlock {
+        let feed = Arc::new(BlockFeed {
+            queue: Mutex::new(VecDeque::new()),
+            snapshot: Mutex::new(None),
+            wake_pending: Arc::new(AtomicBool::new(false)),
+            notify,
+        });
+        self.shared
+            .feeds
+            .lock()
+            .unwrap()
+            .insert(token, feed.clone());
+        if let Some(orphans) = self.shared.orphan.lock().unwrap().remove(&token) {
+            for chunk in orphans {
+                match chunk {
+                    QueuedChunk::Data(bytes) => feed.queue.lock().unwrap().push_back(bytes),
+                    QueuedChunk::Snapshot(bytes) => *feed.snapshot.lock().unwrap() = Some(bytes),
+                }
+            }
+        }
+        IpcBlock {
+            token,
+            feed,
+            conn: self.clone(),
+        }
+    }
+
+    /// Sends `Attach`: a fresh server answers like init, an existing one hands over its state
+    pub fn attach(
+        &self,
+        shell: &ShellConfig,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> Result<AttachAnswer, String> {
+        let reply = self.ask(wire::WireOp::Attach {
+            shell: wire::WireShell::from_config(shell),
+            cols,
+            rows,
+            scrollback,
+        })?;
+        match reply.reply {
+            WireReplyKind::Init {
+                state,
+                created: Some(pane),
+            } => Ok(AttachAnswer::Fresh { state, pane }),
+            WireReplyKind::Init { created: None, .. } => {
+                Err("the server attached without its first pane".to_string())
+            }
+            WireReplyKind::Attached { state, panes } => Ok(AttachAnswer::Existing { state, panes }),
+            WireReplyKind::InitFailed { error } => Err(error),
+            WireReplyKind::Busy => {
+                Err("another window is driving this terminal server".to_string())
+            }
+            other => Err(format!("the attach got an unexpected reply: {other:?}")),
+        }
+    }
+
+    /// Sends a fire-and-forget op
+    pub(crate) fn send_op(&self, op: wire::WireOp) {
+        let _ = self.send_wire(&WireRequest {
+            v: WIRE_VERSION,
+            rid: None,
+            op,
+        });
+    }
+
+    /// The working directory of the block's foreground program (a blocking round trip, asked
+    /// under `ask`'s timeout)
+    pub(crate) fn foreground_dir(&self, block: BlockId) -> Option<PathBuf> {
+        match self.ask(wire::WireOp::ForegroundDir { block }) {
+            Ok(WireReply {
+                reply: WireReplyKind::ForegroundDir { dir },
+                ..
+            }) => dir,
+            _ => None,
+        }
+    }
+
+    /// One correlated ask: registers the reply slot, sends, and waits for the reply
+    fn ask(&self, op: wire::WireOp) -> Result<WireReply, String> {
+        let rid = self.shared.next_rid.fetch_add(1, Ordering::Relaxed) + 1;
+        let (reply, answer) = channel();
+        self.shared.pending.lock().unwrap().insert(rid, reply);
+        let request = WireRequest {
+            v: WIRE_VERSION,
+            rid: Some(rid),
+            op,
+        };
+        if let Err(error) = self.send_wire(&request) {
+            self.shared.pending.lock().unwrap().remove(&rid);
+            return Err(error);
+        }
+        match answer.recv_timeout(ASK_TIMEOUT) {
+            Ok(reply) => Ok(reply),
+            Err(_) => {
+                self.shared.pending.lock().unwrap().remove(&rid);
+                Err("the server did not answer".to_string())
+            }
+        }
+    }
+
+    fn send_wire(&self, request: &WireRequest) -> Result<(), String> {
+        let json = wire::frame_json(request).map_err(|error| error.to_string())?;
+        let mut frame = vec![FRAME_CONTROL];
+        frame.extend_from_slice(&json);
+        self.shared
+            .write
+            .lock()
+            .unwrap()
+            .send_frame(&frame)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Ends the connection now: the server's session sees an end-of-file and frees itself (and
+    /// the blocks live on headless). The window process's exit does the same for every fd.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the window's process exit ends the connection; the explicit close is for tests"
+        )
+    )]
+    pub fn close(&self) {
+        self.shared.write.lock().unwrap().shutdown();
+    }
+}
+
+/// What the window sent down along serde's untagged envelope: a reply or an event
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DownControl {
+    Reply(WireReply),
+    Event(WireEvent),
+}
+
+/// A pane's program over the wire: writes and resize/kill go out as requests; reads pop the
+/// queue the connection's reader thread is feeding; the attach snapshot is served first, exactly
+/// once. There is no local backpressure: the local queue takes everything the session streams
+/// (an unbounded queue here is what lets the PTY's own backpressure carry through the socket).
+pub struct IpcBlock {
+    token: BlockId,
+    feed: Arc<BlockFeed>,
+    conn: IpcConn,
+}
+
+impl PaneIo for IpcBlock {
+    fn write(&mut self, bytes: &[u8]) {
+        self.conn.send_op(wire::WireOp::Write {
+            block: self.token,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    fn try_read(&mut self) -> Option<Vec<u8>> {
+        if let Some(snapshot) = self.feed.snapshot.lock().unwrap().take() {
+            return Some(snapshot);
+        }
+        self.feed.queue.lock().unwrap().pop_front()
+    }
+
+    fn rearm(&self) {
+        self.feed.wake_pending.store(false, Ordering::Release);
+    }
+
+    fn notify_again(&self) {
+        self.feed.wake_pending.store(true, Ordering::Release);
+        (self.feed.notify)(IoEvent::Output);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.conn.send_op(wire::WireOp::ResizeBlock {
+            block: self.token,
+            cols,
+            rows,
+        });
+    }
+
+    fn foreground_dir(&self) -> Option<PathBuf> {
+        self.conn.foreground_dir(self.token)
+    }
+
+    fn kill(&mut self) {
+        self.conn.send_op(wire::WireOp::Kill { block: self.token });
+    }
+}
+
+impl Drop for IpcBlock {
+    fn drop(&mut self) {
+        // The pane is gone; the reader thread stops feeding it. This never closes the block:
+        // closing a pane goes through `Close` ops, and exit is an event
+        self.shared_feeds().remove(&self.token);
+    }
+}
+
+impl IpcBlock {
+    fn shared_feeds(&self) -> std::sync::MutexGuard<'_, HashMap<BlockId, Arc<BlockFeed>>> {
+        self.conn.shared.feeds.lock().unwrap()
+    }
+}
+
+/// The window's op sender, shaped like the in-process [`ServerHandle`] so call sites that only
+/// queue layout ops (the mouse driver) keep building the same [`Request`]s they always have:
+/// they just travel over the wire instead of an in-process channel.
+#[derive(Clone)]
+pub struct OpSender {
+    conn: IpcConn,
+}
+
+impl OpSender {
+    pub(crate) fn new(conn: IpcConn) -> Self {
+        Self { conn }
+    }
+
+    /// Queues an op for the server thread; errors are ignored (the server may be gone)
+    pub(crate) fn send(&self, request: Request) {
+        if let Some(op) = wire::WireOp::from_request(&request) {
+            self.conn.send_op(op);
+        }
+    }
+}
+
 /// A pane's program, running in the server
 pub struct ServerBlock {
     requests: Sender<Request>,
@@ -1519,11 +3373,27 @@ impl ServerBlock {
     /// The block's screen as VT sequences (see [`snapshot`])
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "attaching clients arrive in stage 3")
+        expect(
+            dead_code,
+            reason = "sessions ask the server thread directly; the block view's ask stays for tests"
+        )
     )]
     pub fn snapshot(&self) -> Vec<u8> {
         self.ask(|reply| Request::Snapshot(self.id, reply))
             .unwrap_or_default()
+    }
+
+    /// The wire token of the block: how sessions and data frames name it
+    pub(crate) fn block_id(&self) -> BlockId {
+        self.id
+    }
+
+    /// Drops everything pending without the pause handshake: an attach discards the chunks that
+    /// predate its snapshot (their effect is already on the server-side screen it exports) and
+    /// never asks for a drain, so a block paused headless stays paused until the session resumes
+    /// it properly
+    pub(crate) fn discard_pending(&self) {
+        while self.output.try_recv().is_ok() {}
     }
 }
 
@@ -1564,11 +3434,9 @@ impl PaneIo for ServerBlock {
     }
 }
 
-impl Drop for ServerBlock {
-    fn drop(&mut self) {
-        let _ = self.requests.send(Request::Close(self.id));
-    }
-}
+// There is no close-on-drop: sessions hand their block views back to the server process when
+// they end (the shells must outlive the window), so dropping a view is never a close. In-process
+// closing goes through `Request::Close` / `LayoutClose` explicitly.
 
 #[cfg(test)]
 mod tests {
@@ -2485,7 +4353,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_replies_carry_the_state_with_a_blockless_created_pane() {
+    fn wire_replies_carry_the_state_with_the_pane_token() {
         let (server, _events) = Server::start();
         let (block, notice, _rx) =
             create(&server, &shell("no-such-program-wire-reply", &[]), false)
@@ -2497,16 +4365,16 @@ mod tests {
             rows: 24,
             notice,
         };
-        // What the wire should carry for this pane: pane, size and notice, nothing else
+        // What the wire should carry for this pane: pane, its block token, size and notice;
+        // the block view itself still does not travel
         let expected = IpcCreatedPane::from_created(&created);
         let reply = WireReply::init(11, Ok((Layout::new(PaneId(7)).state(), Some(created))));
         assert_eq!(reply.rid, 11);
         assert_eq!(reply.v, WIRE_VERSION);
         let json = serde_json::to_string(&reply).expect("serializes");
         assert!(json.contains("\"reply\":\"init\""), "{json}");
-        assert!(!json.contains("block"), "the block does not travel: {json}");
         assert_eq!(round_trip(reply.clone()), reply);
-        // The decoded created pane is exactly what the window needs to size its pane
+        // The decoded created pane is exactly what the window needs to build its pane
         let WireReplyKind::Init {
             state,
             created: Some(wire_created),
@@ -2515,9 +4383,10 @@ mod tests {
             panic!("an init reply");
         };
         assert_eq!(state.focus, PaneId(7));
+        assert_eq!(wire_created, expected);
         assert_eq!(
-            wire_created, expected,
-            "the created pane carries pane, size and notice only"
+            wire_created.block, expected.block,
+            "the pane's block token travels: it names the block over the data channel"
         );
         let notice = wire_created.notice.expect("the fallback notice travels");
         assert!(notice.ends_with("; using the default shell"), "{notice}");
@@ -2587,5 +4456,480 @@ mod tests {
             .expect("a whole message");
         assert_eq!(second, request);
         assert_eq!(used + rest, wire.len());
+    }
+
+    #[test]
+    fn an_attach_on_a_fresh_server_behaves_like_init() {
+        let (server, _events) = Server::start();
+        let (reply, answer) = channel();
+        server.send(Request::Attach {
+            shell: waiting(),
+            cols: 80,
+            rows: 24,
+            scrollback: 1000,
+            reply,
+        });
+        match answer
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the attach answers")
+        {
+            AttachOutcome::Fresh(Ok((state, created))) => {
+                assert_eq!(created.pane, PaneId(0), "a fresh start inits the layout");
+                assert_eq!(state.focus, PaneId(0));
+                assert_eq!((created.cols, created.rows), (80, 24));
+            }
+            other => panic!("expected a fresh attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_attach_on_an_existing_layout_lists_its_live_panes() {
+        let (server, events) = Server::start();
+        init(&server);
+        split(&server, PaneId(0), waiting(), Rect::new(0, 0, 800, 600));
+        let (split_state, created) = wait_state(&events);
+        let created = created.expect("the split reports its pane");
+        let second_block = created.block.block_id();
+
+        let (reply, answer) = channel();
+        server.send(Request::Attach {
+            shell: waiting(),
+            cols: 80,
+            rows: 24,
+            scrollback: 1000,
+            reply,
+        });
+        match answer
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the attach answers")
+        {
+            AttachOutcome::Existing(attach_state, panes) => {
+                assert_eq!(
+                    attach_state, split_state,
+                    "the attach carries the current state"
+                );
+                let ids: Vec<PaneId> = panes.iter().map(|pane| pane.pane).collect();
+                assert_eq!(ids, vec![PaneId(0), PaneId(1)], "both live panes travel");
+                assert_eq!((panes[0].cols, panes[0].rows), (80, 24));
+                assert_eq!(
+                    (panes[1].cols, panes[1].rows),
+                    (40, 20),
+                    "the split's spawn size travels"
+                );
+                assert_ne!(
+                    panes[0].block, panes[1].block,
+                    "each pane names its own block"
+                );
+                assert_eq!(panes[1].block, second_block);
+                assert_eq!(
+                    Layout::from_state(attach_state).tiled_ids(),
+                    vec![PaneId(0), PaneId(1)]
+                );
+            }
+            other => panic!("expected an existing attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_last_pane_closing_leaves_a_fresh_server_for_the_next_attach() {
+        let (server, events) = Server::start();
+        init(&server);
+        server.send(Request::LayoutClose { pane: PaneId(0) });
+        match wait_layout(&events) {
+            LayoutEvent::LastPaneClosed => {}
+            other => panic!("expected LastPaneClosed, got {other:?}"),
+        }
+
+        let (reply, answer) = channel();
+        server.send(Request::Attach {
+            shell: waiting(),
+            cols: 80,
+            rows: 24,
+            scrollback: 1000,
+            reply,
+        });
+        match answer
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the attach answers")
+        {
+            AttachOutcome::Fresh(Ok((state, created))) => {
+                // A fresh layout, and a fresh pane id: ids are never reused, not even now
+                assert_ne!(created.pane, PaneId(0));
+                assert_eq!(state.focus, created.pane);
+                assert_eq!(Layout::from_state(state).tiled_ids(), vec![created.pane]);
+            }
+            other => panic!("expected a fresh attach after the last pane closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicking_request_does_not_stop_the_server() {
+        let (server, _events) = Server::start();
+        server.send(Request::Panic);
+        // The run loop survives the panic and keeps answering
+        let (state, created) = init(&server);
+        assert_eq!(created.pane, PaneId(0));
+        assert_eq!(state.focus, PaneId(0));
+    }
+
+    /// Reads a block's output until `wanted` shows up (answering ConPTY's cursor query), like
+    /// the window drains its panes
+    #[cfg(unix)]
+    fn read_until_marker(block: &mut dyn PaneIo, wanted: &str) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        while !String::from_utf8_lossy(&output).contains(wanted) && Instant::now() < deadline {
+            block.rearm();
+            match block.try_read() {
+                Some(chunk) => {
+                    if chunk.windows(4).any(|query| query == b"\x1b[6n") {
+                        block.write(b"\x1b[1;1R");
+                    }
+                    output.extend(chunk);
+                }
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&output).contains(wanted),
+            "{wanted:?} never came back over the socket"
+        );
+        output
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_block_writer_thread_serializes_writes_and_never_blocks_the_server() {
+        let (server, _events) = Server::start();
+        // Echo off: the kernel echo and the program's own print would produce two interleaved
+        // copies of every line; with echo off each write comes back exactly once, in order
+        let echo_off = running("stty -echo; cat", "more");
+        let (mut block, _notice, _rx) =
+            create(&server, &echo_off, false).expect("the program starts");
+        let id = block.block_id();
+
+        // Each sender writes its pair back to back; the single writer thread per block applies
+        // each sender's pair in order and every marker stays one whole write
+        const PAIRS: usize = 12;
+        let mut senders = Vec::new();
+        for sender in 0..3 {
+            let handle = server.clone();
+            senders.push(thread::spawn(move || {
+                for round in 0..PAIRS {
+                    let first = format!("s{sender}-a{round}-{}", "x".repeat(40));
+                    let second = format!("s{sender}-b{round}-{}", "y".repeat(40));
+                    handle.send(Request::Write(id, format!("{first}\n").into_bytes()));
+                    handle.send(Request::Write(id, format!("{second}\n").into_bytes()));
+                }
+            }));
+        }
+
+        // A snapshot must answer while the writes queue: before the per-block writer thread
+        // existed, a deep enough PTY write backlog blocked the server loop itself
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        let (reply, answer) = channel();
+        server.send(Request::Snapshot(id, reply));
+        let screen = answer
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the server answers a snapshot while writes are pending");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the server answered in {:?} with a write backlog pending",
+            started.elapsed()
+        );
+        assert!(!screen.is_empty());
+        let _ = screen;
+
+        for sender in senders {
+            sender.join().expect("the writers finished");
+        }
+        // Every marker arrives whole, and each sender's pairs stay in order
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let complete = |text: &str| {
+            (0..3).all(|sender| {
+                (0..PAIRS).all(|round| {
+                    text.contains(&format!("s{sender}-a{round}"))
+                        && text.contains(&format!("s{sender}-b{round}"))
+                })
+            })
+        };
+        while !complete(&String::from_utf8_lossy(&output)) && Instant::now() < deadline {
+            block.rearm();
+            match block.try_read() {
+                Some(chunk) => {
+                    if chunk.windows(4).any(|query| query == b"\x1b[6n") {
+                        block.write(b"\x1b[1;1R");
+                    }
+                    output.extend(chunk);
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let text = String::from_utf8_lossy(&output).into_owned();
+        for sender in 0..3 {
+            for round in 0..PAIRS {
+                let first = format!("s{sender}-a{round}-{}", "x".repeat(40));
+                let second = format!("s{sender}-b{round}-{}", "y".repeat(40));
+                let (a, b) = (
+                    text.find(&first)
+                        .expect("the marker arrived whole; it is one write"),
+                    text.find(&second)
+                        .expect("the marker arrived whole; it is one write"),
+                );
+                assert!(
+                    a < b,
+                    "sender {sender} round {round}: the pair got reordered: {text}"
+                );
+            }
+        }
+        block.kill();
+    }
+
+    #[test]
+    fn typed_frames_dispatch_by_their_type_byte() {
+        let request = WireRequest {
+            v: WIRE_VERSION,
+            rid: Some(3),
+            op: WireOp::ToggleZoom,
+        };
+        let json = wire::frame_json(&request).expect("the request serializes");
+        let mut stream: Vec<u8> = Vec::new();
+        stream.push(FRAME_CONTROL);
+        stream.extend_from_slice(&wire::frame(&json));
+        stream.append(&mut data_frame(
+            FRAME_DATA,
+            BlockId(9),
+            b"live-bytes".to_vec(),
+        ));
+        stream.append(&mut data_frame(
+            FRAME_SNAPSHOT,
+            BlockId(9),
+            b"screen-bits".to_vec(),
+        ));
+        stream.push(7); // an unknown type byte ends the connection
+
+        let mut read = &stream[..];
+        match read_typed_frame(&mut read).expect("the control frame") {
+            WireFrame::Control(bytes) => {
+                assert_eq!(bytes, json, "the control frame carries the JSON whole");
+            }
+            frame => panic!("expected a control frame, got {frame:?}"),
+        }
+        match read_typed_frame(&mut read).expect("the data frame") {
+            WireFrame::Data(token, bytes) => {
+                assert_eq!(token, 9, "the block token travels");
+                assert_eq!(bytes, b"live-bytes");
+            }
+            frame => panic!("expected a data frame, got {frame:?}"),
+        }
+        match read_typed_frame(&mut read).expect("the snapshot frame") {
+            WireFrame::Snapshot(token, bytes) => {
+                assert_eq!(token, 9);
+                assert_eq!(bytes, b"screen-bits");
+            }
+            frame => panic!("expected a snapshot frame, got {frame:?}"),
+        }
+        assert!(
+            read_typed_frame(&mut read).is_err(),
+            "an unknown type byte is an error, not a frame"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_real_socket_client_attaches_writes_and_reads_back() {
+        // The socket path must be shorter than SUN_LEN: a short /tmp name
+        let dir = std::env::temp_dir().join(format!(
+            "t{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock works")
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("the test directory is created");
+        let path = dir.join("server.sock");
+
+        let (server, layout_events) = Server::start();
+        let shared = Arc::new(ProcessShared::default());
+        let router_shared = shared.clone();
+        thread::spawn(move || route_events(layout_events, router_shared));
+        let listener =
+            IpcListener::bind(&IpcEndpoint::Socket(path.clone())).expect("the endpoint binds");
+        let accept_shared = shared.clone();
+        let accept_handle = server.clone();
+        thread::spawn(move || accept_sessions(listener, accept_handle, accept_shared));
+
+        // The client connects, spawns its reader, and attaches
+        let (client, read) =
+            IpcConn::connect(&IpcEndpoint::Socket(path.clone())).expect("the client connects");
+        let (layout_tx, layout_rx) = channel::<WireEventKind>();
+        {
+            let client = client.clone();
+            thread::spawn(move || {
+                client.read_loop(read, move |down| match down {
+                    ControlDown::Event(event) => {
+                        let _ = layout_tx.send(event);
+                    }
+                    ControlDown::Reply(reply) => {
+                        panic!("an unexpected reply arrived over the wire: {reply:?}")
+                    }
+                });
+            });
+        }
+        // An echoing program, so the written bytes come over the data channel back
+        let echo = running("cat", "more");
+        let answer = client
+            .attach(&echo, 80, 24, 1000)
+            .expect("the attach answers");
+        let AttachAnswer::Fresh { state, pane } = answer else {
+            panic!("a fresh server attaches like init");
+        };
+        assert_eq!(state.focus, pane.pane);
+
+        // The pane is built exactly as the window would: an IpcBlock over the connection
+        let (event_tx, _event_rx) = channel::<IoEvent>();
+        let event_tx = std::sync::Mutex::new(event_tx);
+        let notify: Notify = Arc::new(move |event| {
+            let _ = event_tx.lock().unwrap().send(event);
+        });
+        let mut block = client.open_block(pane.block, notify);
+        assert_eq!(pane.block, BlockId(0), "the first block is token zero");
+
+        // The echoed write comes back over the data channel, exactly like a pane drains
+        block.write(b"echo-after-attach\n");
+        read_until_marker(&mut block, "echo-after-attach");
+
+        // Layout events travel as wire events too: a mutation answers with a state event. A
+        // split is the guaranteed change with a single pane (it also reports its created pane)
+        client.send_op(WireOp::Split {
+            pane: pane.pane,
+            dir: crate::layout::Dir::Right,
+            shell: wire::WireShell::from_config(&waiting()),
+            explicit: false,
+            cols: 40,
+            rows: 20,
+            scrollback: 1000,
+            area: Rect::new(0, 0, 800, 600),
+            limits: Limits {
+                min_w: 80,
+                min_h: 60,
+            },
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_state = false;
+        while Instant::now() < deadline {
+            match layout_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(WireEventKind::State { .. }) => {
+                    saw_state = true;
+                    break;
+                }
+                // A created pane followed the state event; keep collecting
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_state, "a state event traveled over the wire");
+
+        // A second connection gets the busy gate, and the first session is unaffected
+        {
+            let mut second =
+                std::os::unix::net::UnixStream::connect(&path).expect("the gate opens");
+            let WireFrame::Control(json) = read_typed_frame(&mut second).expect("the gate answers")
+            else {
+                panic!("the gate answers in the control channel");
+            };
+            let reply: WireReply = serde_json::from_slice(&json).expect("a wire reply");
+            assert!(matches!(reply.reply, WireReplyKind::Busy), "{reply:?}");
+        }
+        block.write(b"echo-after-busy\n");
+        read_until_marker(&mut block, "echo-after-busy");
+
+        // The working directory ask answers over the wire too
+        let _ = client.foreground_dir(pane.block);
+
+        // The client goes away: the session ends, the block keeps running headless, and the
+        // next session re-attaches to the same block with its screen
+        drop(block);
+        client.close();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && shared.slot.lock().unwrap().is_some() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            shared.slot.lock().unwrap().is_none(),
+            "the session ended when the client went away"
+        );
+
+        let (client, read) =
+            IpcConn::connect(&IpcEndpoint::Socket(path.clone())).expect("the client reconnects");
+        {
+            let client = client.clone();
+            thread::spawn(move || {
+                client.read_loop(read, move |down| match down {
+                    ControlDown::Event(_) => {}
+                    ControlDown::Reply(reply) => {
+                        panic!("an unexpected reply arrived over the wire: {reply:?}")
+                    }
+                });
+            });
+        }
+        let answer = client
+            .attach(&waiting(), 80, 24, 1000)
+            .expect("the re-attach answers");
+        let AttachAnswer::Existing { state, panes } = answer else {
+            panic!("an existing layout hands itself over");
+        };
+        // Both panes of the split layout are live, in pane order
+        assert_eq!(
+            Layout::from_state(state).tiled_ids(),
+            vec![PaneId(0), PaneId(1)]
+        );
+        assert_eq!(panes.len(), 2, "both live panes travel");
+        assert_eq!(
+            panes[0].block,
+            BlockId(0),
+            "the first block keeps its token"
+        );
+        assert_eq!(
+            panes[1].block,
+            BlockId(1),
+            "the split's block keeps its token"
+        );
+
+        // The snapshot for the re-attached pane arrives on the data channel, before any live
+        // chunk, and the first read serves it
+        let (event_tx, _event_rx) = channel::<IoEvent>();
+        let event_tx = std::sync::Mutex::new(event_tx);
+        let notify: Notify = Arc::new(move |event| {
+            let _ = event_tx.lock().unwrap().send(event);
+        });
+        let mut second_block = client.open_block(panes[0].block, notify);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let snapshot = loop {
+            second_block.rearm();
+            if let Some(bytes) = second_block.try_read() {
+                break bytes;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the snapshot never arrived on the data channel"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            !snapshot.is_empty(),
+            "the re-attached pane replays its screen first"
+        );
+
+        // The shell behind the block is still alive (the window never killed it) and answers
+        second_block.write(b"echo-after-reattach\n");
+        read_until_marker(&mut second_block, "echo-after-reattach");
+
+        drop(second_block);
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
