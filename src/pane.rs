@@ -18,7 +18,8 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
-use crate::pane_io::{IoEvent, LocalPty, Notify, PaneIo};
+use crate::pane_io::{IoEvent, Notify, PaneIo};
+use crate::server::ServerHandle;
 use crate::{LuaEvent, UserEvent};
 
 /// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
@@ -269,10 +270,11 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Creates the terminal, opens the PTY, launches the shell, and starts the threads serving it.
-    /// The threads wake the event loop with `UserEvent::PtyOutput(id)` / `ShellExited(id)`.
+    /// Creates the terminal and asks `server` to launch the shell in a new block. The server wakes
+    /// the event loop with `UserEvent::PtyOutput(id)` / `ShellExited(id)`.
     pub fn spawn(
         config: &Config,
+        server: &ServerHandle,
         spawn: Spawn,
         lua_events: Sender<(PaneId, LuaEvent)>,
         proxy: EventLoopProxy<UserEvent>,
@@ -332,11 +334,12 @@ impl Pane {
                 IoEvent::Exited => UserEvent::ShellExited(id),
             });
         });
-        let (io, fallback) = LocalPty::spawn(
+        let (io, fallback) = server.create_block(
             &with_integration(shell),
             explicit,
             spawn.cols,
             spawn.rows,
+            config.scrollback,
             notify,
         )?;
         if let Some(message) = fallback {

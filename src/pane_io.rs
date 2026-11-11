@@ -47,7 +47,7 @@ pub trait PaneIo {
 
 /// Chunks that fit in the output channel before the reader thread blocks (backpressure to the PTY,
 /// and to ConPTY on Windows, instead of memory growing without limit)
-const CHANNEL_CAPACITY: usize = 64;
+pub(crate) const CHANNEL_CAPACITY: usize = 64;
 
 /// A program running in a PTY of this machine
 pub struct LocalPty {
