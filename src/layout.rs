@@ -1,8 +1,8 @@
-//! Geometría de los paneles: el árbol de splits del mosaico, los paneles flotantes, el foco, el
-//! zoom y qué hay bajo un punto. No sabe nada de ventanas, GPU ni PTY: recibe rectángulos en
-//! pixeles físicos y devuelve rectángulos, para poder probarlo todo con tests normales.
+//! Pane geometry: the tiling split tree, floating panes, focus, zoom and what lies under a
+//! point. It knows nothing about windows, the GPU or PTYs: it takes rectangles in physical
+//! pixels and returns rectangles, so everything can be tested with plain tests.
 
-/// Identificador de un panel; no se reutiliza durante la vida de la app
+/// Pane identifier; never reused during the app's lifetime
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PaneId(pub u32);
 
@@ -35,19 +35,19 @@ impl Rect {
     }
 }
 
-/// Tamaño mínimo de un panel (con su margen incluido), en pixeles
+/// Minimum pane size (padding included), in pixels
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub min_w: u32,
     pub min_h: u32,
 }
 
-/// Cómo se colocan los hijos de un split
+/// How a split's children are laid out
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
-    /// Uno al lado del otro (el divisor es una línea vertical): "dividir a la derecha"
+    /// Side by side (the divider is a vertical line): "split right"
     Horizontal,
-    /// Uno encima del otro (el divisor es una línea horizontal): "dividir hacia abajo"
+    /// One above the other (the divider is a horizontal line): "split down"
     Vertical,
 }
 
@@ -67,13 +67,13 @@ impl Dir {
         }
     }
 
-    /// ¿Crece hacia coordenadas mayores?
+    /// Does it grow toward larger coordinates?
     fn positive(self) -> bool {
         matches!(self, Dir::Right | Dir::Down)
     }
 }
 
-/// Bordes de un flotante que están bajo el puntero (dos a la vez en una esquina)
+/// Edges of a floating pane under the pointer (two at once at a corner)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Edge {
     pub left: bool,
@@ -82,11 +82,11 @@ pub struct Edge {
     pub bottom: bool,
 }
 
-/// Camino hasta un split: `false` = hijo `a` (izquierda/arriba), `true` = hijo `b`
+/// Path to a split: `false` = child `a` (left/top), `true` = child `b`
 pub type Path = Vec<bool>;
 
-/// Línea que separa los dos hijos de un split. `pos` es la coordenada del límite en el eje del
-/// split y `start..start + len` lo que ocupa en el otro eje.
+/// Line separating a split's two children. `pos` is the boundary coordinate on the split's
+/// axis and `start..start + len` is its extent on the other axis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Divider {
     pub path: Path,
@@ -97,7 +97,7 @@ pub struct Divider {
 }
 
 impl Divider {
-    /// Rectángulo de la línea, de `thickness` pixeles de grosor centrada en el límite
+    /// Rectangle of the line, `thickness` pixels thick, centered on the boundary
     pub fn rect(&self, thickness: u32) -> Rect {
         let before = self.pos.saturating_sub(thickness / 2);
         match self.axis {
@@ -111,20 +111,20 @@ impl Divider {
 pub enum Hit {
     Pane(PaneId),
     Divider(Path, Axis),
-    /// El anillo de margen de un flotante: arrastrarlo lo mueve
+    /// The padding ring of a floating pane: dragging it moves the pane
     FloatMove(PaneId),
     FloatResize(PaneId, Edge),
     None,
 }
 
-/// Tolerancias de `hit_test`, en pixeles físicos
+/// `hit_test` tolerances, in physical pixels
 #[derive(Clone, Copy, Debug)]
 pub struct HitParams {
-    /// A cuántos pixeles de un divisor se agarra
+    /// How many pixels from a divider it can be grabbed
     pub divider_zone: f64,
-    /// Grosor de la banda de los bordes de un flotante que lo redimensiona
+    /// Width of the edge band of a floating pane that resizes it
     pub edge_band: f64,
-    /// Grosor del anillo de un flotante (margen del panel) que lo mueve
+    /// Width of a floating pane's ring (the pane padding) that moves it
     pub move_ring: f64,
 }
 
@@ -139,7 +139,7 @@ enum Node {
     },
 }
 
-/// Reparte `total` pixeles entre los dos hijos; cada uno recibe al menos uno si hay sitio
+/// Splits `total` pixels between the two children; each gets at least one if there is room
 fn split_sizes(total: u32, ratio: f32) -> (u32, u32) {
     let first = (total as f32 * ratio).round() as u32;
     let first = first.clamp(1, total.saturating_sub(1).max(1)).min(total);
@@ -164,7 +164,7 @@ impl Node {
         }
     }
 
-    /// Tamaño mínimo del subárbol: la suma de los mínimos en el eje del split y el mayor en el otro
+    /// Minimum subtree size: the sum of the minimums on the split axis, the largest on the other
     fn min_size(&self, limits: Limits) -> (u32, u32) {
         match self {
             Node::Leaf(_) => (limits.min_w, limits.min_h),
@@ -267,7 +267,7 @@ impl Node {
         }
     }
 
-    /// Sustituye la hoja `target` por un split con ella y la nueva a partes iguales
+    /// Replaces leaf `target` with a split holding it and the new leaf in equal halves
     fn split_leaf(&mut self, target: PaneId, axis: Axis, new_id: PaneId) -> bool {
         if matches!(self, Node::Leaf(id) if *id == target) {
             *self = Node::Split {
@@ -286,7 +286,7 @@ impl Node {
         }
     }
 
-    /// Quita la hoja `id`: su hermano ocupa el sitio del split. `None` si el nodo era esa hoja.
+    /// Removes leaf `id`: its sibling takes the split's place. `None` if the node was that leaf.
     fn remove(self, id: PaneId) -> Option<Node> {
         match self {
             Node::Leaf(leaf) => (leaf != id).then_some(Node::Leaf(leaf)),
@@ -304,7 +304,7 @@ impl Node {
     }
 }
 
-/// Un panel flotante, en fracciones de la ventana: así sigue en su sitio cuando esta cambia de tamaño
+/// A floating pane, in window fractions, so it stays in place when the window resizes
 #[derive(Clone, Debug, PartialEq)]
 pub struct Float {
     pub id: PaneId,
@@ -314,19 +314,19 @@ pub struct Float {
     h: f32,
 }
 
-/// Lo que pasó al cerrar un panel
+/// What happened when closing a pane
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closed {
     Pane,
-    /// Era el último panel del mosaico: la ventana se cierra
+    /// It was the last tiled pane: the window closes
     LastTiled,
-    /// No existía
+    /// It did not exist
     Unknown,
 }
 
-/// Cuántos paneles recuerda el historial de foco
+/// How many panes the focus history remembers
 const HISTORY_LIMIT: usize = 32;
-/// Desplazamiento (fracción de la ventana) entre flotantes nuevos, para que no queden uno sobre otro
+/// Offset (window fraction) between new floating panes, so they do not stack exactly
 const FLOAT_CASCADE: f32 = 0.03;
 const MIN_FLOAT_FRACTION: f32 = 0.1;
 
@@ -336,7 +336,7 @@ pub struct Layout {
     zoomed: Option<PaneId>,
     floats: Vec<Float>,
     floats_visible: bool,
-    /// Paneles con foco, del más antiguo al más reciente
+    /// Focused panes, oldest to most recent
     history: Vec<PaneId>,
 }
 
@@ -377,14 +377,14 @@ impl Layout {
         self.root.contains(id) || self.is_float(id)
     }
 
-    /// Paneles del mosaico, en orden de recorrido del árbol
+    /// Tiled panes, in tree traversal order
     pub fn tiled_ids(&self) -> Vec<PaneId> {
         let mut ids = Vec::new();
         self.root.leaves(&mut ids);
         ids
     }
 
-    /// Todos los paneles que existen (mosaico y flotantes, estén o no visibles)
+    /// Every pane that exists (tiled and floating, visible or not)
     #[cfg(test)]
     pub fn all_ids(&self) -> Vec<PaneId> {
         let mut ids = self.tiled_ids();
@@ -392,8 +392,8 @@ impl Layout {
         ids
     }
 
-    /// Paneles que se ven ahora mismo, en orden de dibujo (de abajo arriba): los del mosaico (con
-    /// zoom, solo el ampliado) y encima los flotantes si no están ocultos
+    /// Panes visible right now, in draw order (bottom to top): the tiled ones (when zoomed, only
+    /// the zoomed one) and the floating ones on top unless hidden
     pub fn visible_ids(&self) -> Vec<PaneId> {
         let mut ids = match self.zoomed {
             Some(zoomed) => vec![zoomed],
@@ -425,8 +425,8 @@ impl Layout {
             .map_or(-1, |index| index as i64)
     }
 
-    /// Da el foco a un panel. Un flotante sube al primer plano; pasar a otro panel del mosaico
-    /// quita el zoom; dar el foco a un flotante oculto los muestra.
+    /// Gives focus to a pane. A floating pane is raised to the front; moving to another tiled pane
+    /// clears zoom; focusing a hidden floating pane shows them all.
     pub fn set_focus(&mut self, id: PaneId) -> bool {
         if !self.contains(id) {
             return false;
@@ -449,7 +449,7 @@ impl Layout {
         }
     }
 
-    /// Último panel del mosaico que tuvo el foco (el primero del árbol si no hay historial)
+    /// Last tiled pane that had focus (the first in the tree if there is no history)
     fn last_tiled(&self) -> PaneId {
         self.history
             .iter()
@@ -459,10 +459,10 @@ impl Layout {
             .unwrap_or_else(|| self.tiled_ids()[0])
     }
 
-    // ---- Mosaico ---------------------------------------------------------------------------
+    // ---- Tiling ----------------------------------------------------------------------------
 
-    /// Panel del mosaico al que afecta un split: el enfocado o, si el foco está en un flotante,
-    /// el último del mosaico que lo tuvo
+    /// Tiled pane a split applies to: the focused one or, if focus is on a floating pane,
+    /// the last tiled pane that had it
     pub fn split_target(&self) -> PaneId {
         if self.is_float(self.focus) {
             self.last_tiled()
@@ -471,8 +471,8 @@ impl Layout {
         }
     }
 
-    /// Divide el panel `target` del mosaico en dos y da el foco al nuevo. `false` si `target` no
-    /// está en el mosaico o si las dos mitades quedarían por debajo del tamaño mínimo.
+    /// Splits tiled pane `target` in two and focuses the new one. `false` if `target` is not
+    /// tiled or if both halves would fall below the minimum size.
     pub fn split(
         &mut self,
         target: PaneId,
@@ -486,7 +486,7 @@ impl Layout {
             self.zoomed = before;
             return false;
         };
-        // Con el zoom puesto `rects` solo devolvía el ampliado: se recalcula sin zoom
+        // With zoom on, `rects` only returned the zoomed pane: recompute without zoom
         let rect = if before.is_some() {
             self.rects(area)
                 .into_iter()
@@ -507,8 +507,8 @@ impl Layout {
         true
     }
 
-    /// Cierra un panel. Al cerrar el último del mosaico no se toca nada y se avisa para que la
-    /// ventana se cierre.
+    /// Closes a pane. Closing the last tiled pane changes nothing and reports it so the window
+    /// can close.
     pub fn close(&mut self, id: PaneId) -> Closed {
         if let Some(index) = self.floats.iter().position(|float| float.id == id) {
             self.floats.remove(index);
@@ -528,7 +528,7 @@ impl Layout {
         Closed::Pane
     }
 
-    /// Quita un panel del historial y, si tenía el foco, lo pasa al último que lo tuvo
+    /// Removes a pane from the history and, if it had focus, passes it to the previous holder
     fn forget(&mut self, id: PaneId) {
         self.history.retain(|&other| other != id);
         if self.zoomed == Some(id) {
@@ -548,7 +548,7 @@ impl Layout {
         self.remember(next);
     }
 
-    /// Rectángulos de los paneles del mosaico. Con zoom, solo el ampliado, que ocupa todo el área.
+    /// Rectangles of the tiled panes. When zoomed, only the zoomed one, filling the whole area.
     pub fn rects(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         if let Some(zoomed) = self.zoomed {
             return vec![(zoomed, area)];
@@ -560,7 +560,7 @@ impl Layout {
         rects
     }
 
-    /// Divisores del mosaico (ninguno con zoom)
+    /// Tiled dividers (none when zoomed)
     pub fn dividers(&self, area: Rect) -> Vec<Divider> {
         if self.zoomed.is_some() {
             return Vec::new();
@@ -572,8 +572,8 @@ impl Layout {
         dividers
     }
 
-    /// Mueve el foco al panel vecino en esa dirección (dentro del mosaico). Quita el zoom. `false`
-    /// si el foco está en un flotante o no hay vecino.
+    /// Moves focus to the neighboring pane in that direction (within the tiling). Clears zoom.
+    /// `false` if focus is on a floating pane or there is no neighbor.
     pub fn focus_dir(&mut self, dir: Dir, area: Rect) -> bool {
         if self.is_float(self.focus) {
             return false;
@@ -623,7 +623,7 @@ impl Layout {
         }
     }
 
-    /// Siguiente (o anterior) panel: primero los del mosaico y luego los flotantes visibles
+    /// Next (or previous) pane: tiled panes first, then visible floating panes
     pub fn focus_cycle(&mut self, forward: bool) -> bool {
         let mut order = self.tiled_ids();
         if self.floats_visible {
@@ -640,9 +640,9 @@ impl Layout {
         next != self.focus && self.set_focus(next)
     }
 
-    /// Mueve el borde del panel en la dirección dada `delta` pixeles (agranda hacia ese lado). Si el
-    /// panel no tiene borde por ahí (está en el límite de la ventana) se mueve el del lado contrario,
-    /// y el panel encoge. Con un flotante, derecha y abajo agrandan; izquierda y arriba encogen.
+    /// Moves the pane's edge in the given direction by `delta` pixels (growing toward that
+    /// side). If the pane has no edge there (it sits at the window boundary) the opposite edge
+    /// moves instead and the pane shrinks. For a floating pane, right/down grow; left/up shrink.
     pub fn resize(&mut self, id: PaneId, dir: Dir, delta: u32, area: Rect, limits: Limits) -> bool {
         if self.is_float(id) {
             let delta = delta as i64;
@@ -658,8 +658,8 @@ impl Layout {
         if self.zoomed.is_some() || !self.root.path_to(id, &mut path) {
             return false;
         }
-        // De cerca a lejos: el primer ancestro con ese eje y el panel del lado que corresponde
-        // (primero, el que deja el borde en la dirección pedida; si no, el contrario)
+        // Nearest to farthest: the first ancestor with that axis and the pane on the matching side
+        // (first, the one that leaves the edge in the requested direction; otherwise, the opposite)
         let ancestors = (0..path.len()).rev();
         let mut chosen = None;
         for outward in [true, false] {
@@ -697,7 +697,7 @@ impl Layout {
         self.set_first_size(split_path, target, area, limits)
     }
 
-    /// Rectángulo que ocupa el nodo al que lleva `path`
+    /// Rectangle occupied by the node `path` leads to
     fn node_rect(&self, area: Rect, path: &[bool]) -> Option<Rect> {
         let mut node = &self.root;
         let mut rect = area;
@@ -720,8 +720,8 @@ impl Layout {
         Some(rect)
     }
 
-    /// Fija cuántos pixeles ocupa el primer hijo del split de `path`, respetando el mínimo de los
-    /// dos subárboles
+    /// Sets how many pixels the first child of the split at `path` takes, respecting the minimum
+    /// of both subtrees
     fn set_first_size(&mut self, path: &[bool], wanted: i64, area: Rect, limits: Limits) -> bool {
         let Some(rect) = self.node_rect(area, path) else {
             return false;
@@ -743,7 +743,7 @@ impl Layout {
         changed
     }
 
-    /// Arrastre de un divisor con el ratón: lleva el límite a la coordenada `boundary`
+    /// Mouse drag of a divider: moves the boundary to coordinate `boundary`
     pub fn set_divider(
         &mut self,
         path: &[bool],
@@ -764,8 +764,8 @@ impl Layout {
         self.set_first_size(path, boundary - i64::from(origin), area, limits)
     }
 
-    /// Ampliar el panel enfocado a toda la ventana, o volver al mosaico. Solo con un panel del
-    /// mosaico enfocado y al menos otro más.
+    /// Zooms the focused pane to fill the window, or returns to the tiling. Only with a tiled pane
+    /// focused and at least one other.
     pub fn toggle_zoom(&mut self) -> bool {
         if self.zoomed.is_some() {
             self.zoomed = None;
@@ -778,10 +778,10 @@ impl Layout {
         true
     }
 
-    // ---- Flotantes -------------------------------------------------------------------------
+    // ---- Floating panes --------------------------------------------------------------------
 
-    /// Añade un flotante centrado (con un pequeño desplazamiento por cada uno que ya hay), lo
-    /// muestra y le da el foco
+    /// Adds a centered floating pane (with a small offset for each existing one), shows it
+    /// and focuses it
     pub fn add_float(&mut self, id: PaneId, width: f32, height: f32) {
         let w = width.clamp(MIN_FLOAT_FRACTION, 1.0);
         let h = height.clamp(MIN_FLOAT_FRACTION, 1.0);
@@ -793,8 +793,8 @@ impl Layout {
         self.set_focus(id);
     }
 
-    /// Oculta o muestra todos los flotantes. Al ocultarlos, el foco vuelve al mosaico; al mostrarlos,
-    /// al último flotante que lo tuvo. Devuelve si hay alguno (si no, no hay nada que mostrar).
+    /// Hides or shows all floating panes. Hiding returns focus to the tiling; showing returns
+    /// it to the last floating pane that had it. Returns whether any exist (else nothing to show).
     pub fn toggle_floats(&mut self) -> bool {
         if self.floats.is_empty() {
             return false;
@@ -837,7 +837,7 @@ impl Layout {
             .map(|float| self.float_px(float, window))
     }
 
-    /// Flotantes visibles, del que está al fondo al que está encima
+    /// Visible floating panes, from bottom-most to top-most
     pub fn float_rects(&self, window: Rect) -> Vec<(PaneId, Rect)> {
         if !self.floats_visible {
             return Vec::new();
@@ -859,7 +859,7 @@ impl Layout {
         float.h = rect.h as f32 / wh;
     }
 
-    /// Mueve un flotante sin sacarlo de la ventana
+    /// Moves a floating pane without leaving the window
     pub fn move_float(&mut self, id: PaneId, dx: i64, dy: i64, window: Rect) -> bool {
         let Some(rect) = self.float_rect(id, window) else {
             return false;
@@ -877,7 +877,7 @@ impl Layout {
         true
     }
 
-    /// Cambia el tamaño de un flotante moviendo su esquina inferior derecha
+    /// Resizes a floating pane by moving its bottom-right corner
     fn resize_float_by(
         &mut self,
         id: PaneId,
@@ -900,8 +900,8 @@ impl Layout {
         true
     }
 
-    /// Arrastre del borde (o esquina) de un flotante con el ratón: `dx`/`dy` son lo que se movió
-    /// el puntero desde el último evento
+    /// Mouse drag of a floating pane's edge (or corner): `dx`/`dy` are how far the pointer moved
+    /// since the last event
     pub fn resize_float_edge(
         &mut self,
         id: PaneId,
@@ -954,10 +954,10 @@ impl Layout {
         true
     }
 
-    // ---- Qué hay bajo un punto -------------------------------------------------------------
+    // ---- What is under a point -------------------------------------------------------------
 
-    /// Qué hay en `(x, y)`: primero los flotantes visibles (de arriba abajo), luego los divisores y
-    /// por último los paneles del mosaico
+    /// What is at `(x, y)`: first the visible floating panes (top to bottom), then the dividers
+    /// and finally the tiled panes
     pub fn hit_test(&self, x: f64, y: f64, window: Rect, params: HitParams) -> Hit {
         for (id, rect) in self.float_rects(window).into_iter().rev() {
             if !rect.contains(x, y) {
@@ -1033,14 +1033,14 @@ mod tests {
             .1
     }
 
-    /// 1 | 2 en una fila
+    /// 1 | 2 in a row
     fn two_columns() -> Layout {
         let mut layout = Layout::new(id(1));
         assert!(layout.split(id(1), Axis::Horizontal, id(2), WINDOW, LIMITS));
         layout
     }
 
-    /// Cuadrícula de 2x2: arriba 1 | 2, abajo 3 | 4
+    /// 2x2 grid: top 1 | 2, bottom 3 | 4
     fn grid() -> Layout {
         let mut layout = Layout::new(id(1));
         assert!(layout.split(id(1), Axis::Vertical, id(3), WINDOW, LIMITS));
@@ -1063,7 +1063,7 @@ mod tests {
         assert_eq!(a.w + b.w, WINDOW.w);
         assert_eq!(b.x, a.right());
         assert_eq!((a.h, b.h), (WINDOW.h, WINDOW.h));
-        // Con 801 px, el primero se queda con el redondeo hacia arriba
+        // At 801 px, the first one gets the rounded-up half
         assert_eq!((a.w, b.w), (401, 400));
     }
 
@@ -1094,7 +1094,7 @@ mod tests {
         assert!(!layout.split(id(1), Axis::Horizontal, id(2), tiny, LIMITS));
         assert_eq!(layout.tiled_ids(), vec![id(1)]);
         assert!(layout.split(id(1), Axis::Vertical, id(2), tiny, LIMITS));
-        // Y no se puede dividir un panel que no existe
+        // And a pane that does not exist cannot be split
         assert!(!layout.split(id(9), Axis::Vertical, id(3), tiny, LIMITS));
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(layout.focus(), id(3));
         assert!(layout.focus_dir(Dir::Up, WINDOW));
         assert_eq!(layout.focus(), id(1));
-        // En el borde no hay a dónde ir
+        // At the edge there is nowhere to go
         assert!(!layout.focus_dir(Dir::Left, WINDOW));
         assert!(!layout.focus_dir(Dir::Up, WINDOW));
         assert_eq!(layout.focus(), id(1));
@@ -1138,8 +1138,8 @@ mod tests {
 
     #[test]
     fn with_two_neighbours_the_most_recent_one_wins_a_tie() {
-        // 1 a la izquierda, 2 y 3 apilados a la derecha. Con una ventana de altura par los dos
-        // solapan lo mismo con 1 y están igual de cerca: gana el último que tuvo el foco
+        // 1 on the left, 2 and 3 stacked on the right. With an even window height both overlap
+        // 1 equally and are equally close: the one that last had focus wins
         let window = Rect::new(0, 0, 800, 600);
         let mut layout = Layout::new(id(1));
         layout.split(id(1), Axis::Horizontal, id(2), window, LIMITS);
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn with_unequal_overlap_the_pane_sharing_more_edge_wins() {
-        // Con 601 px de alto el panel de arriba mide 301 y el de abajo 300
+        // At 601 px tall the top pane is 301 and the bottom one 300
         let mut layout = Layout::new(id(1));
         layout.split(id(1), Axis::Horizontal, id(2), WINDOW, LIMITS);
         layout.split(id(2), Axis::Vertical, id(3), WINDOW, LIMITS);
@@ -1186,18 +1186,18 @@ mod tests {
         let before = rect_of(&layout, 1).w;
         assert!(layout.resize(id(1), Dir::Right, 50, WINDOW, LIMITS));
         assert_eq!(rect_of(&layout, 1).w, before + 50);
-        // Un panel pegado al borde derecho "crece hacia la derecha" moviendo su borde izquierdo
+        // A pane flush with the right edge "grows to the right" by moving its left edge
         let width = rect_of(&layout, 2).w;
         assert!(layout.resize(id(2), Dir::Right, 20, WINDOW, LIMITS));
         assert_eq!(
             rect_of(&layout, 2).w,
             width - 20,
-            "encoge: no tiene borde a la derecha"
+            "shrinks: it has no right edge"
         );
-        // Hacia el lado contrario crece
+        // Toward the opposite side it grows
         assert!(layout.resize(id(2), Dir::Left, 20, WINDOW, LIMITS));
         assert_eq!(rect_of(&layout, 2).w, width);
-        // Nunca por debajo del mínimo
+        // Never below the minimum
         assert!(layout.resize(id(1), Dir::Right, 10_000, WINDOW, LIMITS));
         assert_eq!(rect_of(&layout, 2).w, LIMITS.min_w);
         assert!(!layout.resize(id(1), Dir::Right, 10, WINDOW, LIMITS));
@@ -1205,7 +1205,7 @@ mod tests {
 
     #[test]
     fn resizing_looks_for_the_nearest_split_along_the_right_axis() {
-        // Columnas 1 | (2 sobre 3): redimensionar 3 en vertical mueve el divisor de 2/3
+        // Columns 1 | (2 over 3): resizing 3 vertically moves the 2/3 divider
         let mut layout = Layout::new(id(1));
         layout.split(id(1), Axis::Horizontal, id(2), WINDOW, LIMITS);
         layout.split(id(2), Axis::Vertical, id(3), WINDOW, LIMITS);
@@ -1213,17 +1213,17 @@ mod tests {
         assert!(layout.resize(id(2), Dir::Down, 30, WINDOW, LIMITS));
         assert_eq!(rect_of(&layout, 2).h, top + 30);
         assert_eq!(rect_of(&layout, 3).h, bottom - 30);
-        // Y en horizontal el único divisor es el de las columnas
+        // And horizontally the only divider is the column one
         let width = rect_of(&layout, 1).w;
         assert!(layout.resize(id(3), Dir::Left, 10, WINDOW, LIMITS));
         assert_eq!(rect_of(&layout, 1).w, width - 10);
-        // Con un solo panel no hay nada que mover
+        // With a single pane there is nothing to move
         assert!(!Layout::new(id(1)).resize(id(1), Dir::Right, 10, WINDOW, LIMITS));
     }
 
     #[test]
     fn nested_minimums_are_respected_when_moving_a_divider() {
-        // 1 | (2 | 3): el divisor de 1 no puede pasar de dejar sitio mínimo a 2 y 3
+        // 1 | (2 | 3): the divider of 1 cannot go past leaving minimum room for 2 and 3
         let mut layout = Layout::new(id(1));
         layout.split(id(1), Axis::Horizontal, id(2), WINDOW, LIMITS);
         layout.split(id(2), Axis::Horizontal, id(3), WINDOW, LIMITS);
@@ -1267,7 +1267,7 @@ mod tests {
         assert!(layout.toggle_zoom());
         assert_eq!(layout.rects(WINDOW).len(), 2);
 
-        // Mover el foco, dividir o cerrar lo quitan
+        // Moving focus, splitting or closing clears it
         layout.toggle_zoom();
         assert!(layout.focus_dir(Dir::Left, WINDOW));
         assert_eq!(layout.zoomed(), None);
@@ -1279,7 +1279,7 @@ mod tests {
         layout.close(id(3));
         assert_eq!(layout.zoomed(), None);
 
-        // Con un solo panel no hay nada que ampliar
+        // With a single pane there is nothing to zoom
         assert!(!Layout::new(id(1)).toggle_zoom());
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
         layout.add_float(id(3), 0.5, 0.5);
         assert_eq!(layout.visible_ids(), vec![id(1), id(2), id(3)]);
         layout.toggle_zoom();
-        // Con el zoom puesto, un flotante no es un panel del mosaico: no se puede ampliar
+        // With zoom on, a floating pane is not a tiled pane: it cannot be zoomed
         assert_eq!(layout.zoomed(), None);
         layout.set_focus(id(2));
         layout.toggle_zoom();
@@ -1303,7 +1303,7 @@ mod tests {
         let mut layout = Layout::new(id(1));
         layout.add_float(id(2), 0.5, 0.5);
         let first = layout.float_rect(id(2), WINDOW).unwrap();
-        // La mitad de 801x601, redondeada
+        // Half of 801x601, rounded
         assert_eq!((first.w, first.h), (401, 301));
         assert_eq!((first.x, first.y), (200, 150));
         layout.add_float(id(3), 0.5, 0.5);
@@ -1327,7 +1327,7 @@ mod tests {
         assert_eq!((rect.x, rect.y), (0, 0));
         assert!(
             !layout.move_float(id(2), -5, -5, WINDOW),
-            "ya está en la esquina"
+            "already in the corner"
         );
         let doubled = Rect::new(0, 0, 1602, 1202);
         let big = layout.float_rect(id(2), doubled).unwrap();
@@ -1353,7 +1353,7 @@ mod tests {
         assert!(layout.resize_float_edge(id(2), top_left, -20, -10, WINDOW, LIMITS));
         let now = layout.float_rect(id(2), WINDOW).unwrap();
         assert_eq!((now.x, now.y), (start.x - 20, start.y - 10));
-        // No baja del mínimo ni se sale de la ventana
+        // It does not go below the minimum or leave the window
         layout.resize_float_edge(id(2), right, -10_000, 0, WINDOW, LIMITS);
         assert_eq!(layout.float_rect(id(2), WINDOW).unwrap().w, LIMITS.min_w);
         layout.resize_float_edge(id(2), right, 10_000, 0, WINDOW, LIMITS);
@@ -1388,7 +1388,7 @@ mod tests {
         assert!(layout.toggle_floats());
         assert!(layout.floats_visible());
         assert_eq!(layout.focus(), id(3));
-        // Sin flotantes no hay nada que alternar
+        // Without floating panes there is nothing to toggle
         assert!(!two_columns().toggle_floats());
     }
 
@@ -1419,7 +1419,7 @@ mod tests {
         assert_eq!(layout.split_target(), id(1));
         assert!(
             !layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS),
-            "un flotante no se divide"
+            "a floating pane cannot be split"
         );
     }
 
@@ -1480,7 +1480,7 @@ mod tests {
             f64::from(float.y + float.h / 2),
         );
         assert_eq!(layout.hit_test(cx, cy, WINDOW, PARAMS), Hit::Pane(id(3)));
-        // El anillo mueve, la banda del borde redimensiona
+        // The ring moves, the edge band resizes
         assert_eq!(
             layout.hit_test(f64::from(float.x) + 8.0, cy, WINDOW, PARAMS),
             Hit::FloatMove(id(3))
@@ -1511,13 +1511,13 @@ mod tests {
                 }
             )
         );
-        // Un divisor tapado por el flotante no se agarra a través de él
+        // A divider covered by the floating pane cannot be grabbed through it
         let hidden_divider = layout.hit_test(divider_x, cy, WINDOW, PARAMS);
         assert!(matches!(
             hidden_divider,
             Hit::Pane(_) | Hit::FloatMove(_) | Hit::FloatResize(..)
         ));
-        // Y ocultos los flotantes, se vuelve a ver lo de debajo
+        // And with the floating panes hidden, what is underneath shows again
         layout.toggle_floats();
         assert_eq!(
             layout.hit_test(divider_x, cy, WINDOW, PARAMS),

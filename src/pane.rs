@@ -1,5 +1,5 @@
-//! Un panel: un terminal de libghostty con su PTY, los hilos que lo atienden y el estado de la
-//! selección con el ratón. La app tiene uno o varios, colocados por `layout`.
+//! A pane: a libghostty terminal with its PTY, the threads that serve it, and the mouse
+//! selection state. The app has one or more, arranged by `layout`.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -23,14 +23,14 @@ use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
 use crate::{LuaEvent, UserEvent};
 
-/// Bloques del shell que se procesan por despertar. Con mucha salida (`cat` de un archivo grande)
-/// así los eventos de la ventana (redibujar, cerrar) se intercalan en vez de esperar al final.
+/// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
+/// events (redraw, close) interleave instead of waiting until the end.
 pub const MAX_CHUNKS_PER_WAKE: usize = 256;
-/// Bloques que caben en el canal del PTY antes de frenar al hilo lector (contrapresión a ConPTY)
+/// Chunks that fit in the PTY channel before the reader thread blocks (backpressure to ConPTY)
 const PTY_CHANNEL_CAPACITY: usize = 64;
 
-// Respuesta a la consulta de atributos (CSI c). ConPTY la lanza al arrancar, junto con la de la
-// posición del cursor, y espera hasta 3 s a que el terminal conteste antes de mostrar nada.
+// Reply to the device attributes query (CSI c). ConPTY sends it at startup, along with the cursor
+// position query, and waits up to 3 s for the terminal to answer before showing anything.
 const DEVICE_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
     primary: PrimaryDeviceAttributes::new(
         ConformanceLevel::LEVEL_2,
@@ -44,7 +44,7 @@ const DEVICE_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
     tertiary: TertiaryDeviceAttributes { unit_id: 0 },
 };
 
-// Colores de fábrica de libghostty (medidos: texto blanco sobre fondo negro)
+// libghostty factory colors (measured: white text on a black background)
 const DEFAULT_FOREGROUND: RgbColor = RgbColor {
     r: 255,
     g: 255,
@@ -52,12 +52,12 @@ const DEFAULT_FOREGROUND: RgbColor = RgbColor {
 };
 const DEFAULT_BACKGROUND: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
 
-/// Colores y cursor por defecto de la configuración.
+/// Default colors and cursor from the configuration.
 ///
-/// El texto y el fondo se fijan SIEMPRE los dos y con valores explícitos, por dos peculiaridades
-/// de libghostty-vt que se comprobaron: (1) solo se aplican si están los dos a la vez, y (2) pasar
-/// `None` no se refleja en un `RenderState` ya creado (se queda con los colores anteriores).
-/// Así, quitar una línea de config.lua al recargar devuelve los colores de fábrica.
+/// Foreground and background are ALWAYS set together and with explicit values, because of two
+/// verified quirks of libghostty-vt: (1) they only apply when both are set at once, and (2) passing
+/// `None` is not reflected in an existing `RenderState` (it keeps the previous colors).
+/// This way, removing a line from config.lua on reload restores the factory colors.
 pub fn apply_theme(terminal: &mut Terminal<'static, 'static>, config: &Config) {
     let colors = &config.colors;
     let _ =
@@ -84,12 +84,12 @@ pub fn apply_theme(terminal: &mut Terminal<'static, 'static>, config: &Config) {
     let _ = terminal.set_default_cursor_blink(Some(config.cursor.blink));
 }
 
-/// Script que, ejecutado dentro de un PowerShell interactivo (ya cargado su perfil), hace que
-/// informe su directorio actual por OSC 7 en cada prompt. Envuelve la función `prompt` que haya
-/// (la de starship, la de fábrica...): la llama PRIMERO, porque lo primero que ejecuta un prompt
-/// como el de starship es leer `$?`, y cualquier otra instrucción antes lo borraría; su texto se
-/// devuelve intacto. Va en una sola línea y sin comillas dobles ni barras al final, para que
-/// sobreviva al paso por la línea de comandos de Windows.
+/// Script that, run inside an interactive PowerShell (with its profile already loaded), makes it
+/// report its current directory via OSC 7 on every prompt. It wraps whatever `prompt` function
+/// exists (starship's, the default one...): it calls it FIRST, because the first thing a prompt
+/// like starship's does is read `$?`, and any earlier statement would clobber it; its text is
+/// returned unchanged. It is a single line with no double quotes or trailing backslashes, so it
+/// survives being passed through the Windows command line.
 const PWSH_OSC7: &str = "$global:__terminal_prompt = $function:prompt; \
 function global:prompt { \
 $text = & $global:__terminal_prompt; \
@@ -106,7 +106,7 @@ fn is_powershell(program: &str) -> bool {
         .is_some_and(|stem| matches!(stem.to_ascii_lowercase().as_str(), "pwsh" | "powershell"))
 }
 
-/// ¿Los argumentos de PowerShell ya piden ejecutar un comando o un archivo?
+/// Do the PowerShell arguments already ask to run a command or a file?
 fn runs_a_command(args: &[String]) -> bool {
     args.iter().any(|arg| {
         let name = arg.trim_start_matches(['-', '/']).to_ascii_lowercase();
@@ -124,8 +124,8 @@ fn runs_a_command(args: &[String]) -> bool {
     })
 }
 
-/// El shell con la integración de directorio (ver `ShellConfig::integration`) si procede: es
-/// PowerShell, está activada y los argumentos no traen ya un comando
+/// The shell with directory integration (see `ShellConfig::integration`) when applicable: it is
+/// PowerShell, integration is enabled, and the arguments do not already include a command
 fn with_integration(mut shell: ShellConfig) -> ShellConfig {
     let powershell = shell.program.as_deref().is_some_and(is_powershell);
     if shell.integration && powershell && !runs_a_command(&shell.args) {
@@ -139,8 +139,8 @@ fn with_integration(mut shell: ShellConfig) -> ShellConfig {
 }
 
 fn build_command(shell: &ShellConfig) -> CommandBuilder {
-    // `args` entra en pánico con el shell por defecto; la validación de config.rs ya garantiza
-    // que solo hay argumentos si hay programa.
+    // `args` panics with the default shell; config.rs validation already guarantees
+    // there are only arguments when there is a program.
     let mut command = match &shell.program {
         Some(program) => {
             let mut command = CommandBuilder::new(program);
@@ -158,9 +158,9 @@ fn build_command(shell: &ShellConfig) -> CommandBuilder {
     command
 }
 
-/// `portable-pty` devuelve el fallo de `CreateProcessW` como un texto plano ("CreateProcessW `...`
-/// in cwd `...` failed: <causa>") con caracteres NUL escapados. Para mostrarlo se queda con la
-/// causa; si el formato cambiara, devuelve el mensaje completo.
+/// `portable-pty` returns the `CreateProcessW` failure as plain text ("CreateProcessW `...`
+/// in cwd `...` failed: <cause>") with escaped NUL characters. For display this keeps only the
+/// cause; if the format ever changes, it returns the full message.
 fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
     let text = error.to_string();
     match text.rsplit_once(" failed: ") {
@@ -169,11 +169,11 @@ fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
     }
 }
 
-/// Escribe un aviso en rojo en la propia cuadrícula, antes de que arranque el shell. Con doble
-/// clic no hay consola donde mirar stderr, y así el error se ve donde está el usuario.
+/// Writes a red notice into the grid itself, before the shell starts. When launched by
+/// double-click there is no console to read stderr, so the error shows up where the user is.
 pub fn write_notice(terminal: &mut Terminal<'static, 'static>, tag: &str, message: &str) {
-    // El terminal necesita retorno de carro con cada salto de línea; cualquier otro carácter de
-    // control (que podría venir de un mensaje de error) se descarta
+    // The terminal needs a carriage return with each line feed; any other control character
+    // (which could come from an error message) is dropped
     let clean: String = message
         .chars()
         .filter(|c| *c == '\n' || !c.is_control())
@@ -189,8 +189,8 @@ fn vt_error(error: libghostty_vt::Error) -> String {
     format!("libghostty: {error}")
 }
 
-/// El directorio que informó un shell: el URI de OSC 7 o, como hacen ConEmu y Windows Terminal con
-/// OSC 9;9 (muy usado en el prompt de cmd), una ruta absoluta tal cual, a veces entre comillas
+/// The directory a shell reported: the OSC 7 URI or, as ConEmu and Windows Terminal do with
+/// OSC 9;9 (common in cmd prompts), an absolute path as is, sometimes quoted
 fn reported_path(value: &str) -> Option<String> {
     if value.starts_with("file://") {
         return osc7_path(value);
@@ -201,11 +201,11 @@ fn reported_path(value: &str) -> Option<String> {
         .then(|| path.to_string())
 }
 
-/// La ruta de un URI de directorio de OSC 7 ("file://host/C:/ruta%20con%20espacios", con o sin
-/// host), decodificada. En Windows quita la barra que precede a la unidad ("/C:/ruta").
+/// The path of an OSC 7 directory URI ("file://host/C:/path%20with%20spaces", with or without
+/// host), decoded. On Windows it strips the slash before the drive letter ("/C:/path").
 fn osc7_path(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
-    // Lo que va entre "file://" y la primera barra es el host
+    // Whatever sits between "file://" and the first slash is the host
     let path = &rest[rest.find('/')?..];
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -231,55 +231,56 @@ fn osc7_path(uri: &str) -> Option<String> {
     })
 }
 
-/// Directorio que el shell de un terminal informó con OSC 7, si existe
+/// Directory the terminal's shell reported via OSC 7, if it exists
 fn terminal_dir(terminal: &Terminal<'static, 'static>) -> Option<PathBuf> {
     let path = PathBuf::from(reported_path(terminal.pwd().ok()?)?);
     path.is_dir().then_some(path)
 }
 
-/// Qué lanzar y dónde para un panel nuevo
+/// What to launch, and where, for a new pane
 pub struct Spawn<'a> {
     pub id: PaneId,
     pub cols: u16,
     pub rows: u16,
-    /// Programa y argumentos en lugar del shell de la configuración (un flotante lanzado con
-    /// `program`). Si no arranca no se cae al shell por defecto: el panel no se crea.
+    /// Program and arguments instead of the configured shell (a floating pane launched with
+    /// `program`). If it fails to start, it does not fall back to the default shell: no pane opens.
     pub program: Option<(String, Vec<String>)>,
-    /// Directorio de trabajo; si falta, el de `shell.cwd`
+    /// Working directory; if missing, `shell.cwd`
     pub cwd: Option<PathBuf>,
-    /// Aviso en rojo (etiqueta y mensaje) que se escribe antes de que arranque el shell
+    /// Red notice (label and message) written before the shell starts
     pub notice: Option<(&'a str, &'a str)>,
 }
 
 pub struct Pane {
     pub id: PaneId,
     pub terminal: Terminal<'static, 'static>,
-    /// Estado de libghostty que solo se usa para dibujar este panel
+    /// libghostty state used only to draw this pane
     pub render_state: RenderState<'static>,
-    /// Rectángulo que ocupa en la ventana (pixeles físicos), con su margen
+    /// Rectangle it occupies in the window (physical pixels), including its padding
     pub rect: Rect,
-    /// Columnas y filas con las que se notificó por última vez al PTY y a libghostty
+    /// Columns and rows last reported to the PTY and to libghostty
     pub grid: (u16, u16),
     master: Box<dyn MasterPty + Send>,
     pty_writer: Box<dyn Write + Send>,
     rx: Receiver<Vec<u8>>,
-    /// Respuestas del terminal a las consultas del shell (posición del cursor, atributos...)
+    /// Terminal replies to the shell's queries (cursor position, attributes...)
     replies: Receiver<Vec<u8>>,
-    /// El hilo lector solo manda un aviso a la vez; se rearma antes de leer el canal
+    /// The reader thread sends one notification at a time; it is re-armed before reading the
+    /// channel
     wake_pending: Arc<AtomicBool>,
-    /// Para terminar el shell (el `Child` vive en el hilo que lo espera)
+    /// To terminate the shell (the `Child` lives in the thread that waits on it)
     killer: Box<dyn ChildKiller + Send + Sync>,
-    /// Estado del gesto de selección (clic, doble clic, arrastre) en este terminal
+    /// State of the selection gesture (click, double-click, drag) in this terminal
     pub gesture: Gesture<'static>,
-    /// Hay un arrastre de selección en curso
+    /// A selection drag is in progress
     pub selecting: bool,
-    /// Botón cuya pulsación se envió al programa (el movimiento y la suelta también van a él)
+    /// Button whose press was sent to the program (motion and release go to it as well)
     pub reported: Option<mouse::Button>,
 }
 
 impl Pane {
-    /// Crea el terminal, abre el PTY, lanza el shell y arranca los hilos que lo atienden. Los
-    /// hilos despiertan el bucle de eventos con `UserEvent::PtyOutput(id)` / `ShellExited(id)`.
+    /// Creates the terminal, opens the PTY, launches the shell, and starts the threads serving it.
+    /// The threads wake the event loop with `UserEvent::PtyOutput(id)` / `ShellExited(id)`.
     pub fn spawn(
         config: &Config,
         spawn: Spawn,
@@ -298,9 +299,9 @@ impl Pane {
             write_notice(&mut terminal, tag, message);
         }
 
-        // Por defecto libghostty ignora las consultas del shell. Sus respuestas se encolan aquí y el
-        // bucle de eventos las escribe en el PTY. Los eventos de título y campana se encolan igual
-        // para despacharlos a Lua cuando `vt_write` ya terminó (no se llama a Lua dentro de los
+        // By default libghostty ignores the shell's queries. Their replies are queued here and the
+        // event loop writes them to the PTY. Title and bell events are queued the same way to
+        // dispatch them to Lua once `vt_write` has finished (Lua is never called inside the
         // callbacks).
         let (reply_tx, replies) = channel::<Vec<u8>>();
         terminal
@@ -324,7 +325,7 @@ impl Pane {
             })
             .map_err(vt_error)?;
 
-        // El PTY (pseudo-terminal) del sistema operativo
+        // The operating system's PTY (pseudo-terminal)
         let pty_pair = NativePtySystem::default()
             .openpty(PtySize {
                 rows: spawn.rows,
@@ -332,10 +333,10 @@ impl Pane {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|error| format!("no se pudo abrir el PTY: {error}"))?;
+            .map_err(|error| format!("could not open the PTY: {error}"))?;
 
-        // El shell (o el programa pedido) dentro del PTY. Si el programa de la configuración no se
-        // puede iniciar, se avisa y se usa el shell por defecto.
+        // The shell (or the requested program) inside the PTY. If the configured program cannot
+        // be started, a notice is shown and the default shell is used.
         let explicit = spawn.program.is_some();
         let mut shell = config.shell.clone();
         if let Some((program, args)) = spawn.program {
@@ -350,22 +351,22 @@ impl Pane {
             Ok(child) => child,
             Err(error) => {
                 let Some(program) = &shell.program else {
-                    return Err(format!("no se pudo iniciar el shell por defecto: {error}"));
+                    return Err(format!("could not start the default shell: {error}"));
                 };
                 if explicit {
                     return Err(format!(
-                        "no se pudo iniciar {program:?}: {}",
+                        "could not start {program:?}: {}",
                         spawn_failure_cause(&error)
                     ));
                 }
-                eprintln!("[shell] no se pudo iniciar {program:?}: {error}");
-                // En pantalla solo la causa ("no se encuentra el archivo"); el detalle de
-                // CreateProcessW queda en stderr
+                eprintln!("[shell] could not start {program:?}: {error}");
+                // On screen only the cause ("file not found"); the CreateProcessW details
+                // go to stderr
                 write_notice(
                     &mut terminal,
                     "shell",
                     &format!(
-                        "no se pudo iniciar {program:?}: {}; se usa el shell por defecto",
+                        "could not start {program:?}: {}; using the default shell",
                         spawn_failure_cause(&error)
                     ),
                 );
@@ -377,21 +378,22 @@ impl Pane {
                 pty_pair
                     .slave
                     .spawn_command(build_command(&default_shell))
-                    .map_err(|error| format!("no se pudo iniciar el shell por defecto: {error}"))?
+                    .map_err(|error| format!("could not start the default shell: {error}"))?
             }
         };
 
         let mut pty_reader = pty_pair
             .master
             .try_clone_reader()
-            .map_err(|error| format!("no se pudo leer del PTY: {error}"))?;
+            .map_err(|error| format!("could not read from the PTY: {error}"))?;
         let pty_writer = pty_pair
             .master
             .take_writer()
-            .map_err(|error| format!("no se pudo escribir en el PTY: {error}"))?;
+            .map_err(|error| format!("could not write to the PTY: {error}"))?;
 
-        // Hilo lector: lee del PTY y manda los bytes al canal. El canal es acotado: si la UI se
-        // atrasa, `send` bloquea y ConPTY recibe contrapresión en vez de acumularse memoria sin límite.
+        // Reader thread: reads from the PTY and sends the bytes to the channel. The channel is
+        // bounded: if the UI falls behind, `send` blocks and ConPTY gets backpressure instead of
+        // memory growing without limit.
         let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_CAPACITY);
         let wake_pending = Arc::new(AtomicBool::new(false));
         thread::spawn({
@@ -403,9 +405,10 @@ impl Pane {
                     match pty_reader.read(&mut buf) {
                         Ok(n) if n > 0 => {
                             if tx.send(buf[..n].to_vec()).is_err() {
-                                break; // el panel se cerró
+                                break; // the pane was closed
                             }
-                            // Un solo aviso pendiente a la vez: el manejador drena todo el canal
+                            // One pending notification at a time: the handler drains the
+                            // whole channel
                             if !wake_pending.swap(true, Ordering::AcqRel) {
                                 let _ = proxy.send_event(UserEvent::PtyOutput(id));
                             }
@@ -416,7 +419,7 @@ impl Pane {
             }
         });
 
-        // Hilo que espera al shell. No se usa el fin de lectura del PTY: en Windows no es fiable.
+        // Thread that waits on the shell. PTY end-of-read is not used: it is unreliable on Windows.
         let killer = child.clone_killer();
         thread::spawn(move || {
             let mut child = child;
@@ -442,41 +445,41 @@ impl Pane {
         })
     }
 
-    /// Escribe en la entrada del shell
+    /// Writes to the shell's input
     pub fn write(&mut self, bytes: &[u8]) {
         let _ = self.pty_writer.write_all(bytes);
         let _ = self.pty_writer.flush();
     }
 
-    /// Pasa a libghostty lo que el shell escribió (hasta `max_chunks` bloques) y contesta sus
-    /// consultas. Devuelve cuántos bloques procesó.
+    /// Feeds libghostty what the shell wrote (up to `max_chunks` chunks) and answers its
+    /// queries. Returns how many chunks were processed.
     pub fn drain(&mut self, max_chunks: usize) -> usize {
-        // Se rearma ANTES de leer: un bloque que llegue durante el drenado dispara otro aviso
+        // Re-armed BEFORE reading: a chunk arriving during the drain triggers another notification
         self.wake_pending.store(false, Ordering::Release);
 
         let mut chunks = 0;
         while chunks < max_chunks
             && let Ok(bytes) = self.rx.try_recv()
         {
-            // Escribir los bytes crudos en libghostty para que procese los escapes ANSI
+            // Write the raw bytes into libghostty so it processes the ANSI escapes
             self.terminal.vt_write(&bytes);
             chunks += 1;
         }
 
-        // Contestar las consultas que el shell hizo en esos bytes
+        // Answer the queries the shell made in those bytes
         while let Ok(reply) = self.replies.try_recv() {
             self.write(&reply);
         }
         chunks
     }
 
-    /// Pide otro despertar para seguir drenando lo que quedó en el canal
+    /// Requests another wakeup to keep draining what is left in the channel
     pub fn request_more(&self, proxy: &EventLoopProxy<UserEvent>) {
         self.wake_pending.store(true, Ordering::Release);
         let _ = proxy.send_event(UserEvent::PtyOutput(self.id));
     }
 
-    /// Avisa al PTY y a libghostty (que hace reflow del buffer) del nuevo tamaño
+    /// Notifies the PTY and libghostty (which reflows the buffer) of the new size
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u32, cell_height: u32) {
         self.grid = (cols, rows);
         let _ = self.master.resize(PtySize {
@@ -488,7 +491,7 @@ impl Pane {
         let _ = self.terminal.resize(cols, rows, cell_width, cell_height);
     }
 
-    /// Título que puso el programa, si hay alguno
+    /// Title set by the program, if any
     pub fn title(&self) -> Option<String> {
         match self.terminal.title() {
             Ok(title) if !title.is_empty() => Some(title.to_string()),
@@ -496,9 +499,9 @@ impl Pane {
         }
     }
 
-    /// Directorio actual del panel: el que informó el shell con OSC 7 (también llega por ssh) o,
-    /// si no informó nada, el del proceso en primer plano según el sistema (macOS y Linux), así
-    /// que funciona con cualquier shell sin integración
+    /// The pane's current directory: the one the shell reported via OSC 7 (also works over ssh) or,
+    /// if it reported nothing, the foreground process's directory according to the OS (macOS and
+    /// Linux), so it works with any shell without integration
     pub fn current_dir(&self) -> Option<PathBuf> {
         terminal_dir(&self.terminal).or_else(|| self.foreground_dir())
     }
@@ -521,7 +524,7 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        // Libera los pins que el gesto tiene en el terminal y termina el shell si seguía vivo
+        // Releases the gesture's pins in the terminal and kills the shell if it is still alive
         self.gesture.reset(&self.terminal);
         let _ = self.killer.kill();
     }
@@ -534,8 +537,8 @@ mod tests {
 
     type Rgb = (u8, u8, u8);
 
-    /// Lo que ve el renderer. El `RenderState` es persistente, como en la app: así se comprueba
-    /// que los cambios (y sobre todo las supresiones) de tema se reflejan en uno ya creado.
+    /// What the renderer sees. The `RenderState` is persistent, as in the app: this checks that
+    /// theme changes (and especially removals) are reflected in an existing one.
     fn seen(
         state: &mut RenderState<'static>,
         terminal: &Terminal<'static, 'static>,
@@ -572,16 +575,19 @@ mod tests {
         apply_theme(&mut terminal, &Config::default());
         let factory = seen(&mut state, &terminal);
 
-        // Solo fondo: libghostty lo ignoraría si el texto no se fijara también
+        // Background only: libghostty would ignore it unless the foreground were set too
         apply_theme(
             &mut terminal,
             &config_from(r##"return { colors = { background = "#1e1e2e" } }"##),
         );
         let themed = seen(&mut state, &terminal);
         assert_eq!(themed.1, (0x1e, 0x1e, 0x2e));
-        assert_eq!(themed.0, factory.0, "el texto conserva el color de fábrica");
+        assert_eq!(
+            themed.0, factory.0,
+            "the foreground keeps the factory color"
+        );
 
-        // Paleta y cursor propios
+        // Custom palette and cursor
         apply_theme(
             &mut terminal,
             &config_from(
@@ -595,7 +601,7 @@ mod tests {
             Some(libghostty_vt::render::CursorVisualStyle::Bar)
         );
 
-        // Quitar todo (recargar una config vacía) devuelve el aspecto de fábrica
+        // Removing everything (reloading an empty config) restores the factory look
         apply_theme(&mut terminal, &Config::default());
         assert_eq!(seen(&mut state, &terminal), factory);
     }
@@ -635,15 +641,15 @@ mod tests {
 
     #[test]
     fn the_integration_is_left_out_when_it_does_not_apply() {
-        // No es PowerShell, o no hay programa (shell por defecto)
+        // Not PowerShell, or no program (default shell)
         for program in [Some("cmd.exe"), Some("lazygit"), Some("nu"), None] {
             let original = shell(program, &["/k"], true);
             assert_eq!(with_integration(original.clone()), original, "{program:?}");
         }
-        // Desactivada
+        // Disabled
         let off = shell(Some("pwsh"), &["-NoLogo"], false);
         assert_eq!(with_integration(off.clone()), off);
-        // Ya trae un comando o un archivo: no se le pisa
+        // Already includes a command or a file: leave it alone
         for args in [
             &["-Command", "todos"][..],
             &["-c", "todos"],
@@ -655,7 +661,7 @@ mod tests {
             let original = shell(Some("pwsh"), args, true);
             assert_eq!(with_integration(original.clone()), original, "{args:?}");
         }
-        // `-ExecutionPolicy` empieza por -e pero no es un comando
+        // `-ExecutionPolicy` starts with -e but is not a command
         assert!(
             with_integration(shell(Some("pwsh"), &["-ExecutionPolicy", "Bypass"], true))
                 .args
@@ -666,13 +672,13 @@ mod tests {
 
     #[test]
     fn the_powershell_script_survives_the_windows_command_line() {
-        assert!(!PWSH_OSC7.contains('\n'), "una sola línea");
-        assert!(!PWSH_OSC7.contains('"'), "sin comillas dobles");
+        assert!(!PWSH_OSC7.contains('\n'), "a single line");
+        assert!(!PWSH_OSC7.contains('"'), "no double quotes");
         assert!(
             !PWSH_OSC7.ends_with('\\'),
-            "una barra al final se comería la comilla que cierra el argumento"
+            "a trailing backslash would swallow the quote that closes the argument"
         );
-        // La función `prompt` original se llama antes que nada: starship lee `$?` en su primera línea
+        // The original `prompt` function is called first: starship reads `$?` on its first line
         let call = PWSH_OSC7
             .find("$text = & $global:__terminal_prompt")
             .unwrap();
@@ -680,7 +686,7 @@ mod tests {
         assert!(call > first_statement_in_prompt);
         assert!(
             !PWSH_OSC7[first_statement_in_prompt..call].contains(';'),
-            "nada entre la entrada y la llamada"
+            "nothing between the entry and the call"
         );
         assert!(PWSH_OSC7.contains("]7;file://localhost/"));
     }
@@ -692,36 +698,36 @@ mod tests {
             Some("/usr/local/bin")
         );
         assert_eq!(
-            osc7_path("file://mi-pc/home/yo").as_deref(),
-            Some("/home/yo")
+            osc7_path("file://my-pc/home/me").as_deref(),
+            Some("/home/me")
         );
         assert_eq!(
-            osc7_path("file:///home/mi%20carpeta/%C3%B1").as_deref(),
-            Some("/home/mi carpeta/ñ")
+            osc7_path("file:///home/my%20folder/%C3%B1").as_deref(),
+            Some("/home/my folder/ñ")
         );
         assert_eq!(osc7_path("http://example.com/x"), None);
-        assert_eq!(osc7_path("file://sin-ruta"), None);
-        assert_eq!(osc7_path("file:///mal%2"), None);
-        assert_eq!(osc7_path("file:///mal%zz"), None);
-        assert_eq!(osc7_path("file:///%ff"), None, "no es UTF-8");
+        assert_eq!(osc7_path("file://no-path"), None);
+        assert_eq!(osc7_path("file:///bad%2"), None);
+        assert_eq!(osc7_path("file:///bad%zz"), None);
+        assert_eq!(osc7_path("file:///%ff"), None, "not UTF-8");
     }
 
     #[test]
     fn a_plain_absolute_path_is_accepted_as_osc_9_9_does() {
         let absolute = if cfg!(windows) {
-            r"C:\Users\yo"
+            r"C:\Users\me"
         } else {
-            "/home/yo"
+            "/home/me"
         };
         assert_eq!(reported_path(absolute).as_deref(), Some(absolute));
         assert_eq!(
             reported_path(&format!("\"{absolute}\"")).as_deref(),
             Some(absolute)
         );
-        assert_eq!(reported_path("relativa/ruta"), None);
+        assert_eq!(reported_path("relative/path"), None);
         assert_eq!(reported_path(""), None);
-        // Un URI inválido no se interpreta como ruta
-        assert_eq!(reported_path("file://sin-ruta"), None);
+        // An invalid URI is not interpreted as a path
+        assert_eq!(reported_path("file://no-path"), None);
     }
 
     #[test]
@@ -741,12 +747,12 @@ mod tests {
     #[test]
     fn osc7_windows_drive_paths_lose_the_leading_slash() {
         assert_eq!(
-            osc7_path("file:///C:/Users/yo").as_deref(),
-            Some("C:/Users/yo")
+            osc7_path("file:///C:/Users/me").as_deref(),
+            Some("C:/Users/me")
         );
         assert_eq!(
-            osc7_path("file://PC/C:/Users/yo%20x").as_deref(),
-            Some("C:/Users/yo x")
+            osc7_path("file://PC/C:/Users/me%20x").as_deref(),
+            Some("C:/Users/me x")
         );
     }
 
@@ -758,8 +764,8 @@ mod tests {
             max_scrollback: 0,
         })
         .unwrap();
-        assert_eq!(terminal_dir(&terminal), None, "sin OSC 7 no hay directorio");
-        // El directorio de pruebas de cargo existe en cualquier plataforma
+        assert_eq!(terminal_dir(&terminal), None, "no directory without OSC 7");
+        // cargo's test directory exists on every platform
         let here = std::env::current_dir().unwrap();
         let uri = if cfg!(windows) {
             format!("file:///{}", here.display().to_string().replace('\\', "/"))
@@ -768,8 +774,8 @@ mod tests {
         };
         terminal.vt_write(format!("\x1b]7;{uri}\x07").as_bytes());
         assert_eq!(terminal_dir(&terminal).as_deref(), Some(here.as_path()));
-        // Un directorio que no existe no se usa
-        terminal.vt_write(b"\x1b]7;file:///no/existe/de/verdad\x07");
+        // A directory that does not exist is not used
+        terminal.vt_write(b"\x1b]7;file:///does/not/really/exist\x07");
         assert_eq!(terminal_dir(&terminal), None);
     }
 
@@ -805,7 +811,7 @@ mod tests {
         assert_eq!(entry(&mut state, &terminal, 16), (0xff, 0xa0, 0x66));
         assert_eq!(entry(&mut state, &terminal, 17), (0xff, 0x5d, 0x62));
 
-        // Al quitar la paleta propia vuelven los de fábrica
+        // Removing the custom palette restores the factory colors
         apply_theme(&mut terminal, &Config::default());
         assert_eq!(
             (

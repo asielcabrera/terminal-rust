@@ -1,11 +1,11 @@
-//! Ratón: selección con gestos (clic, doble clic por palabra, triple por línea, arrastre y
-//! autodesplazamiento), copia, reporte a los programas que lo piden, rueda y los bordes de una
-//! ventana sin decoraciones. Con varios paneles, cada gesto va al panel que hay bajo el puntero
-//! (o al que lo capturó al pulsar, mientras dure el arrastre).
+//! Mouse: selection gestures (click, double-click for words, triple-click for lines, drag and
+//! autoscroll), copying, reporting to programs that request it, the wheel, and the edges of an
+//! undecorated window. With several panes, each gesture goes to the pane under the pointer
+//! (or to the one that captured it on press, for the duration of the drag).
 //!
-//! La lógica de ventana vive en `impl App`; las cuentas que no necesitan una ventana (qué borde
-//! está bajo el puntero, a qué celda corresponde un punto, cuántas líneas es un giro de rueda) son
-//! funciones puras para poder probarlas.
+//! Window logic lives in `impl App`; the math that needs no window (which edge is under the
+//! pointer, which cell a point maps to, how many lines a wheel turn is) lives in pure
+//! functions so it can be tested.
 
 use std::time::{Duration, Instant};
 
@@ -26,30 +26,30 @@ use crate::actions;
 use crate::config::{Decorations, RightClick};
 use crate::layout::{Axis, Edge, Hit, HitParams, PaneId, Path};
 
-/// Cada cuánto se desplaza una línea mientras se arrastra una selección fuera de la ventana
+/// How often one line scrolls while a selection is dragged outside the window
 pub const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
-/// Tiempo máximo entre clics para que cuenten como doble o triple clic
+/// Maximum time between clicks for them to count as a double or triple click
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-/// Grosor, en pixeles lógicos, de la zona de los bordes que redimensiona una ventana sin barra
+/// Width, in logical pixels, of the edge band that resizes a window without a title bar
 const RESIZE_BORDER: f64 = 6.0;
-/// A cuántos pixeles lógicos de un divisor entre paneles se agarra
+/// How many logical pixels from a divider between panes it can be grabbed
 const DIVIDER_ZONE: f64 = 4.0;
 
-/// Qué tiene capturado el ratón mientras hay un botón pulsado
+/// What has captured the mouse while a button is held
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Capture {
-    /// Una selección o un reporte al programa de ese panel
+    /// A selection or a report to that pane's program
     Pane(PaneId),
-    /// El arrastre de un divisor entre paneles
+    /// Dragging a divider between panes
     Divider(Path, Axis),
-    /// Mover un flotante agarrándolo por el anillo de su margen
+    /// Moving a floating pane by grabbing the ring of its padding
     FloatMove(PaneId),
-    /// Redimensionar un flotante por un borde o una esquina
+    /// Resizing a floating pane by an edge or a corner
     FloatResize(PaneId, Edge),
 }
 
-/// Estado del ratón que persiste entre eventos. El estado de la selección (el gesto, si hay un
-/// arrastre en curso, qué botón se reportó) es de cada panel.
+/// Mouse state that persists between events. Selection state (the gesture, whether a drag is
+/// in progress, which button was reported) belongs to each pane.
 pub struct MouseState {
     press: PressEvent<'static>,
     drag: DragEvent<'static>,
@@ -57,19 +57,19 @@ pub struct MouseState {
     autoscroll_tick: AutoscrollTickEvent<'static>,
     encoder: mouse::Encoder<'static>,
     event: mouse::Event<'static>,
-    /// Última posición del puntero, en pixeles físicos de la ventana
+    /// Last pointer position, in physical window pixels
     pointer: (f64, f64),
-    /// Lo que tiene el ratón mientras hay un botón pulsado
+    /// What holds the mouse while a button is pressed
     capture: Option<Capture>,
-    /// Dónde estaba el puntero en el último paso de un arrastre de divisor o de flotante
+    /// Where the pointer was at the last step of a divider or floating-pane drag
     drag_from: (f64, f64),
-    /// Fracción de línea que sobró del último giro de rueda (ratones de precisión y touchpads)
+    /// Fraction of a line left over from the last wheel turn (precision mice and touchpads)
     wheel_remainder: f64,
-    /// Origen del tiempo de los clics
+    /// Time origin for clicks
     clock: Instant,
-    /// Unidades por segundo que libghostty espera en `set_time` (ver `gesture_time`)
+    /// Units per second that libghostty expects in `set_time` (see `gesture_time`)
     ticks_per_second: u64,
-    /// Cuándo toca el siguiente paso del autodesplazamiento, si hay uno en curso
+    /// When the next autoscroll step is due, if one is in progress
     pub autoscroll_deadline: Option<Instant>,
     icon: CursorIcon,
 }
@@ -94,7 +94,7 @@ impl MouseState {
         })
     }
 
-    /// Un panel se cerró: si tenía el ratón, lo suelta
+    /// A pane was closed: if it held the mouse, release it
     pub fn forget_pane(&mut self, id: PaneId) {
         if self.capture == Some(Capture::Pane(id)) {
             self.capture = None;
@@ -110,7 +110,7 @@ fn divider_icon(axis: Axis) -> CursorIcon {
     }
 }
 
-/// Flecha de redimensionado para un borde o una esquina de un flotante
+/// Resize arrow for an edge or a corner of a floating pane
 fn edge_icon(edge: Edge) -> CursorIcon {
     match (edge.left, edge.right, edge.top, edge.bottom) {
         (true, _, true, _) | (_, true, _, true) => CursorIcon::NwseResize,
@@ -129,11 +129,11 @@ fn capture_icon(capture: &Capture) -> Option<CursorIcon> {
     }
 }
 
-/// Unidades por segundo del tiempo que se le da a `PressEvent::set_time`. La API dice nanosegundos,
-/// pero en Windows libghostty guarda ese número tal cual en un `std.time.Instant` de Zig, que ahí
-/// cuenta ticks de QueryPerformanceCounter (10 MHz = 100 ns por tick) y al compararlo con el
-/// intervalo los multiplica por 100: sin corregirlo, un doble clic solo cuenta si los dos clics
-/// están a menos de 5 ms en lugar de 500 ms.
+/// Units per second of the time passed to `PressEvent::set_time`. The API says nanoseconds,
+/// but on Windows libghostty stores that number as-is in a Zig `std.time.Instant`, which there
+/// counts QueryPerformanceCounter ticks (10 MHz = 100 ns per tick) and multiplies them by 100
+/// when comparing against the interval: uncorrected, a double click only registers if the two
+/// clicks are less than 5 ms apart instead of 500 ms.
 fn gesture_ticks_per_second() -> u64 {
     #[cfg(windows)]
     {
@@ -141,7 +141,7 @@ fn gesture_ticks_per_second() -> u64 {
             fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
         }
         let mut frequency = 0i64;
-        // SAFETY: recibe un puntero a un entero válido y no guarda nada de él
+        // SAFETY: takes a pointer to a valid integer and keeps nothing from it
         let ok = unsafe { QueryPerformanceFrequency(&mut frequency) };
         if ok != 0 && frequency > 0 {
             return frequency as u64;
@@ -150,14 +150,14 @@ fn gesture_ticks_per_second() -> u64 {
     1_000_000_000
 }
 
-/// Convierte el tiempo transcurrido en lo que `set_time` espera, dado `ticks_per_second`
+/// Converts elapsed time into what `set_time` expects, given `ticks_per_second`
 pub fn gesture_time(elapsed: Duration, ticks_per_second: u64) -> Duration {
     let ticks = elapsed.as_nanos() * u128::from(ticks_per_second) / 1_000_000_000;
     Duration::from_nanos(ticks as u64)
 }
 
-/// Qué borde o esquina de una ventana de `width` x `height` está bajo `(x, y)`, con un borde
-/// sensible de `border` pixeles. Las esquinas mandan sobre los lados.
+/// Which edge or corner of a `width` x `height` window is under `(x, y)`, with a sensitive
+/// border of `border` pixels. Corners take precedence over sides.
 pub fn resize_direction(
     x: f64,
     y: f64,
@@ -191,8 +191,8 @@ fn resize_icon(direction: ResizeDirection) -> CursorIcon {
     }
 }
 
-/// Celda (columna, fila) bajo el punto `(x, y)` de la ventana. Fuera de la cuadrícula (en el margen
-/// o más allá) se queda en la celda más cercana, como hacen los terminales al arrastrar.
+/// Cell (column, row) under the window point `(x, y)`. Outside the grid (in the padding or
+/// beyond) it clamps to the nearest cell, as terminals do while dragging.
 pub fn cell_at(
     x: f64,
     y: f64,
@@ -215,9 +215,9 @@ fn viewport_point(column: u16, row: u16) -> Point {
     })
 }
 
-/// Líneas que corresponden a un giro de rueda. Positivo = hacia arriba (ver el historial). Un
-/// `LineDelta` (rueda con muescas) vale `scroll_lines` líneas por muesca; un `PixelDelta` (touchpad)
-/// vale lo que mida en celdas. Lo que no llega a una línea entera se acumula en `remainder`.
+/// Lines corresponding to a wheel turn. Positive = up (into the history). A `LineDelta`
+/// (notched wheel) is worth `scroll_lines` lines per notch; a `PixelDelta` (touchpad) is worth
+/// its size in cells. Anything short of a whole line accumulates in `remainder`.
 pub fn wheel_lines(
     delta: MouseScrollDelta,
     scroll_lines: u16,
@@ -242,8 +242,8 @@ impl App {
     fn hit_params(&self) -> Option<HitParams> {
         let scale = self.window.as_ref()?.scale_factor();
         let padding = f64::from(self.renderer.as_ref()?.padding());
-        // La banda de los bordes de un flotante no puede comerse todo su margen: lo que queda
-        // es el anillo con el que se mueve
+        // The edge band of a floating pane cannot eat all of its padding: what remains is the
+        // ring used to move it
         let band = (RESIZE_BORDER * scale).min((padding * 0.6).max(3.0));
         Some(HitParams {
             divider_zone: DIVIDER_ZONE * scale,
@@ -252,7 +252,7 @@ impl App {
         })
     }
 
-    /// Flotante bajo el puntero, esté sobre su contenido, su margen o su borde
+    /// Floating pane under the pointer, whether over its content, its padding or its edge
     fn float_under_pointer(&self) -> Option<PaneId> {
         match self.hit_at_pointer()? {
             Hit::Pane(id) | Hit::FloatMove(id) | Hit::FloatResize(id, _)
@@ -264,7 +264,7 @@ impl App {
         }
     }
 
-    /// Qué hay bajo el puntero: el contenido de un panel, un divisor, el borde de un flotante...
+    /// What is under the pointer: a pane's content, a divider, a floating pane's edge...
     fn hit_at_pointer(&self) -> Option<Hit> {
         let area = self.window_area()?;
         let params = self.hit_params()?;
@@ -272,7 +272,7 @@ impl App {
         Some(self.layout.hit_test(x, y, area, params))
     }
 
-    /// Panel cuyo contenido está bajo el puntero
+    /// Pane whose content is under the pointer
     fn pane_at_pointer(&self) -> Option<usize> {
         match self.hit_at_pointer()? {
             Hit::Pane(id) => self.index_of(id),
@@ -280,8 +280,8 @@ impl App {
         }
     }
 
-    /// Panel que recibe el ratón: el que lo capturó al pulsar un botón o, si no, el de debajo. Con
-    /// un divisor capturado no lo recibe ninguno.
+    /// Pane that receives the mouse: the one that captured it on button press or, otherwise,
+    /// the one underneath. With a divider captured, none receives it.
     fn target_pane(&self) -> Option<usize> {
         match &self.mouse.capture {
             Some(Capture::Pane(id)) => self.index_of(*id),
@@ -290,7 +290,7 @@ impl App {
         }
     }
 
-    /// Panel que capturó el ratón al pulsar un botón
+    /// Pane that captured the mouse on button press
     fn captured_pane(&self) -> Option<usize> {
         match &self.mouse.capture {
             Some(Capture::Pane(id)) => self.index_of(*id),
@@ -298,15 +298,15 @@ impl App {
         }
     }
 
-    /// Empieza el arrastre de un divisor o de un flotante
+    /// Starts dragging a divider or a floating pane
     fn start_drag(&mut self, capture: Capture) {
         self.mouse.drag_from = self.mouse.pointer;
         self.mouse.capture = Some(capture);
         self.update_pointer_icon();
     }
 
-    /// Mueve (`edge` = `None`) o redimensiona un flotante lo que se movió el puntero desde el
-    /// último paso
+    /// Moves (`edge` = `None`) or resizes a floating pane by however much the pointer moved since
+    /// the last step
     fn drag_float(&mut self, id: PaneId, edge: Option<Edge>) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -329,7 +329,7 @@ impl App {
         }
     }
 
-    /// Lleva el divisor capturado hasta donde está el puntero
+    /// Moves the captured divider to where the pointer is
     fn drag_divider(&mut self, path: &[bool], axis: Axis) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -347,7 +347,7 @@ impl App {
         }
     }
 
-    /// Posición del puntero respecto a la esquina del panel
+    /// Pointer position relative to the pane's corner
     fn local_pointer(&self, idx: usize) -> (f64, f64) {
         let rect = self.panes[idx].rect;
         (
@@ -356,8 +356,8 @@ impl App {
         )
     }
 
-    /// ¿El programa de ese panel pidió recibir el ratón? Con Shift mantenido el ratón es siempre de
-    /// la terminal (selección), como en cualquier emulador.
+    /// Did that pane's program ask to receive the mouse? With Shift held the mouse always
+    /// belongs to the terminal (selection), as in any emulator.
     fn app_wants_mouse_at(&self, idx: usize) -> bool {
         self.panes[idx]
             .terminal
@@ -370,7 +370,7 @@ impl App {
         self.mod_bits == self.config.mouse.rectangle_modifiers.0
     }
 
-    /// Borde de la ventana bajo el puntero, solo si no tiene decoraciones y no está maximizada
+    /// Window edge under the pointer, only if the window is undecorated and not maximized
     fn edge_under_pointer(&self) -> Option<ResizeDirection> {
         let window = self.window.as_ref()?;
         if !self.undecorated() || window.is_maximized() || window.fullscreen().is_some() {
@@ -387,7 +387,7 @@ impl App {
         )
     }
 
-    /// Celda (columna, fila) del panel bajo el puntero
+    /// Cell (column, row) of the pane under the pointer
     fn cell_in_pane(&self, idx: usize) -> Option<(u16, u16)> {
         let renderer = self.renderer.as_ref()?;
         let pane = self.panes.get(idx)?;
@@ -421,9 +421,9 @@ impl App {
         })
     }
 
-    /// Cursor del sistema según lo que haya bajo el puntero: flechas de redimensionado en los
-    /// bordes de una ventana sin barra, flecha normal si el programa se queda con el ratón, y el
-    /// cursor de texto en el resto
+    /// System cursor based on what is under the pointer: resize arrows on the edges of a window
+    /// without a title bar, the normal arrow if the program owns the mouse, and the text cursor
+    /// everywhere else
     fn update_pointer_icon(&mut self) {
         let icon = if let Some(direction) = self.edge_under_pointer() {
             resize_icon(direction)
@@ -489,7 +489,7 @@ impl App {
 
         match (button, pressed) {
             (MouseButton::Left, true) => {
-                // Ventana sin barra: los bordes redimensionan y el gesto configurado la mueve
+                // Window without a title bar: edges resize it, the configured gesture moves it
                 if let Some(window) = self.window.as_ref().filter(|_| self.undecorated())
                     && let Some(direction) = self.edge_under_pointer()
                 {
@@ -497,7 +497,7 @@ impl App {
                     return;
                 }
                 if self.mod_bits == self.config.window.drag_modifiers.0 {
-                    // El mismo gesto mueve un flotante si hay uno bajo el puntero, desde donde sea
+                    // The same gesture moves a floating pane under the pointer, from anywhere
                     if let Some(id) = self.float_under_pointer() {
                         self.focus_pane(id);
                         self.start_drag(Capture::FloatMove(id));
@@ -508,7 +508,7 @@ impl App {
                         return;
                     }
                 }
-                // Un divisor entre paneles o el margen y los bordes de un flotante se agarran
+                // A divider between panes, or a floating pane's padding and edges, can be grabbed
                 match self.hit_at_pointer() {
                     Some(Hit::Divider(path, axis)) => {
                         self.start_drag(Capture::Divider(path, axis));
@@ -599,7 +599,7 @@ impl App {
         }
     }
 
-    /// Cuando el panel ya no tiene un botón pulsado, deja de tener el ratón capturado
+    /// Once the pane no longer has a button pressed, it stops holding the mouse capture
     fn release_capture(&mut self, idx: usize) {
         let pane = &self.panes[idx];
         if !pane.selecting && pane.reported.is_none() {
@@ -629,7 +629,7 @@ impl App {
         let up = lines > 0;
 
         if self.app_wants_mouse_at(idx) {
-            // La rueda es el "botón" 4 (arriba) o 5 (abajo); una muesca es un evento
+            // The wheel is "button" 4 (up) or 5 (down); one notch is one event
             let button = if up {
                 mouse::Button::Four
             } else {
@@ -646,7 +646,7 @@ impl App {
                 .mode(Mode::ALT_SCROLL)
                 .unwrap_or(false)
         {
-            // Pantalla alternativa sin ratón (less, man...): la rueda mueve el cursor con flechas
+            // Alternate screen without mouse (less, man...): the wheel sends arrow keys
             let key = if up { Key::ArrowUp } else { Key::ArrowDown };
             self.send_key_repeatedly(idx, key, lines.unsigned_abs());
         } else {
@@ -654,7 +654,7 @@ impl App {
         }
     }
 
-    /// Manda al programa de un panel un evento de ratón codificado según el protocolo que haya pedido
+    /// Sends a pane's program a mouse event encoded in the protocol it requested
     fn send_mouse(&mut self, idx: usize, action: mouse::Action, button: Option<mouse::Button>) {
         let Some(size) = self.encoder_size(idx) else {
             return;
@@ -726,8 +726,8 @@ impl App {
         })
     }
 
-    /// Pulsación izquierda: empieza una selección (o la amplía a palabra o línea con doble o
-    /// triple clic)
+    /// Left press: starts a selection (or extends it to a word or line on double or
+    /// triple click)
     fn begin_selection(&mut self, idx: usize) {
         let Some((column, row)) = self.cell_in_pane(idx) else {
             return;
@@ -756,13 +756,13 @@ impl App {
             Ok(selection) => {
                 let _ = pane.terminal.set_selection(selection.as_ref());
             }
-            Err(error) => eprintln!("[mouse] no se pudo iniciar la selección: {error}"),
+            Err(error) => eprintln!("[mouse] could not start the selection: {error}"),
         }
         pane.selecting = true;
         self.redraw();
     }
 
-    /// El puntero se mueve con el botón izquierdo pulsado: la selección sigue al puntero
+    /// The pointer moves with the left button held: the selection follows the pointer
     fn drag_selection(&mut self, idx: usize) {
         let Some((column, row)) = self.cell_in_pane(idx) else {
             return;
@@ -788,7 +788,7 @@ impl App {
             let _ = pane.terminal.set_selection(Some(&selection));
         }
 
-        // Si el puntero salió por arriba o por abajo, el historial sigue desplazándose
+        // If the pointer left through the top or bottom, the history keeps scrolling
         let direction = pane
             .gesture
             .autoscroll(&pane.terminal)
@@ -804,7 +804,7 @@ impl App {
         self.redraw();
     }
 
-    /// Un paso del autodesplazamiento, cuando vence su plazo
+    /// One autoscroll step, when its deadline is reached
     pub fn tick_autoscroll(&mut self, now: Instant) {
         let Some(deadline) = self.mouse.autoscroll_deadline else {
             return;
@@ -858,7 +858,7 @@ impl App {
         self.redraw();
     }
 
-    /// Soltar el botón izquierdo termina la selección (y la copia si `copy_on_select`)
+    /// Releasing the left button ends the selection (and copies it if `copy_on_select`)
     fn finish_selection(&mut self, idx: usize) {
         let grid_ref_cell = self.cell_in_pane(idx);
         let pane = &mut self.panes[idx];
@@ -875,8 +875,8 @@ impl App {
         }
     }
 
-    /// Copia al portapapeles la selección de un panel, sin saltos de línea de ajuste ni espacios
-    /// finales
+    /// Copies a pane's selection to the clipboard, without soft-wrap line breaks or trailing
+    /// spaces
     fn copy_selection_at(&mut self, idx: usize) {
         let options = FormatOptions::new().with_unwrap(true).with_trim(true);
         let text = match self.panes[idx]
@@ -892,11 +892,11 @@ impl App {
         if let Err(error) =
             arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
         {
-            eprintln!("[copy] no se pudo escribir en el portapapeles: {error}");
+            eprintln!("[copy] could not write to the clipboard: {error}");
         }
     }
 
-    /// Copia la selección del panel con foco
+    /// Copies the focused pane's selection
     pub fn copy_selection(&mut self) {
         let idx = self.focused_index();
         self.copy_selection_at(idx);
@@ -911,7 +911,7 @@ impl App {
         }
     }
 
-    /// Quita la selección del panel con foco
+    /// Clears the focused pane's selection
     pub fn clear_selection(&mut self) {
         let idx = self.focused_index();
         self.clear_selection_at(idx);
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn points_map_to_cells_and_clamp_to_the_grid() {
-        // padding 6, celdas de 9x19, rejilla de 80x24
+        // padding 6, 9x19 cells, 80x24 grid
         let at = |x, y| cell_at(x, y, 6.0, 9, 19, 80, 24);
         assert_eq!(at(6.0, 6.0), (0, 0));
         assert_eq!(at(14.9, 24.9), (0, 0));
@@ -1066,7 +1066,7 @@ mod tests {
             at(6.0 + 79.0 * 9.0 + 4.0, 6.0 + 23.0 * 19.0 + 4.0),
             (79, 23)
         );
-        // En el margen o fuera de la ventana se queda en la celda más cercana
+        // In the padding or outside the window it clamps to the nearest cell
         assert_eq!(at(0.0, 0.0), (0, 0));
         assert_eq!(at(-50.0, -50.0), (0, 0));
         assert_eq!(at(5000.0, 5000.0), (79, 23));
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn gesture_time_counts_ticks_for_a_10_mhz_clock() {
-        // 1,5 s a 10 MHz son 15 millones de ticks, que `set_time` recibe como "nanosegundos"
+        // 1.5 s at 10 MHz is 15 million ticks, which `set_time` receives as "nanoseconds"
         assert_eq!(
             gesture_time(Duration::from_millis(1500), 10_000_000),
             Duration::from_nanos(15_000_000)
@@ -1090,8 +1090,8 @@ mod tests {
 
     #[test]
     fn a_double_click_is_inside_the_interval_on_the_real_clock() {
-        // Con el factor de la plataforma, 100 ms entre clics siguen dentro de 500 ms: libghostty
-        // convierte la diferencia de ticks a nanosegundos con la misma frecuencia
+        // With the platform factor, 100 ms between clicks stays within 500 ms: libghostty
+        // converts the tick difference to nanoseconds with the same frequency
         let ticks = gesture_ticks_per_second();
         let a = gesture_time(Duration::from_secs(3), ticks).as_nanos();
         let b = gesture_time(Duration::from_millis(3100), ticks).as_nanos();
@@ -1124,7 +1124,7 @@ mod tests {
     fn touchpads_accumulate_fractions_of_a_line() {
         let mut rest = 0.0;
         let pixels = |y: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
-        // Celdas de 20 px: 8 px son 0,4 línea, y no se pierden entre eventos
+        // 20 px cells: 8 px is 0.4 of a line, and it is not lost between events
         assert_eq!(wheel_lines(pixels(8.0), 3, 20, &mut rest), 0);
         assert_eq!(wheel_lines(pixels(8.0), 3, 20, &mut rest), 0);
         assert_eq!(wheel_lines(pixels(8.0), 3, 20, &mut rest), 1);
@@ -1211,11 +1211,11 @@ mod tests {
 
     #[test]
     fn sgr_mouse_mode_encodes_presses_releases_and_wheel() {
-        // 1000 = reportar pulsaciones, 1006 = formato SGR
+        // 1000 = report presses, 1006 = SGR format
         let terminal = terminal_with(b"\x1b[?1000h\x1b[?1006h");
         assert!(terminal.is_mouse_tracking().unwrap());
 
-        // Celda (columna 2, fila 1) -> coordenadas de 1 en 1: 3;2
+        // Cell (column 2, row 1) -> 1-based coordinates: 3;2
         let press = encoded(
             &terminal,
             mouse::Action::Press,
@@ -1232,7 +1232,7 @@ mod tests {
             25.0,
         );
         assert_eq!(String::from_utf8_lossy(&release), "\x1b[<0;3;2m");
-        // La rueda hacia arriba es el botón 4 (código 64) y hacia abajo el 5 (65)
+        // Wheel up is button 4 (code 64) and wheel down is 5 (65)
         let up = encoded(
             &terminal,
             mouse::Action::Press,

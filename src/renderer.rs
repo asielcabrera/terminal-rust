@@ -1,5 +1,5 @@
-//! Dibujo de la cuadrícula del terminal con wgpu: un quad instanciado por cada rectángulo
-//! (fondos, subrayados, cursor) y por cada glifo, todo en un único render pass.
+//! Draws the terminal grid with wgpu: one instanced quad per rectangle (backgrounds, underlines,
+//! cursor) and per glyph, all in a single render pass.
 
 use std::mem::size_of;
 use std::ops::Range;
@@ -43,9 +43,9 @@ struct GlyphInstance {
     color: [u8; 4],
 }
 
-/// Las instancias de un panel dentro del frame: sus rangos en los tres vectores y el área a la
-/// que se recortan. Cada panel se dibuja entero (fondos, glifos y decoraciones) antes del
-/// siguiente, así lo que está encima tapa por completo a lo que hay debajo.
+/// A pane's instances within the frame: their ranges in the three vectors and the area they are
+/// clipped to. Each pane is drawn in full (backgrounds, glyphs, and decorations) before the next
+/// one, so whatever is on top completely covers what is underneath.
 #[derive(Clone)]
 struct Batch {
     scissor: Rect,
@@ -54,7 +54,7 @@ struct Batch {
     overlays: Range<u32>,
 }
 
-/// Instancias de un frame. Los vectores se reutilizan entre frames para no reservar memoria cada vez.
+/// A frame's instances. The vectors are reused across frames to avoid allocating every time.
 #[derive(Default)]
 struct Frame {
     backgrounds: Vec<RectInstance>,
@@ -72,7 +72,7 @@ impl Frame {
         self.batches.clear();
     }
 
-    /// Cuántas instancias hay de cada tipo hasta ahora
+    /// How many instances of each kind there are so far
     fn lengths(&self) -> (u32, u32, u32) {
         (
             self.backgrounds.len() as u32,
@@ -82,25 +82,25 @@ impl Frame {
     }
 }
 
-/// Un panel a dibujar: su terminal, el estado de libghostty que usa el dibujo, y dónde va
+/// A pane to draw: its terminal, the libghostty state used for drawing, and where it goes
 pub struct PaneView<'a> {
     pub terminal: &'a Terminal<'static, 'static>,
     pub render_state: &'a mut RenderState<'static>,
-    /// Rectángulo en pixeles físicos, con el margen incluido
+    /// Rectangle in physical pixels, padding included
     pub rect: Rect,
-    /// El cursor se dibuja activo (y parpadea si el programa lo pide); si no, hueco y fijo
+    /// The cursor is drawn active (and blinks if the program asks); otherwise hollow and steady
     pub focused: bool,
-    /// El texto se apaga (`panes.inactive_dim`): un panel sin foco cuando hay varios a la vista
+    /// The text is dimmed (`panes.inactive_dim`): an unfocused pane when several are visible
     pub dim: bool,
-    /// Se dibuja el marco del panel con foco a su alrededor
+    /// The focused-pane border is drawn around it
     pub frame: bool,
-    /// El prefijo está pulsado: el marco toma el color del prefijo
+    /// The prefix is pressed: the border takes the prefix color
     pub leader: bool,
-    /// Panel flotante: tapa con un fondo opaco lo que tiene debajo y siempre lleva borde
+    /// Floating pane: covers what is underneath with an opaque background and always has a border
     pub floating: bool,
 }
 
-/// Colores del texto seleccionado (`None` = invertir los de la pantalla)
+/// Colors for selected text (`None` = invert the screen colors)
 #[derive(Clone, Copy, Default)]
 struct SelectionColors {
     foreground: Option<RgbColor>,
@@ -116,16 +116,16 @@ impl From<&Config> for SelectionColors {
     }
 }
 
-/// Cómo se distinguen los paneles entre sí (`None` = derivarlo de los colores del tema)
+/// How panes are told apart (`None` = derive it from the theme colors)
 #[derive(Clone, Copy, Default)]
 struct PaneStyle {
-    /// Color de los divisores
+    /// Divider color
     border: Option<RgbColor>,
-    /// Color del marco del panel con foco
+    /// Border color of the focused pane
     focus: Option<RgbColor>,
-    /// Color del marco mientras el prefijo está pulsado
+    /// Border color while the prefix is pressed
     leader: Option<RgbColor>,
-    /// Cuánto se apaga el texto de los paneles sin foco (0 a 1)
+    /// How much the text of unfocused panes is dimmed (0 to 1)
     inactive_dim: f32,
 }
 
@@ -148,7 +148,7 @@ struct Cursor {
     color: RgbColor,
 }
 
-/// Buffer de vértices que crece (potencias de dos) cuando el frame necesita más espacio
+/// Vertex buffer that grows (in powers of two) when the frame needs more space
 struct GrowBuffer {
     buffer: wgpu::Buffer,
     size: u64,
@@ -174,7 +174,7 @@ impl GrowBuffer {
         })
     }
 
-    /// Escribe los fragmentos uno a continuación del otro
+    /// Writes the chunks one after another
     fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, parts: &[&[u8]]) {
         let total: u64 = parts.iter().map(|part| part.len() as u64).sum();
         if total > self.size {
@@ -204,13 +204,14 @@ pub struct Renderer {
     glyph_bind_group: wgpu::BindGroup,
     glyph_buffer: GrowBuffer,
     cache: GlyphCache,
-    /// Margen en pixeles lógicos (de la configuración) y en pixeles físicos con la escala actual
+    /// Padding in logical pixels (from the configuration) and in physical pixels at the current
+    /// scale
     padding_logical: f64,
     padding: u32,
     selection: SelectionColors,
     panes: PaneStyle,
     frame: Frame,
-    // Iteradores de libghostty que solo se usan para dibujar (se reapuntan en cada panel)
+    // libghostty iterators used only for drawing (re-pointed for each pane)
     row_iter: RowIterator<'static>,
     cell_iter: CellIterator<'static>,
 }
@@ -235,8 +236,8 @@ impl Renderer {
         let size = window.inner_size();
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .ok_or("la superficie no es compatible con el adaptador")?;
-        // Los colores del terminal ya están en sRGB: se escriben tal cual, sin conversión
+            .ok_or("the surface is not compatible with the adapter")?;
+        // Terminal colors are already sRGB: they are written as-is, without conversion
         let capabilities = surface.get_capabilities(&adapter);
         if let Some(format) = capabilities.formats.iter().copied().find(|f| !f.is_srgb()) {
             config.format = format;
@@ -290,9 +291,9 @@ impl Renderer {
             },
         );
 
-        // Los layouts se deducen del shader: el de rectángulos solo ve `globals`
+        // Layouts are inferred from the shader: the rectangle one only sees `globals`
         let rect_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rectángulos"),
+            label: Some("rectangles"),
             layout: &rect_pipeline.get_bind_group_layout(0),
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -301,7 +302,7 @@ impl Renderer {
         });
         let atlas = cache.atlas_view();
         let glyph_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("glifos"),
+            label: Some("glyphs"),
             layout: &glyph_pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
@@ -316,8 +317,8 @@ impl Renderer {
         });
 
         Ok(Self {
-            rect_buffer: GrowBuffer::new(&device, "rectángulos"),
-            glyph_buffer: GrowBuffer::new(&device, "glifos"),
+            rect_buffer: GrowBuffer::new(&device, "rectangles"),
+            glyph_buffer: GrowBuffer::new(&device, "glyphs"),
             padding_logical: settings.padding,
             padding: padding_for(settings.padding, scale_factor),
             selection: SelectionColors::from(settings),
@@ -340,17 +341,17 @@ impl Renderer {
         })
     }
 
-    /// Tamaño de una celda en pixeles físicos
+    /// Size of a cell in physical pixels
     pub fn cell_size(&self) -> (u32, u32) {
         (self.cache.cell_width, self.cache.cell_height)
     }
 
-    /// Margen alrededor de la cuadrícula en pixeles físicos
+    /// Padding around the grid in physical pixels
     pub fn padding(&self) -> u32 {
         self.padding
     }
 
-    /// Columnas y filas que caben en una ventana de ese tamaño (en pixeles físicos)
+    /// Columns and rows that fit in a window of that size (in physical pixels)
     pub fn grid_size(&self, width: u32, height: u32) -> (u16, u16) {
         let cols = width.saturating_sub(2 * self.padding) / self.cache.cell_width;
         let rows = height.saturating_sub(2 * self.padding) / self.cache.cell_height;
@@ -361,7 +362,7 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        // wgpu no admite superficies de 0×0 (la ventana minimizada reporta ese tamaño)
+        // wgpu does not support 0×0 surfaces (a minimized window reports that size)
         if width == 0 || height == 0 {
             return;
         }
@@ -375,8 +376,8 @@ impl Renderer {
         );
     }
 
-    /// Aplica la fuente y el margen de una configuración nueva. Si la fuente no se puede cargar
-    /// devuelve el error sin cambiar nada.
+    /// Applies the font and padding from a new configuration. If the font cannot be loaded, it
+    /// returns the error without changing anything.
     pub fn reconfigure(&mut self, settings: &Config) -> Result<(), String> {
         self.cache.set_font(&settings.font)?;
         self.padding_logical = settings.padding;
@@ -386,7 +387,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Grosor, en pixeles, de los divisores entre paneles
+    /// Thickness, in pixels, of the dividers between panes
     pub fn divider_thickness(&self) -> u32 {
         self.cache.thickness.max(1)
     }
@@ -396,11 +397,11 @@ impl Renderer {
         self.padding = padding_for(self.padding_logical, scale_factor);
     }
 
-    /// Dibuja un frame con los paneles dados, de abajo arriba. `blink_visible` es la fase actual
-    /// del parpadeo. Devuelve si el cursor del panel con foco está parpadeando, para que la app sepa
-    /// si tiene que programar el siguiente cambio de fase.
+    /// Draws a frame with the given panes, bottom to top. `blink_visible` is the current blink
+    /// phase. Returns whether the focused pane's cursor is blinking, so the app knows whether it
+    /// needs to schedule the next phase change.
     pub fn draw(&mut self, views: &mut [PaneView], dividers: &[Rect], blink_visible: bool) -> bool {
-        /// Lo que se leyó de un panel y no cambia aunque haya que rehacer las instancias
+        /// What was read from a pane; it does not change even if the instances must be rebuilt
         struct Prepared<'s> {
             snapshot: Snapshot<'static, 's>,
             colors: Colors,
@@ -424,16 +425,16 @@ impl Renderer {
             if view.focused {
                 blinking = pane_blinking;
             }
-            // Parpadeo solo con foco: sin foco el cursor es un bloque hueco y fijo
+            // Blink only when focused: unfocused, the cursor is a hollow, steady block
             let hidden_by_blink = view.focused && pane_blinking && !blink_visible;
             let cursor = if hidden_by_blink {
                 None
             } else {
                 read_cursor(&snapshot, &colors, view.focused)
             };
-            // Marco: el del foco, y el borde de un flotante sin foco (como los divisores)
+            // Border: the focus one, and the border of an unfocused floating pane (like dividers)
             let frame = if view.frame && view.leader {
-                // Amarillo ANSI por defecto: se distingue del marco normal del foco
+                // ANSI yellow by default: stands out from the normal focus border
                 Some(self.panes.leader.unwrap_or(colors.palette[3]))
             } else if view.frame {
                 Some(
@@ -471,7 +472,7 @@ impl Renderer {
         else {
             return false;
         };
-        // Los divisores, por defecto, son el color del texto muy apagado
+        // By default, dividers use the text color heavily dimmed
         let divider_color = self
             .panes
             .border
@@ -479,10 +480,10 @@ impl Renderer {
         let window = Rect::new(0, 0, self.config.width, self.config.height);
         let frame_thickness = 2 * self.cache.thickness.max(1);
 
-        // Si el atlas se llena a mitad de frame se vacía y hay que rehacer las instancias
+        // If the atlas fills up mid-frame it is cleared and the instances must be rebuilt
         for _ in 0..2 {
             self.frame.clear();
-            // Los divisores van debajo de todo
+            // Dividers go beneath everything
             if !dividers.is_empty() {
                 let start = self.frame.lengths();
                 for rect in dividers {
@@ -504,7 +505,7 @@ impl Renderer {
             }
             for pane in &prepared {
                 let start = self.frame.lengths();
-                // Un flotante tapa por completo lo que hay debajo con el fondo del tema
+                // A floating pane fully covers what is underneath with the theme background
                 if pane.floating {
                     let r = pane.rect;
                     self.frame.backgrounds.push(RectInstance::new(
@@ -525,7 +526,7 @@ impl Renderer {
                     pane.cursor,
                     self.selection,
                     (pane.rect.x + self.padding, pane.rect.y + self.padding),
-                    // Las celdas no se funden con el fondo opaco de un flotante
+                    // Cells are not merged with a floating pane's opaque background
                     start.0 as usize + usize::from(pane.floating),
                     pane.dim,
                 );
@@ -571,7 +572,7 @@ impl Renderer {
                 }
                 return;
             }
-            // Ventana oculta, timeout o error de validación: se salta este frame
+            // Hidden window, timeout, or validation error: skip this frame
             _ => return,
         };
 
@@ -613,29 +614,29 @@ impl Renderer {
                 ..Default::default()
             });
 
-            // Un lote por panel, de abajo arriba: cada uno recortado a su rectángulo y con sus
-            // fondos, texto y decoraciones en ese orden
+            // One batch per pane, bottom to top: each clipped to its rectangle, with its
+            // backgrounds, text, and decorations in that order
             for batch in &self.frame.batches {
                 let Some(clip) = clip_to(batch.scissor, self.config.width, self.config.height)
                 else {
                     continue;
                 };
                 pass.set_scissor_rect(clip.x, clip.y, clip.w, clip.h);
-                // 1. Fondos de celda
+                // 1. Cell backgrounds
                 if !batch.backgrounds.is_empty() {
                     pass.set_pipeline(&self.rect_pipeline);
                     pass.set_bind_group(0, &self.rect_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.rect_buffer.buffer.slice(..background_bytes));
                     pass.draw(0..4, batch.backgrounds.clone());
                 }
-                // 2. Texto
+                // 2. Text
                 if !batch.glyphs.is_empty() {
                     pass.set_pipeline(&self.glyph_pipeline);
                     pass.set_bind_group(0, &self.glyph_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.glyph_buffer.buffer.slice(..));
                     pass.draw(0..4, batch.glyphs.clone());
                 }
-                // 3. Subrayados, tachados y cursor por encima del texto
+                // 3. Underlines, strikethroughs, and cursor on top of the text
                 if !batch.overlays.is_empty() {
                     pass.set_pipeline(&self.rect_pipeline);
                     pass.set_bind_group(0, &self.rect_bind_group, &[]);
@@ -659,7 +660,7 @@ fn padding_for(padding: f64, scale_factor: f64) -> u32 {
     (padding * scale_factor).round() as u32
 }
 
-/// Recorte válido dentro de una superficie de `width` x `height`; `None` si no queda nada
+/// Valid clip rectangle within a `width` x `height` surface; `None` if nothing remains
 fn clip_to(rect: Rect, width: u32, height: u32) -> Option<Rect> {
     let w = rect.w.min(width.saturating_sub(rect.x));
     let h = rect.h.min(height.saturating_sub(rect.y));
@@ -724,7 +725,7 @@ fn resolve_style_color(color: StyleColor, colors: &Colors) -> Option<RgbColor> {
     }
 }
 
-/// Caracteres que no se dibujan (unión de ancho cero, selectores de variación, etc.)
+/// Characters that are not drawn (zero-width joiner, variation selectors, etc.)
 fn is_invisible(ch: char) -> bool {
     ch <= ' '
         || ch == '\x7f'
@@ -736,7 +737,7 @@ fn read_cursor(snapshot: &Snapshot<'static, '_>, colors: &Colors, focused: bool)
         return None;
     }
     let viewport = snapshot.cursor_viewport().ok()??;
-    // Sin foco, el cursor pasa a ser un bloque hueco
+    // When unfocused, the cursor becomes a hollow block
     let style = if focused {
         snapshot.cursor_visual_style().ok()?
     } else {
@@ -749,7 +750,7 @@ fn read_cursor(snapshot: &Snapshot<'static, '_>, colors: &Colors, focused: bool)
         .or(colors.cursor)
         .unwrap_or(colors.foreground);
     Some(Cursor {
-        // Sobre la mitad derecha de un carácter ancho, el cursor se dibuja desde la izquierda
+        // Over the right half of a wide character, the cursor is drawn from the left half
         col: if viewport.at_wide_tail {
             viewport.x.saturating_sub(1)
         } else {
@@ -761,7 +762,7 @@ fn read_cursor(snapshot: &Snapshot<'static, '_>, colors: &Colors, focused: bool)
     })
 }
 
-/// Recorre la cuadrícula visible y llena `frame` con las instancias a dibujar
+/// Walks the visible grid and fills `frame` with the instances to draw
 #[allow(clippy::too_many_arguments)]
 fn build_frame(
     snapshot: &Snapshot<'static, '_>,
@@ -787,7 +788,7 @@ fn build_frame(
         let this_row = row_index;
         row_index += 1;
         let y = origin.1 + u32::from(this_row) * cell_h;
-        // Columnas seleccionadas en esta fila (inclusive); `None` si la selección no la toca
+        // Selected columns in this row (inclusive); `None` if the selection does not touch it
         let selected_columns = row
             .selection()
             .ok()
@@ -798,7 +799,7 @@ fn build_frame(
         };
 
         let mut col = 0u16;
-        // El cursor sobre un carácter ancho cubre también la celda siguiente
+        // A cursor over a wide character also covers the next cell
         let mut cursor_on_tail = false;
         while let Some(cell) = cells.next() {
             let this_col = col;
@@ -831,11 +832,11 @@ fn build_frame(
             if style.faint {
                 fg = mix(fg, bg, 0.5);
             }
-            // Panel sin foco: el texto se apaga hacia el fondo
+            // Unfocused pane: the text is dimmed toward the background
             if dim > 0.0 {
                 fg = mix(fg, bg, dim);
             }
-            // Texto seleccionado: colores propios o, por defecto, los de la pantalla invertidos
+            // Selected text: custom colors or, by default, the screen colors inverted
             if selected_columns
                 .as_ref()
                 .is_some_and(|range| range.contains(&this_col))
@@ -851,8 +852,8 @@ fn build_frame(
                 fg = colors.background;
             }
 
-            // Fondo (las celdas contiguas del mismo color se funden en un solo rectángulo, pero
-            // nunca con uno de otro panel)
+            // Background (adjacent cells of the same color are merged into a single rectangle, but
+            // never with one from another pane)
             if bg != colors.background {
                 let color = rgba(bg);
                 let can_merge = frame.backgrounds.len() > batch_start;
@@ -871,7 +872,7 @@ fn build_frame(
                 }
             }
 
-            // Texto
+            // Text
             if !style.invisible && !is_spacer && cell.graphemes_len().unwrap_or(0) > 0 {
                 frame.text.clear();
                 if cell.graphemes_utf8(&mut frame.text).is_ok() {
@@ -893,7 +894,7 @@ fn build_frame(
                 }
             }
 
-            // Decoraciones. Las celdas "spacer" no dibujan nada: la celda ancha ya cubre ambas.
+            // Decorations. "Spacer" cells draw nothing: the wide cell already covers both.
             if !is_spacer {
                 let width = cell_w * span;
                 let decoration = resolve_style_color(style.underline_color, colors).unwrap_or(fg);
@@ -915,7 +916,7 @@ fn build_frame(
                             decoration,
                         ));
                     }
-                    // Ondulado, punteado y discontinuo se aproximan con una línea simple
+                    // Wavy, dotted, and dashed are approximated with a single line
                     _ => frame.overlays.push(RectInstance::new(
                         x,
                         y + cache.underline_y,
@@ -939,7 +940,8 @@ fn build_frame(
                         .push(RectInstance::new(x, y, width, thickness, fg));
                 }
 
-                // El cursor en bloque ya se pintó como fondo; el resto son rectángulos encima
+                // The block cursor was already painted as a background; the rest are rectangles
+                // on top
                 if let Some(c) = cursor
                     && on_cursor
                 {

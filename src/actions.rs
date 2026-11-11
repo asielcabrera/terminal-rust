@@ -1,8 +1,8 @@
-//! Teclas, acciones y eventos que se definen desde config.lua, y el estado de Lua que las ejecuta.
+//! Keys, actions, and events defined in config.lua, plus the Lua state that runs them.
 //!
-//! Lua no es `Send` y vive en el hilo de la UI. Una función de Lua no puede llamar de vuelta a
-//! `App` mientras `App` está prestada, así que lo que quiere hacer (enviar texto, ejecutar una
-//! acción) se encola como [`Command`] y `App` lo ejecuta cuando la función termina.
+//! Lua is not `Send` and lives on the UI thread. A Lua function cannot call back into `App`
+//! while `App` is borrowed, so whatever it wants to do (send text, run an action) is queued as a
+//! [`Command`] and `App` executes it once the function returns.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -13,22 +13,22 @@ use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, Table, Value, VmState};
 use serde::Deserialize;
 use winit::keyboard::{Key, NamedKey};
 
-/// Bits de modificadores (independientes de winit y de libghostty)
+/// Modifier bits (independent of winit and libghostty)
 pub const CTRL: u8 = 1;
 pub const SHIFT: u8 = 2;
 pub const ALT: u8 = 4;
 pub const SUPER: u8 = 8;
-/// "Prefijo pulsado": en `mods` de una tecla, la enlaza para después de pulsar el `leader`
+/// "Leader pressed": in a key's `mods`, binds it to the key pressed after the `leader`
 pub const LEADER: u8 = 16;
 
-/// Tiempo máximo de un script: la configuración al cargar, o cada llamada a una función. Sin esto
-/// un `while true do end` congelaría la terminal entera, porque Lua corre en el hilo de la UI.
+/// Maximum run time for a script: the config on load, or each function call. Without it a
+/// `while true do end` would freeze the whole terminal, since Lua runs on the UI thread.
 pub const CONFIG_TIME_LIMIT: Duration = Duration::from_secs(2);
 const HOOK_TIME_LIMIT: Duration = Duration::from_millis(250);
-/// Cada cuántas instrucciones de Lua se mira el reloj
+/// How many Lua instructions run between clock checks
 const TIME_CHECK_EVERY: u32 = 10_000;
 
-/// Mensaje de un error de Lua sin la traza de pila, que solo añade ruido
+/// A Lua error message without the stack traceback, which only adds noise
 pub fn lua_message(error: &mlua::Error) -> String {
     let text = error.to_string();
     text.split("\nstack traceback:")
@@ -38,7 +38,7 @@ pub fn lua_message(error: &mlua::Error) -> String {
         .to_string()
 }
 
-/// Dirección de una acción de paneles (en Lua: "left", "right", "up", "down")
+/// Direction of a pane action (in Lua: "left", "right", "up", "down")
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
@@ -48,16 +48,16 @@ pub enum Direction {
     Down,
 }
 
-/// Lo que una tecla o un hook pueden hacer. Las nativas se construyen desde Lua con
-/// `terminal.action.X` (tablas con la clave `action`); `Lua` es una función propia.
+/// What a key or a hook can do. Built-in actions are built from Lua with
+/// `terminal.action.X` (tables with an `action` key); `Lua` is a user-defined function.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", deny_unknown_fields)]
 pub enum Action {
-    /// Escribe el texto en el shell, tal cual
+    /// Writes the text to the shell, as is
     SendString {
         text: String,
     },
-    /// Desplaza el historial: negativo sube, positivo baja
+    /// Scrolls the history: negative goes up, positive goes down
     ScrollLines {
         amount: isize,
     },
@@ -71,38 +71,38 @@ pub enum Action {
     ResetFontSize,
     ToggleFullscreen,
     ReloadConfig,
-    /// Pega el portapapeles (con pegado entre corchetes si el programa lo pidió)
+    /// Pastes the clipboard (with bracketed paste if the program requested it)
     Paste,
-    /// Copia al portapapeles el texto seleccionado (no hace nada si no hay selección)
+    /// Copies the selected text to the clipboard (does nothing if there is no selection)
     Copy,
     ClearSelection,
-    /// Selecciona todo el contenido, historial incluido
+    /// Selects all content, history included
     SelectAll,
-    /// Divide el panel con foco: el nuevo queda a la derecha
+    /// Splits the focused pane: the new one goes to the right
     SplitRight,
-    /// Divide el panel con foco: el nuevo queda debajo
+    /// Splits the focused pane: the new one goes below
     SplitDown,
-    /// Cierra el panel con foco y termina su shell; si es el último del mosaico, cierra la ventana
+    /// Closes the focused pane and ends its shell; if it is the last tiled pane, closes the window
     ClosePane,
-    /// Pasa el foco al panel vecino en esa dirección
+    /// Moves focus to the neighboring pane in that direction
     FocusPane {
         dir: Direction,
     },
-    /// Pasa el foco al panel siguiente o anterior (primero el mosaico y luego los flotantes)
+    /// Moves focus to the next or previous pane (tiled panes first, then floating ones)
     FocusNext,
     FocusPrevious,
-    /// Mueve el borde del panel `amount` celdas hacia `dir` (agranda hacia ese lado, o encoge si el
-    /// panel está en el límite de la ventana por ahí)
+    /// Moves the pane's edge `amount` cells toward `dir` (grows toward that side, or shrinks if the
+    /// pane sits at the window's edge on that side)
     ResizePane {
         dir: Direction,
         amount: u16,
     },
-    /// Amplía el panel con foco a toda la ventana, o vuelve al mosaico
+    /// Zooms the focused pane to fill the window, or returns to the tiled layout
     ToggleZoom,
-    /// Abre un panel flotante con su propio shell, o con `program`, y se cierra cuando este
-    /// termina (como un popup). `width` y `height` son fracciones de la ventana (por defecto,
-    /// `panes.float_width` y `panes.float_height`); `cwd` por defecto es el directorio del panel
-    /// con foco si el shell lo informa.
+    /// Opens a floating pane with its own shell, or with `program`, that closes when it exits
+    /// (like a popup). `width` and `height` are fractions of the window (by default,
+    /// `panes.float_width` and `panes.float_height`); `cwd` defaults to the focused pane's
+    /// directory if the shell reports it.
     NewFloat {
         #[serde(default)]
         program: Option<String>,
@@ -115,9 +115,9 @@ pub enum Action {
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// Oculta o muestra todos los flotantes sin cerrar sus shells; si no hay ninguno, abre uno
+    /// Hides or shows all floating panes without closing their shells; if there are none, opens one
     ToggleFloats,
-    /// Mueve el flotante con foco `amount` celdas hacia `dir`
+    /// Moves the focused floating pane `amount` cells toward `dir`
     MovePane {
         dir: Direction,
         amount: u16,
@@ -127,7 +127,7 @@ pub enum Action {
     Lua(Function),
 }
 
-/// Qué quiere hacer una función de Lua; `App` lo ejecuta después de la llamada
+/// What a Lua function wants to do; `App` executes it after the call
 pub enum Command {
     SendText(String),
     Log(String),
@@ -140,8 +140,8 @@ enum KeyId {
     Char(char),
 }
 
-/// Tecla lógica de winit (la que tiene en cuenta la distribución del teclado) en nuestra forma
-/// normalizada. Los caracteres van en minúscula: con Shift, `v` llega como `V`.
+/// A winit logical key (the one that accounts for the keyboard layout) in our normalized form.
+/// Characters are lowercase: with Shift, `v` arrives as `V`.
 fn key_id(key: &Key) -> Option<KeyId> {
     match key {
         Key::Named(named) => Some(KeyId::Named(*named)),
@@ -215,17 +215,17 @@ fn parse_key(name: &str) -> Result<KeyId, String> {
     match (chars.next(), chars.next()) {
         (Some(only), None) => Ok(KeyId::Char(only.to_lowercase().next().unwrap_or(only))),
         _ => Err(format!(
-            "tecla desconocida {name:?} (usa un carácter como \"v\" o un nombre como \"PageUp\", \"F5\", \"Enter\", \"Space\")"
+            "unknown key {name:?} (use a character like \"v\" or a name like \"PageUp\", \"F5\", \"Enter\", \"Space\")"
         )),
     }
 }
 
-/// "CTRL|SHIFT" a bits. Admite CTRL, SHIFT, ALT y SUPER (también CMD y WIN).
+/// "CTRL|SHIFT" to bits. Accepts CTRL, SHIFT, ALT, and SUPER (also CMD and WIN).
 pub fn parse_mods(text: &str) -> Result<u8, String> {
     parse_mods_with(text, false)
 }
 
-/// Como `parse_mods`, pero en las teclas de `keys` también vale `LEADER`
+/// Like `parse_mods`, but keys in `keys` may also use `LEADER`
 fn parse_binding_mods(text: &str) -> Result<u8, String> {
     parse_mods_with(text, true)
 }
@@ -245,12 +245,12 @@ fn parse_mods_with(text: &str, allow_leader: bool) -> Result<u8, String> {
             "LEADER" if allow_leader => LEADER,
             _ if allow_leader => {
                 return Err(format!(
-                    "modificador desconocido {part:?} (usa CTRL, SHIFT, ALT, SUPER o LEADER, separados por |)"
+                    "unknown modifier {part:?} (use CTRL, SHIFT, ALT, SUPER, or LEADER, separated by |)"
                 ));
             }
             _ => {
                 return Err(format!(
-                    "modificador desconocido {part:?} (usa CTRL, SHIFT, ALT o SUPER, separados por |)"
+                    "unknown modifier {part:?} (use CTRL, SHIFT, ALT, or SUPER, separated by |)"
                 ));
             }
         };
@@ -268,9 +268,9 @@ impl Bindings {
         self.map.get(&(key_id(key)?, mods))
     }
 
-    /// La tecla pulsada justo después del prefijo. Un carácter ya lleva el SHIFT en sí (`%` es
-    /// Shift+5 en un teclado US), así que si no hay un enlace exacto se prueba sin SHIFT; `w` y `W`
-    /// siguen siendo distintas porque se mira primero la combinación exacta.
+    /// The key pressed right after the leader. A character already carries SHIFT itself (`%` is
+    /// Shift+5 on a US keyboard), so without an exact binding it is retried without SHIFT; `w` and
+    /// `W` stay distinct because the exact combination is checked first.
     fn lookup_after_leader(&self, key: &Key, mods: u8) -> Option<&Action> {
         let id = key_id(key)?;
         if let Some(action) = self.map.get(&(id.clone(), LEADER | mods)) {
@@ -282,9 +282,9 @@ impl Bindings {
         None
     }
 
-    /// Las teclas que la terminal enlaza sin que nadie las configure: copiar, pegar y desplazar el
-    /// historial, y los paneles tras el prefijo (estilo tmux). Las de `keys` en config.lua las
-    /// sustituyen.
+    /// Keys the terminal binds without any configuration: copy, paste, scroll the history, and the
+    /// pane keys after the leader (tmux style). Entries in `keys` in config.lua replace
+    /// them.
     fn defaults() -> Self {
         let mut map = HashMap::new();
         let mut bind = |key: KeyId, mods: u8, action: Action| {
@@ -305,7 +305,7 @@ impl Bindings {
             Action::ScrollPages { amount: 1 },
         );
 
-        // Paneles, tras el prefijo
+        // Panes, after the leader
         bind(KeyId::Char('%'), LEADER, Action::SplitRight);
         bind(KeyId::Char('"'), LEADER, Action::SplitDown);
         bind(KeyId::Char('x'), LEADER, Action::ClosePane);
@@ -358,8 +358,8 @@ impl Bindings {
     }
 }
 
-/// La tecla de prefijo (como el Ctrl+B de tmux): tras pulsarla, la tecla siguiente se busca entre
-/// las enlazadas con `mods = "LEADER"`
+/// The leader key (like tmux's Ctrl+B): after pressing it, the next key is looked up among
+/// those bound with `mods = "LEADER"`
 pub struct Leader {
     key: KeyId,
     mods: u8,
@@ -371,8 +371,8 @@ impl Leader {
         key_id(key).is_some_and(|id| id == self.key) && mods == self.mods
     }
 
-    /// Lo que se envía al programa al pulsar el prefijo dos veces: el carácter de control de
-    /// Ctrl+letra (Ctrl+B es 0x02). Con cualquier otro prefijo, nada.
+    /// What is sent to the program when the leader is pressed twice: the control character for
+    /// Ctrl+letter (Ctrl+B is 0x02). With any other leader, nothing.
     fn passthrough(&self) -> Option<Vec<u8>> {
         match (&self.key, self.mods) {
             (KeyId::Char(letter), CTRL) if letter.is_ascii_alphabetic() => {
@@ -383,7 +383,7 @@ impl Leader {
     }
 }
 
-/// La tabla `leader` de config.lua tal como llega, antes de comprobar la tecla y los modificadores
+/// The `leader` table from config.lua as received, before checking the key and modifiers
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawLeader {
@@ -402,8 +402,8 @@ impl Default for RawLeader {
     }
 }
 
-/// Convierte `leader`: sin ponerlo (o `true`) vale Ctrl+B, `false` lo desactiva, y una tabla
-/// `{ key, mods, timeout_ms }` lo personaliza
+/// Parses `leader`: unset (or `true`) means Ctrl+B, `false` disables it, and a table
+/// `{ key, mods, timeout_ms }` customizes it
 pub fn parse_leader(value: Value) -> Result<Option<Leader>, String> {
     let raw: RawLeader = match value {
         Value::Nil | Value::Boolean(true) => RawLeader::default(),
@@ -412,7 +412,7 @@ pub fn parse_leader(value: Value) -> Result<Option<Leader>, String> {
             .map_err(|e| format!("leader: {e}"))?,
         other => {
             return Err(format!(
-                "leader debe ser una tabla {{ key = ..., mods = ... }}, true o false (recibió {})",
+                "leader must be a table {{ key = ..., mods = ... }}, true, or false (got {})",
                 other.type_name()
             ));
         }
@@ -421,7 +421,7 @@ pub fn parse_leader(value: Value) -> Result<Option<Leader>, String> {
     let mods = parse_mods(&raw.mods).map_err(|e| format!("leader.mods: {e}"))?;
     if !(200..=10_000).contains(&raw.timeout_ms) {
         return Err(format!(
-            "leader.timeout_ms debe estar entre 200 y 10000 (recibió {})",
+            "leader.timeout_ms must be between 200 and 10000 (got {})",
             raw.timeout_ms
         ));
     }
@@ -432,7 +432,7 @@ pub fn parse_leader(value: Value) -> Result<Option<Leader>, String> {
     }))
 }
 
-/// Si hay un prefijo pulsado esperando la tecla siguiente, y hasta cuándo
+/// Whether a leader press is waiting for the next key, and until when
 #[derive(Default)]
 pub struct LeaderState {
     until: Option<Instant>,
@@ -447,7 +447,7 @@ impl LeaderState {
         self.until
     }
 
-    /// Si el plazo venció, cancela el prefijo y devuelve `true`
+    /// If the timeout expired, cancels the leader and returns `true`
     pub fn expire(&mut self, now: Instant) -> bool {
         if self.until.is_some_and(|until| now >= until) {
             self.until = None;
@@ -461,24 +461,24 @@ impl LeaderState {
     }
 }
 
-/// Qué hacer con una pulsación de tecla según el estado del prefijo
+/// What to do with a key press depending on the leader state
 #[derive(Debug)]
 pub enum LeaderOutcome {
-    /// No tiene que ver con el prefijo: sigue el camino normal (enlaces, encoder, shell)
+    /// Unrelated to the leader: follows the normal path (bindings, encoder, shell)
     Normal,
-    /// Un modificador suelto o una repetición mientras el prefijo está pendiente: no hacer nada
+    /// A lone modifier or a repeat while the leader is pending: do nothing
     Ignore,
-    /// Se pulsó el prefijo: queda esperando la tecla siguiente
+    /// The leader was pressed: now waiting for the next key
     Arm,
-    /// El prefijo se cancela (Escape o una tecla sin enlace); la tecla se descarta
+    /// The leader is cancelled (Escape or an unbound key); the key is discarded
     Cancel,
-    /// El prefijo se pulsó dos veces: se envía este carácter de control al programa
+    /// The leader was pressed twice: this control character is sent to the program
     Passthrough(Vec<u8>),
-    /// La tecla tenía un enlace tras el prefijo
+    /// The key had a binding after the leader
     Run(Action),
 }
 
-/// Teclas que son solo un modificador: pulsar Shift para escribir `%` no cancela el prefijo
+/// Keys that are only a modifier: pressing Shift to type `%` does not cancel the leader
 fn is_modifier_key(key: &Key) -> bool {
     matches!(
         key,
@@ -497,10 +497,10 @@ fn is_modifier_key(key: &Key) -> bool {
     )
 }
 
-/// Convierte la tabla `keys` de config.lua. Los modificadores tienen que coincidir exactamente
-/// (también SHIFT cuando el carácter lo necesita, como `+` en un teclado US). Con `defaults`, se
-/// parte de las teclas por defecto: una tecla del usuario sustituye a la de por defecto con la
-/// misma combinación, pero dos del usuario con la misma combinación son un error.
+/// Parses the `keys` table from config.lua. Modifiers must match exactly (SHIFT too when the
+/// character needs it, like `+` on a US keyboard). With `defaults`, it starts from the default
+/// keys: a user key replaces the default one with the same combination, but two user keys with
+/// the same combination are an error.
 pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, String> {
     let table = match value {
         Value::Nil => {
@@ -513,7 +513,7 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
         Value::Table(table) => table,
         other => {
             return Err(format!(
-                "keys debe ser una lista de tablas {{ key = ..., mods = ..., action = ... }} (recibió {})",
+                "keys must be a list of tables {{ key = ..., mods = ..., action = ... }} (got {})",
                 other.type_name()
             ));
         }
@@ -530,13 +530,13 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
         let entry = entry.map_err(|e| format!("{at}: {}", lua_message(&e)))?;
         let Value::Table(entry) = entry else {
             return Err(format!(
-                "{at} debe ser una tabla {{ key = ..., mods = ..., action = ... }}"
+                "{at} must be a table {{ key = ..., mods = ..., action = ... }}"
             ));
         };
 
         let name: String = entry
             .get("key")
-            .map_err(|_| format!("{at}.key debe ser un texto, como \"v\" o \"PageUp\""))?;
+            .map_err(|_| format!("{at}.key must be a string, like \"v\" or \"PageUp\""))?;
         let key = parse_key(&name).map_err(|e| format!("{at}.key: {e}"))?;
         let mods = match entry.get::<Value>("mods").map_err(|e| lua_message(&e))? {
             Value::Nil => 0,
@@ -544,7 +544,7 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
                 .map_err(|e| format!("{at}.mods: {e}"))?,
             other => {
                 return Err(format!(
-                    "{at}.mods debe ser un texto, como \"CTRL|SHIFT\" (recibió {})",
+                    "{at}.mods must be a string, like \"CTRL|SHIFT\" (got {})",
                     other.type_name()
                 ));
             }
@@ -554,7 +554,7 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
 
         if !from_user.insert((key.clone(), mods)) {
             return Err(format!(
-                "{at}: la combinación {name:?} + {mods:?} ya estaba enlazada"
+                "{at}: the combination {name:?} + {mods:?} is already bound"
             ));
         }
         bindings.map.insert((key, mods), action);
@@ -562,7 +562,7 @@ pub fn parse_keys(lua: &Lua, value: Value, defaults: bool) -> Result<Bindings, S
     Ok(bindings)
 }
 
-/// Una acción es una función propia, `terminal.action.X` o el nombre de una acción sin parámetros
+/// An action is a user-defined function, `terminal.action.X`, or the name of a parameterless action
 pub fn parse_action(lua: &Lua, value: Value) -> Result<Action, String> {
     match value {
         Value::Function(function) => Ok(Action::Lua(function)),
@@ -574,22 +574,22 @@ pub fn parse_action(lua: &Lua, value: Value) -> Result<Action, String> {
         }
         Value::Table(_) => lua.from_value(value).map_err(|e| lua_message(&e)),
         other => Err(format!(
-            "debe ser una función, terminal.action.X o el nombre de una acción (recibió {})",
+            "must be a function, terminal.action.X, or the name of an action (got {})",
             other.type_name()
         )),
     }
 }
 
-/// Cosas que le pasan al terminal y para las que se puede definir un hook en `events`
+/// Things that happen to the terminal for which a hook can be defined in `events`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
-    /// El programa cambió el título (recibe el título)
+    /// The program changed the title (receives the title)
     TitleChanged,
-    /// Sonó la campana
+    /// The bell rang
     Bell,
-    /// El shell terminó
+    /// The shell exited
     ShellExit,
-    /// La configuración se recargó con éxito
+    /// The configuration was reloaded successfully
     ConfigReloaded,
 }
 
@@ -614,14 +614,14 @@ pub struct Events {
     handlers: HashMap<EventKind, Function>,
 }
 
-/// Convierte la tabla `events` de config.lua
+/// Parses the `events` table from config.lua
 pub fn parse_events(value: Value) -> Result<Events, String> {
     let table = match value {
         Value::Nil => return Ok(Events::default()),
         Value::Table(table) => table,
         other => {
             return Err(format!(
-                "events debe ser una tabla {{ [\"bell\"] = function(ctx) ... end }} (recibió {})",
+                "events must be a table {{ [\"bell\"] = function(ctx) ... end }} (got {})",
                 other.type_name()
             ));
         }
@@ -629,19 +629,18 @@ pub fn parse_events(value: Value) -> Result<Events, String> {
 
     let mut events = Events::default();
     for pair in table.pairs::<String, Value>() {
-        let (name, handler) = pair.map_err(|_| {
-            "las claves de events deben ser nombres de evento (por ejemplo [\"bell\"])".to_string()
-        })?;
+        let (name, handler) = pair
+            .map_err(|_| "events keys must be event names (for example [\"bell\"])".to_string())?;
         let Some(kind) = EventKind::from_name(&name) else {
             let valid: Vec<_> = EventKind::ALL.iter().map(|(name, _)| *name).collect();
             return Err(format!(
-                "evento desconocido {name:?} (válidos: {})",
+                "unknown event {name:?} (valid: {})",
                 valid.join(", ")
             ));
         };
         let Value::Function(function) = handler else {
             return Err(format!(
-                "events[{name:?}] debe ser una función (recibió {})",
+                "events[{name:?}] must be a function (got {})",
                 handler.type_name()
             ));
         };
@@ -650,8 +649,8 @@ pub fn parse_events(value: Value) -> Result<Events, String> {
     Ok(events)
 }
 
-/// El estado de Lua de una configuración: su intérprete, las teclas, los hooks y el `ctx` que
-/// reciben las funciones.
+/// The Lua state for a configuration: its interpreter, the keys, the hooks, and the `ctx` that
+/// functions receive.
 pub struct Script {
     lua: Lua,
     bindings: Bindings,
@@ -663,7 +662,7 @@ pub struct Script {
 }
 
 impl Script {
-    /// Crea el intérprete con el límite de tiempo ya activo (para la carga de la configuración)
+    /// Creates the interpreter with the time limit already active (for loading the configuration)
     pub fn new() -> mlua::Result<Self> {
         let lua = Lua::new();
         let deadline = Rc::new(Cell::new(Instant::now() + CONFIG_TIME_LIMIT));
@@ -677,7 +676,7 @@ impl Script {
                 move |_lua, _debug| {
                     if Instant::now() > deadline.get() {
                         Err(mlua::Error::runtime(
-                            "el script tardó demasiado y se abortó (¿un bucle infinito?)",
+                            "the script took too long and was aborted (an infinite loop?)",
                         ))
                     } else {
                         Ok(VmState::Continue)
@@ -715,8 +714,8 @@ impl Script {
         self.bindings.lookup(key, mods)
     }
 
-    /// Fija el prefijo. Si su combinación ya es una tecla de `keys`, es un error: no se sabría
-    /// cuál de las dos hacer.
+    /// Sets the leader. If its combination is already a key in `keys`, that is an error: it would
+    /// be ambiguous which of the two to run.
     pub fn set_leader(&mut self, leader: Option<Leader>) -> Result<(), String> {
         if let Some(leader) = &leader
             && self
@@ -724,13 +723,13 @@ impl Script {
                 .map
                 .contains_key(&(leader.key.clone(), leader.mods))
         {
-            return Err("leader: esa combinación de teclas ya está enlazada en keys".to_string());
+            return Err("leader: that key combination is already bound in keys".to_string());
         }
         self.leader = leader;
         Ok(())
     }
 
-    /// Decide qué hacer con una pulsación de tecla según el estado del prefijo (ver `LeaderOutcome`)
+    /// Decides what to do with a key press depending on the leader state (see `LeaderOutcome`)
     pub fn leader_step(
         &self,
         state: &mut LeaderState,
@@ -777,14 +776,14 @@ impl Script {
         self.events.handlers.contains_key(&kind)
     }
 
-    /// Un texto como valor de Lua, para pasarlo como argumento a un hook
+    /// A string as a Lua value, to pass as an argument to a hook
     pub fn text(&self, text: &str) -> Value {
         self.lua
             .create_string(text)
             .map_or(Value::Nil, Value::String)
     }
 
-    /// Llama al hook de un evento (si lo hay) y devuelve lo que pidió hacer
+    /// Calls an event's hook (if any) and returns what it asked to do
     pub fn fire(&self, kind: EventKind, args: Vec<Value>) -> Vec<Command> {
         match self.events.handlers.get(&kind) {
             Some(handler) => self.call(handler, args),
@@ -792,8 +791,8 @@ impl Script {
         }
     }
 
-    /// Llama a una función de Lua con `ctx` como primer argumento. Un error en la función se
-    /// registra y se descarta: nunca tumba la terminal. Devuelve lo que la función pidió hacer.
+    /// Calls a Lua function with `ctx` as the first argument. An error in the function is logged
+    /// and discarded: it never brings down the terminal. Returns what the function asked to do.
     pub fn call(&self, function: &Function, args: Vec<Value>) -> Vec<Command> {
         self.deadline.set(Instant::now() + HOOK_TIME_LIMIT);
         let arguments: mlua::MultiValue = std::iter::once(Value::Table(self.ctx.clone()))
@@ -806,7 +805,7 @@ impl Script {
     }
 }
 
-/// El objeto `ctx` de las funciones: sus métodos solo encolan órdenes (ver el comentario del módulo)
+/// The functions' `ctx` object: its methods only queue commands (see the module comment)
 fn make_ctx(lua: &Lua, commands: &Rc<RefCell<Vec<Command>>>) -> mlua::Result<Table> {
     let ctx = lua.create_table()?;
 
@@ -828,14 +827,14 @@ fn make_ctx(lua: &Lua, commands: &Rc<RefCell<Vec<Command>>>) -> mlua::Result<Tab
         })?,
     )?;
 
-    // Ejecuta una acción nativa (`ctx:perform(terminal.action.Paste)`)
+    // Runs a built-in action (`ctx:perform(terminal.action.Paste)`)
     let queue = commands.clone();
     ctx.set(
         "perform",
         lua.create_function(move |lua, (_this, action): (Value, Value)| {
             match parse_action(lua, action) {
                 Ok(Action::Lua(_)) => Err(mlua::Error::runtime(
-                    "ctx:perform solo admite acciones nativas (terminal.action.X)",
+                    "ctx:perform only accepts built-in actions (terminal.action.X)",
                 )),
                 Ok(action) => {
                     queue.borrow_mut().push(Command::Perform(action));
@@ -891,14 +890,14 @@ mod tests {
 
     #[test]
     fn winit_keys_are_normalized_for_lookup() {
-        // Con Shift, la tecla "v" llega como "V": tiene que coincidir con el mismo enlace
+        // With Shift, the "v" key arrives as "V": it must match the same binding
         assert_eq!(key_id(&Key::Character("V".into())), Some(KeyId::Char('v')));
         assert_eq!(key_id(&Key::Character("v".into())), Some(KeyId::Char('v')));
         assert_eq!(
             key_id(&Key::Named(NamedKey::F5)),
             Some(KeyId::Named(NamedKey::F5))
         );
-        // Secuencias de varios caracteres y teclas muertas no se pueden enlazar
+        // Multi-character sequences and dead keys cannot be bound
         assert_eq!(key_id(&Key::Character("ab".into())), None);
         assert_eq!(key_id(&Key::Dead(Some('´'))), None);
     }
@@ -921,14 +920,14 @@ mod tests {
             .set(Instant::now() + Duration::from_millis(100));
         let started = Instant::now();
         let result = script.lua().load("while true do end").exec();
-        assert!(result.is_err(), "un bucle infinito debería abortarse");
+        assert!(result.is_err(), "an infinite loop should be aborted");
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "tardó {:?}",
+            "took {:?}",
             started.elapsed()
         );
         let message = lua_message(&result.unwrap_err());
-        assert!(message.contains("demasiado"), "{message}");
+        assert!(message.contains("too long"), "{message}");
     }
 
     #[test]
@@ -936,17 +935,17 @@ mod tests {
         let script = Script::new().unwrap();
         let broken: Function = script
             .lua()
-            .load(r#"return function(ctx) error("fallé") end"#)
+            .load(r#"return function(ctx) error("failed") end"#)
             .eval()
             .unwrap();
         assert!(script.call(&broken, vec![]).is_empty());
         let working: Function = script
             .lua()
-            .load(r#"return function(ctx, name) ctx:send_text("hola " .. name) end"#)
+            .load(r#"return function(ctx, name) ctx:send_text("hello " .. name) end"#)
             .eval()
             .unwrap();
-        let commands = script.call(&working, vec![script.text("mundo")]);
-        assert!(matches!(commands.as_slice(), [Command::SendText(text)] if text == "hola mundo"));
+        let commands = script.call(&working, vec![script.text("world")]);
+        assert!(matches!(commands.as_slice(), [Command::SendText(text)] if text == "hello world"));
     }
 
     #[test]
@@ -961,15 +960,15 @@ mod tests {
         script.call(&looping, vec![]);
         assert!(
             started.elapsed() < Duration::from_secs(3),
-            "tardó {:?}",
+            "took {:?}",
             started.elapsed()
         );
         let fine: Function = script
             .lua()
-            .load(r#"return function(ctx) ctx:log("sigo vivo") end"#)
+            .load(r#"return function(ctx) ctx:log("still alive") end"#)
             .eval()
             .unwrap();
         let commands = script.call(&fine, vec![]);
-        assert!(matches!(commands.as_slice(), [Command::Log(text)] if text == "sigo vivo"));
+        assert!(matches!(commands.as_slice(), [Command::Log(text)] if text == "still alive"));
     }
 }

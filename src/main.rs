@@ -37,34 +37,34 @@ use winit::{
     window::{Fullscreen, Window, WindowId},
 };
 
-/// Tamaño de la cuadrícula cuando la configuración no pide otro
+/// Grid size when the configuration does not ask for another
 const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-/// Tamaño mínimo de un panel, en celdas: no se divide si las dos mitades quedarían por debajo
+/// Minimum pane size, in cells: no split happens if both halves would fall below it
 const MIN_PANE_COLUMNS: u32 = 8;
 const MIN_PANE_ROWS: u32 = 3;
 
-/// Eventos que otros hilos mandan al bucle de la UI para despertarlo
+/// Events other threads send to the UI loop to wake it up
 #[derive(Debug)]
 enum UserEvent {
-    /// Hay bytes nuevos del shell de un panel en su canal
+    /// A pane's shell has new bytes in its channel
     PtyOutput(PaneId),
-    /// El proceso hijo de un panel terminó
+    /// A pane's child process exited
     ShellExited(PaneId),
-    /// El archivo de configuración cambió en disco
+    /// The configuration file changed on disk
     ConfigChanged,
 }
 
-/// Lo que pasó dentro de un terminal durante `vt_write` y puede interesar a los hooks de Lua. Se
-/// encola desde los callbacks de libghostty y se despacha cuando `vt_write` ya terminó.
+/// Something that happened inside a terminal during `vt_write` that Lua hooks may care about.
+/// Queued from libghostty callbacks and dispatched once `vt_write` has finished.
 enum LuaEvent {
     TitleChanged(String),
     Bell,
 }
 
-/// Cada cuánto se mira si config.lua cambió, y cuánto se espera antes de leerlo para no pillar
-/// un guardado a medias
+/// How often config.lua is checked for changes, and how long to wait before reading it so a
+/// half-finished save is not picked up
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CONFIG_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
@@ -74,8 +74,8 @@ fn modified_time(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-/// Vigila el archivo de configuración comparando su fecha de modificación. Es un solo archivo, así
-/// que esto evita una dependencia como `notify`. Termina cuando el bucle de eventos se cierra.
+/// Watches the configuration file by comparing its modification time. It is a single file, so
+/// this avoids a dependency like `notify`. It ends when the event loop closes.
 fn watch_config(path: PathBuf, proxy: EventLoopProxy<UserEvent>) {
     thread::spawn(move || {
         let mut last = modified_time(&path);
@@ -93,7 +93,7 @@ fn watch_config(path: PathBuf, proxy: EventLoopProxy<UserEvent>) {
     });
 }
 
-/// Windows 11 redondea las esquinas de las ventanas salvo que se le pida lo contrario
+/// Windows 11 rounds window corners unless asked not to
 #[cfg(windows)]
 fn corner_preference(rounded: bool) -> CornerPreference {
     if rounded {
@@ -103,13 +103,13 @@ fn corner_preference(rounded: bool) -> CornerPreference {
     }
 }
 
-/// El icono de la aplicación a `size`×`size` para winit (barra de título y de tareas)
+/// The application icon at `size`×`size` for winit (title bar and taskbar)
 fn window_icon(size: u32) -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(icon::rgba(size), size, size).ok()
 }
 
-/// Pone el icono en el Dock y en el selector de aplicaciones (Cmd+Tab). Sin un bundle `.app` macOS
-/// muestra el de un ejecutable genérico; esto lo cambia mientras la aplicación está abierta.
+/// Sets the icon in the Dock and the app switcher (Cmd+Tab). Without an `.app` bundle macOS
+/// shows a generic executable icon; this replaces it while the application is running.
 #[cfg(target_os = "macos")]
 fn set_dock_icon() {
     use objc2::{AllocAnyThread, MainThreadMarker};
@@ -130,34 +130,34 @@ fn set_dock_icon() {
 struct App {
     config: Config,
     config_path: Option<PathBuf>,
-    /// Teclas, hooks y el intérprete de Lua de la configuración actual
+    /// Keys, hooks, and the Lua interpreter of the current configuration
     script: Script,
-    /// Eventos de los terminales pendientes de pasar a los hooks de Lua (y el extremo para los
-    /// paneles nuevos)
+    /// Terminal events waiting to be passed to the Lua hooks (and the sender for new
+    /// panes)
     lua_events: Receiver<(PaneId, LuaEvent)>,
     lua_tx: Sender<(PaneId, LuaEvent)>,
-    /// Mientras se ejecutan las órdenes de un hook no se disparan otros hooks, para que uno que
-    /// provoca el evento que lo dispara (p. ej. recargar la config desde `config-reloaded`) no
-    /// entre en bucle
+    /// While a hook's commands run, no other hooks fire, so one that triggers its own event
+    /// (e.g. reloading the config from `config-reloaded`) does not
+    /// loop forever
     in_hook: bool,
-    /// Modificadores pulsados (bits de `actions::CTRL`, etc.) para buscar enlaces de teclas
+    /// Pressed modifiers (bits of `actions::CTRL`, etc.) for looking up key bindings
     mod_bits: u8,
-    /// Cuánto se movió el tamaño de la fuente con las acciones de aumentar/reducir. Una recarga
-    /// de la configuración lo pone a cero.
+    /// How far the font size was moved by the increase/decrease actions. A configuration
+    /// reload resets it to zero.
     font_delta: f32,
-    /// Fase del parpadeo del cursor, y si el último frame tenía un cursor parpadeante (solo
-    /// entonces hace falta despertar el bucle para alternarla)
+    /// Cursor blink phase, and whether the last frame had a blinking cursor (only then
+    /// does the loop need to wake up to toggle it)
     blink: Blink,
     cursor_blinks: bool,
     mouse: MouseState,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     focused: bool,
-    /// Todos los paneles; dónde va cada uno y cuál tiene el foco lo decide `layout`
+    /// All panes; `layout` decides where each one goes and which one has focus
     panes: Vec<Pane>,
     layout: Layout,
     next_pane_id: u32,
-    /// El prefijo (tipo Ctrl+B de tmux) está pulsado y espera la tecla siguiente
+    /// The prefix (like tmux's Ctrl+B) is pressed and waiting for the next key
     leader: LeaderState,
     key_encoder: Encoder<'static>,
     mods: Mods,
@@ -169,7 +169,7 @@ impl App {
         self.panes.iter().position(|pane| pane.id == id)
     }
 
-    /// Posición en `panes` del panel con foco. Siempre hay uno: al cerrarse el último, la app sale.
+    /// Index in `panes` of the focused pane. Always present: closing the last one exits the app.
     fn focused_index(&self) -> usize {
         self.index_of(self.layout.focus()).unwrap_or(0)
     }
@@ -183,8 +183,8 @@ impl App {
         &mut self.panes[index]
     }
 
-    /// El título fijo de la configuración o, si no hay, el que puso el programa del panel con foco
-    /// (o el de fábrica)
+    /// The configured fixed title or, if none, the one set by the focused pane's program
+    /// (or the default)
     fn window_title(&self) -> String {
         if let Some(title) = &self.config.window.title {
             return title.clone();
@@ -200,8 +200,8 @@ impl App {
         }
     }
 
-    /// Da el foco a un panel (un clic, una acción). Si el diseño cambia (un flotante sube, el zoom
-    /// se quita) se recoloca todo.
+    /// Focuses a pane (a click, an action). If the layout changes (a floating pane is raised, zoom
+    /// is removed) everything is repositioned.
     fn focus_pane(&mut self, id: PaneId) {
         if self.layout.focus() == id {
             return;
@@ -223,13 +223,13 @@ impl App {
         }
     }
 
-    /// Área de la ventana (pixeles físicos) que se reparte entre los paneles
+    /// Window area (physical pixels) shared among the panes
     fn window_area(&self) -> Option<Rect> {
         let size = self.window.as_ref()?.inner_size();
         Some(Rect::new(0, 0, size.width, size.height))
     }
 
-    /// Tamaño mínimo de un panel con el tamaño de celda y el margen actuales
+    /// Minimum pane size with the current cell size and padding
     fn pane_limits(&self) -> Option<Limits> {
         let renderer = self.renderer.as_ref()?;
         let (cell_width, cell_height) = renderer.cell_size();
@@ -240,8 +240,8 @@ impl App {
         })
     }
 
-    /// Directorio donde arranca un panel nuevo: el del panel `from` (por OSC 7 o, en macOS y
-    /// Linux, preguntándole al sistema) si `panes.inherit_cwd` lo permite; si no, el de `shell.cwd`
+    /// Directory where a new pane starts: that of pane `from` (via OSC 7 or, on macOS and
+    /// Linux, by asking the OS) if `panes.inherit_cwd` allows it; otherwise `shell.cwd`
     fn inherited_cwd(&self, from: PaneId) -> Option<PathBuf> {
         if !self.config.panes.inherit_cwd {
             return None;
@@ -252,7 +252,7 @@ impl App {
             .current_dir()
     }
 
-    /// Divide el panel con foco (o, desde un flotante, el último del mosaico) y da el foco al nuevo
+    /// Splits the focused pane (or the last tiled one, from a floating pane) and focuses the new one
     fn split(&mut self, axis: Axis) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -261,7 +261,7 @@ impl App {
         let cwd = self.inherited_cwd(target);
         let id = PaneId(self.next_pane_id);
         if !self.layout.split(target, axis, id, area, limits) {
-            eprintln!("[panes] no hay sitio para dividir el panel");
+            eprintln!("[panes] not enough room to split the pane");
             return;
         }
         let Some(renderer) = &self.renderer else {
@@ -292,14 +292,14 @@ impl App {
             }
             Err(error) => {
                 eprintln!("[panes] {error}");
-                // Se deshace el reparto: el panel anterior recupera su espacio y el foco
+                // Undo the split: the previous pane gets its space and focus back
                 self.layout.close(id);
             }
         }
     }
 
-    /// Abre un panel flotante y le da el foco. Con `program` ejecuta ese programa en lugar del
-    /// shell (y el flotante se cierra al terminar). `width` y `height` son fracciones de la ventana.
+    /// Opens a floating pane and focuses it. With `program` it runs that program instead of the
+    /// shell (and the floating pane closes when it exits). `width`/`height` are window fractions.
     fn new_float(
         &mut self,
         program: Option<(String, Vec<String>)>,
@@ -351,7 +351,7 @@ impl App {
         }
     }
 
-    /// Oculta o muestra los flotantes; si no hay ninguno, abre uno
+    /// Hides or shows the floating panes; if there are none, opens one
     fn toggle_floats(&mut self) {
         if !self.layout.has_floats() {
             self.new_float(None, None, None, None);
@@ -359,11 +359,11 @@ impl App {
         }
         self.layout.toggle_floats();
         self.refresh_title();
-        // Al mostrarlos hay que ponerles el tamaño actual de la ventana
+        // When showing them they must be given the current window size
         self.relayout_window();
     }
 
-    /// Mueve el flotante con foco `amount` celdas hacia `direction`
+    /// Moves the focused floating pane `amount` cells toward `direction`
     fn move_pane(&mut self, direction: Direction, amount: u16) {
         let (Some(area), Some(renderer)) = (self.window_area(), &self.renderer) else {
             return;
@@ -388,7 +388,7 @@ impl App {
         }
     }
 
-    /// Tras cambiar el foco: título, y recolocar si el zoom se quitó
+    /// After a focus change: title, and relayout if zoom was removed
     fn after_focus_change(&mut self, zoom_before: Option<PaneId>) {
         self.refresh_title();
         if self.layout.zoomed() != zoom_before {
@@ -412,7 +412,7 @@ impl App {
         self.after_focus_change(zoomed);
     }
 
-    /// Mueve el borde del panel con foco `amount` celdas hacia `direction`
+    /// Moves the focused pane's border `amount` cells toward `direction`
     fn resize_pane(&mut self, direction: Direction, amount: u16) {
         let (Some(area), Some(limits), Some(renderer)) =
             (self.window_area(), self.pane_limits(), &self.renderer)
@@ -436,7 +436,7 @@ impl App {
         }
     }
 
-    /// Rectángulos de las líneas que separan los paneles del mosaico
+    /// Rectangles of the lines separating the tiled panes
     fn divider_rects(&self) -> Vec<Rect> {
         let (Some(area), Some(renderer)) = (self.window_area(), &self.renderer) else {
             return Vec::new();
@@ -449,7 +449,7 @@ impl App {
             .collect()
     }
 
-    /// Cierra un panel. Si era el último del mosaico, la ventana se cierra.
+    /// Closes a pane. If it was the last tiled one, the window closes.
     fn close_pane(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
         match self.layout.close(id) {
             Closed::LastTiled => {
@@ -459,7 +459,7 @@ impl App {
                 event_loop.exit();
             }
             Closed::Pane => {
-                // Al soltar el `Pane` se termina su shell si seguía vivo
+                // Dropping the `Pane` terminates its shell if it was still alive
                 self.panes.retain(|pane| pane.id != id);
                 self.mouse.forget_pane(id);
                 self.refresh_title();
@@ -475,7 +475,7 @@ impl App {
         }
         self.reset_blink();
 
-        // El prefijo va primero: pulsarlo, o la tecla que sigue, nunca llega al shell
+        // The prefix goes first: neither pressing it nor the key that follows reaches the shell
         let outcome = self.script.leader_step(
             &mut self.leader,
             &key_event.logical_key,
@@ -487,7 +487,7 @@ impl App {
             LeaderOutcome::Normal => {}
             LeaderOutcome::Ignore => return,
             LeaderOutcome::Arm | LeaderOutcome::Cancel => {
-                // Cambia (o vuelve) el color del marco que indica el prefijo
+                // Changes (or restores) the border color that signals the prefix
                 self.redraw_window();
                 return;
             }
@@ -504,7 +504,7 @@ impl App {
             }
         }
 
-        // Las teclas enlazadas en config.lua van antes que el encoder: la pulsación no llega al shell
+        // Keys bound in config.lua go before the encoder: the keypress does not reach the shell
         if let Some(action) = self
             .script
             .binding(&key_event.logical_key, self.mod_bits)
@@ -523,7 +523,7 @@ impl App {
             PhysicalKey::Code(code) => map_key(code),
             _ => Key::Unidentified,
         };
-        // Ghostty no quiere caracteres de control en el texto: los deriva de `key` + `mods`
+        // Ghostty does not want control characters in the text: it derives them from `key` + `mods`
         let text = key_event
             .text
             .as_deref()
@@ -548,18 +548,18 @@ impl App {
             self.clear_selection();
             self.write_to_pty(&seq);
         } else if let Some(raw) = key_event.text.as_deref() {
-            // Teclas sin mapeo (p. ej. Ctrl+C llega como "\x03"): se envían tal cual
+            // Unmapped keys (e.g. Ctrl+C arrives as "\x03"): sent as-is
             self.clear_selection();
             self.write_to_pty(raw.as_bytes());
         }
     }
 
-    /// Escribe en la entrada del shell del panel con foco
+    /// Writes to the focused pane's shell input
     fn write_to_pty(&mut self, bytes: &[u8]) {
         self.focused_mut().write(bytes);
     }
 
-    /// Ejecuta una acción de una tecla, de un hook (`ctx:perform`) o de una función de Lua
+    /// Runs an action from a key, a hook (`ctx:perform`), or a Lua function
     fn perform(&mut self, event_loop: &ActiveEventLoop, action: Action) {
         match action {
             Action::SendString { text } => {
@@ -568,7 +568,7 @@ impl App {
             }
             Action::ScrollLines { amount } => self.scroll(ScrollViewport::Delta(amount)),
             Action::ScrollPages { amount } => {
-                // Una página son las filas visibles
+                // A page is the visible rows
                 let page = self.focused().grid.1 as isize;
                 self.scroll(ScrollViewport::Delta(amount.saturating_mul(page)));
             }
@@ -628,7 +628,7 @@ impl App {
         }
     }
 
-    /// Ejecuta lo que pidió una función de Lua, ya terminada su llamada
+    /// Runs what a Lua function requested, once its call has finished
     fn run_commands(&mut self, event_loop: &ActiveEventLoop, commands: Vec<Command>) {
         self.in_hook = true;
         for command in commands {
@@ -641,7 +641,7 @@ impl App {
         self.in_hook = false;
     }
 
-    /// Llama al hook de un evento, si la configuración lo define
+    /// Calls an event's hook, if the configuration defines it
     fn fire_event(&mut self, event_loop: &ActiveEventLoop, kind: EventKind, args: Vec<Value>) {
         if self.in_hook || !self.script.has_handler(kind) {
             return;
@@ -650,13 +650,13 @@ impl App {
         self.run_commands(event_loop, commands);
     }
 
-    /// Despacha lo que ocurrió dentro de los terminales durante `vt_write`
+    /// Dispatches what happened inside the terminals during `vt_write`
     fn dispatch_terminal_events(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok((id, event)) = self.lua_events.try_recv() {
             match event {
                 LuaEvent::TitleChanged(title) => {
-                    // Lo habitual en un terminal: la ventana muestra el título que pone el
-                    // programa del panel con foco, salvo que config.lua fije uno con `window.title`
+                    // Usual terminal behavior: the window shows the title set by the focused pane's
+                    // program, unless config.lua fixes one with `window.title`
                     if self.config.window.title.is_none()
                         && id == self.layout.focus()
                         && let Some(window) = &self.window
@@ -671,7 +671,7 @@ impl App {
         }
     }
 
-    /// Desplaza el historial del panel con foco
+    /// Scrolls the focused pane's history
     fn scroll(&mut self, scroll: ScrollViewport) {
         let index = self.focused_index();
         self.scroll_pane(index, scroll);
@@ -682,14 +682,14 @@ impl App {
         self.redraw_window();
     }
 
-    /// Pega el portapapeles con el pegado entre corchetes si el programa lo activó. libghostty
-    /// sanea los bytes de control del texto pegado.
+    /// Pastes the clipboard, using bracketed paste if the program enabled it. libghostty
+    /// sanitizes control bytes in the pasted text.
     fn paste(&mut self) {
         let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
             Ok(text) if !text.is_empty() => text,
             Ok(_) => return,
             Err(error) => {
-                eprintln!("[paste] no se pudo leer el portapapeles: {error}");
+                eprintln!("[paste] could not read the clipboard: {error}");
                 return;
             }
         };
@@ -713,14 +713,14 @@ impl App {
                     buffer.resize(grown, 0);
                 }
                 Err(error) => {
-                    eprintln!("[paste] no se pudo codificar el texto: {error}");
+                    eprintln!("[paste] could not encode the text: {error}");
                     return;
                 }
             }
         }
     }
 
-    /// Cambia el tamaño de la fuente respecto al de la configuración (en pixeles lógicos)
+    /// Changes the font size relative to the configured one (in logical pixels)
     fn set_font_delta(&mut self, delta: f32) {
         let Some(renderer) = &mut self.renderer else {
             return;
@@ -743,8 +743,8 @@ impl App {
         }
     }
 
-    /// Relee config.lua. Si tiene errores se conserva la configuración anterior y se avisa en el
-    /// título de la ventana y por stderr.
+    /// Rereads config.lua. If it has errors the previous configuration is kept and a warning is
+    /// shown in the window title and on stderr.
     fn reload_config(&mut self, event_loop: &ActiveEventLoop) {
         let Some(path) = self.config_path.clone() else {
             return;
@@ -753,15 +753,15 @@ impl App {
             .and_then(|(config, script)| self.apply_config(config, script));
         match result {
             Ok(()) => {
-                eprintln!("[config] recargada");
+                eprintln!("[config] reloaded");
                 self.fire_event(event_loop, EventKind::ConfigReloaded, Vec::new());
             }
             Err(error) => {
-                eprintln!("[config] {error} (se conserva la configuración anterior)");
+                eprintln!("[config] {error} (keeping the previous configuration)");
                 let first_line = error.lines().next().unwrap_or(&error);
                 if let Some(window) = &self.window {
                     window.set_title(&format!(
-                        "{} [error de config: {first_line}]",
+                        "{} [config error: {first_line}]",
                         self.window_title()
                     ));
                 }
@@ -769,10 +769,10 @@ impl App {
         }
     }
 
-    /// Aplica una configuración nueva en caliente: fuente, tamaño, margen, colores, cursor y título.
-    /// El scrollback, el tamaño inicial de la ventana y el shell solo se leen al arrancar.
+    /// Applies a new configuration live: font, size, padding, colors, cursor, and title.
+    /// Scrollback, initial window size, and shell are only read at startup.
     fn apply_config(&mut self, new: Config, script: Script) -> Result<(), String> {
-        // Lo primero que puede fallar (una fuente que no existe) va antes de cambiar nada
+        // The first thing that can fail (a font that does not exist) goes before changing anything
         let metrics_changed = match &mut self.renderer {
             Some(renderer) => {
                 let before = (renderer.cell_size(), renderer.padding());
@@ -785,8 +785,8 @@ impl App {
         for pane in &mut self.panes {
             apply_theme(&mut pane.terminal, &new);
         }
-        // La barra de título se quita o se pone en vivo (el tamaño del área útil cambia y el
-        // `Resized` que sigue reajusta la cuadrícula)
+        // The title bar is removed or added live (the usable area size changes and the
+        // `Resized` that follows readjusts the grid)
         if new.window.decorations != self.config.window.decorations
             && let Some(window) = &self.window
         {
@@ -806,13 +806,11 @@ impl App {
             || new.window.rows != self.config.window.rows
             || new.shell != self.config.shell
         {
-            eprintln!(
-                "[config] scrollback, window.columns/rows y shell solo se aplican al arrancar"
-            );
+            eprintln!("[config] scrollback, window.columns/rows and shell only apply at startup");
         }
         self.config = new;
-        // Las teclas y los hooks nuevos sustituyen a los anteriores (con su intérprete de Lua), y
-        // el tamaño de fuente vuelve al de la configuración
+        // The new keys and hooks replace the previous ones (with their Lua interpreter), and
+        // the font size goes back to the configured one
         self.script = script;
         self.leader.clear();
         self.font_delta = 0.0;
@@ -824,7 +822,7 @@ impl App {
             window.set_title(&self.window_title());
         }
 
-        // Si cambió la celda, hay que recalcular filas y columnas y avisar a los PTY
+        // If the cell changed, rows and columns must be recomputed and the PTYs notified
         if metrics_changed {
             for pane in &mut self.panes {
                 pane.grid = (0, 0);
@@ -836,21 +834,21 @@ impl App {
         Ok(())
     }
 
-    /// Pasa a libghostty lo que el shell de un panel escribió, contesta sus consultas, avisa a los
-    /// hooks de Lua y pide redibujar
+    /// Feeds libghostty what a pane's shell wrote, answers its queries, notifies the
+    /// Lua hooks, and requests a redraw
     fn drain_pty(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
         let Some(index) = self.index_of(id) else {
             return;
         };
         let chunks = self.panes[index].drain(MAX_CHUNKS_PER_WAKE);
-        // Título y campana, ya con `vt_write` terminado
+        // Title and bell, now that `vt_write` has finished
         self.dispatch_terminal_events(event_loop);
 
         if chunks == MAX_CHUNKS_PER_WAKE {
-            // Puede quedar más: se vuelve a avisar para dejar pasar otros eventos entre medias
+            // There may be more: signal again to let other events through in between
             self.panes[index].request_more(&self.proxy);
         }
-        // Si la terminal cambió de estado interno, redibujamos el frame
+        // If the terminal's internal state changed, redraw the frame
         if chunks > 0 {
             if id == self.layout.focus() {
                 self.blink.reset(Instant::now());
@@ -860,7 +858,7 @@ impl App {
     }
 
     fn resize(&mut self, width: u32, height: u32) {
-        // Minimizar la ventana reporta 0×0: no hay nada que dibujar ni que reflujar
+        // Minimizing the window reports 0×0: nothing to draw or reflow
         if width == 0 || height == 0 {
             return;
         }
@@ -871,7 +869,7 @@ impl App {
         self.relayout(Rect::new(0, 0, width, height));
     }
 
-    /// Recoloca los paneles con el tamaño actual de la ventana
+    /// Relayouts the panes with the current window size
     fn relayout_window(&mut self) {
         let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
             return;
@@ -881,8 +879,8 @@ impl App {
         }
     }
 
-    /// Reparte `area` entre los paneles visibles y, a cada uno cuyo número de columnas y filas
-    /// cambió, avisa a su PTY y a libghostty (que hace reflow del buffer)
+    /// Divides `area` among the visible panes and, for each one whose column and row count
+    /// changed, notifies its PTY and libghostty (which reflows the buffer)
     fn relayout(&mut self, area: Rect) {
         let Some(renderer) = &self.renderer else {
             return;
@@ -906,8 +904,8 @@ impl App {
     fn render(&mut self) {
         let focus = self.layout.focus();
         let window_focused = self.focused;
-        // Las vistas, de abajo arriba: el mosaico y encima los flotantes. Solo cuando hay varios
-        // se distingue el panel con foco (marco) de los demás (texto apagado).
+        // The views, bottom to top: the tiled layout, then the floating panes. Only when there
+        // are several is the focused pane (border) distinguished from the rest (dimmed text).
         let order = self.layout.visible_ids();
         let several = order.len() > 1;
         let leader_pending = self.leader.pending();
@@ -934,7 +932,7 @@ impl App {
                         rect: pane.rect,
                         focused: window_focused && pane.id == focus,
                         dim: several && pane.id != focus,
-                        // Con el prefijo pulsado hay marco aunque haya un solo panel
+                        // With the prefix pressed there is a border even with a single pane
                         frame: (several || leader_pending) && pane.id == focus,
                         leader: leader_pending && pane.id == focus,
                         floating: floating.contains(&pane.id),
@@ -947,8 +945,8 @@ impl App {
         self.cursor_blinks = renderer.draw(&mut views, &dividers, self.blink.visible());
     }
 
-    /// El cursor vuelve a verse y el ciclo de parpadeo empieza de nuevo: mientras se escribe o
-    /// llega salida se queda fijo
+    /// The cursor becomes visible again and the blink cycle restarts: while typing or while
+    /// output arrives it stays solid
     fn reset_blink(&mut self) {
         if self.blink.reset(Instant::now())
             && let Some(window) = &self.window
@@ -995,23 +993,23 @@ impl ApplicationHandler<UserEvent> for App {
                 .with_title(self.window_title())
                 .with_decorations(decorated)
                 .with_window_icon(window_icon(64));
-            // La barra de tareas usa un icono grande aparte del de la barra de título
+            // The taskbar uses a large icon separate from the title bar one
             #[cfg(windows)]
             let attrs = attrs.with_taskbar_icon(window_icon(256));
-            // macOS ignora el icono de la ventana: el del Dock es el de la aplicación
+            // macOS ignores the window icon: the Dock uses the application's
             #[cfg(target_os = "macos")]
             set_dock_icon();
-            // Sin barra, la sombra del sistema es lo que separa la ventana del fondo
+            // Without a title bar, the system shadow separates the window from the background
             #[cfg(windows)]
             let attrs = attrs
                 .with_undecorated_shadow(!decorated)
                 .with_corner_preference(corner_preference(self.config.window.rounded_corners));
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
             let renderer =
-                Renderer::new(window.clone(), &self.config).expect("Error al inicializar wgpu");
+                Renderer::new(window.clone(), &self.config).expect("Failed to initialize wgpu");
 
-            // Si la configuración pide un tamaño en columnas y filas, se traduce a pixeles con el
-            // tamaño real de la celda. Es una petición: el gestor de ventanas puede ignorarla.
+            // If the configuration asks for a size in columns and rows, convert it to pixels using
+            // the real cell size. It is a request: the window manager may ignore it.
             let mut size = window.inner_size();
             let window_config = &self.config.window;
             if window_config.columns.is_some() || window_config.rows.is_some() {
@@ -1026,12 +1024,12 @@ impl ApplicationHandler<UserEvent> for App {
 
             self.renderer = Some(renderer);
             self.window = Some(window);
-            // Ajusta el PTY y la cuadrícula al tamaño real de la ventana
+            // Fit the PTY and the grid to the real window size
             self.resize(size.width, size.height);
         }
     }
 
-    /// Cuando vence el plazo del temporizador, alterna la fase del parpadeo
+    /// When the timer deadline expires, toggles the blink phase
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         if !matches!(cause, StartCause::ResumeTimeReached { .. }) {
             return;
@@ -1044,16 +1042,16 @@ impl ApplicationHandler<UserEvent> for App {
         {
             window.request_redraw();
         }
-        // El prefijo caduca si no llega la tecla siguiente
+        // The prefix expires if the next key does not arrive
         if self.leader.expire(now) {
             self.redraw_window();
         }
         self.tick_autoscroll(now);
     }
 
-    /// Sin nada que hacer, el bucle duerme hasta el siguiente evento. Solo se despierta antes si
-    /// hay un plazo pendiente: el siguiente cambio de fase de un cursor parpadeante (con la ventana
-    /// enfocada) o el siguiente paso del autodesplazamiento de una selección.
+    /// With nothing to do, the loop sleeps until the next event. It only wakes earlier if
+    /// a deadline is pending: the next phase change of a blinking cursor (with the window
+    /// focused) or the next step of a selection's autoscroll.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let blink = (self.cursor_blinks && self.focused).then(|| self.blink.deadline());
         let next = [
@@ -1074,11 +1072,11 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::PtyOutput(id) => self.drain_pty(event_loop, id),
             UserEvent::ShellExited(id) => {
-                // Un panel que ya se cerró a mano no tiene nada más que hacer
+                // A pane that was already closed by hand has nothing left to do
                 let Some(index) = self.index_of(id) else {
                     return;
                 };
-                // Lo último que escribió el shell antes de salir
+                // The last thing the shell wrote before exiting
                 self.drain_pty(event_loop, id);
                 self.fire_event(event_loop, EventKind::ShellExit, Vec::new());
                 match self.config.on_shell_exit {
@@ -1086,7 +1084,7 @@ impl ApplicationHandler<UserEvent> for App {
                     config::ShellExit::Hold => {
                         self.panes[index]
                             .terminal
-                            .vt_write(b"\r\n\x1b[2m[proceso terminado]\x1b[0m\r\n");
+                            .vt_write(b"\r\n\x1b[2m[process exited]\x1b[0m\r\n");
                         self.redraw_window();
                     }
                 }
@@ -1127,13 +1125,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mod_bits = bits;
             }
 
-            // Capturar la entrada del teclado físico del usuario
+            // Capture the user's physical keyboard input
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event_loop, &event),
 
-            // Gestionar el redimensionado (Resize) coordinado
+            // Handle coordinated resizing
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
 
-            // Al cambiar de monitor con otro DPI cambia el tamaño de la fuente y, con él, el de la celda
+            // A monitor with a different DPI changes the font size and, with it, the cell size
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_scale_factor(scale_factor);
@@ -1146,7 +1144,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            // Sin foco el cursor se dibuja hueco
+            // Without focus the cursor is drawn hollow
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 self.blink.reset(Instant::now());
@@ -1174,25 +1172,25 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
-    // 0. Cargar config.lua. Si falla se usan los valores por defecto y el error se escribe en la
-    // cuadrícula del primer panel, cuando ya existe el terminal.
+    // 0. Load config.lua. If it fails, defaults are used and the error is written to the
+    // first pane's grid once its terminal exists.
     let loaded = config::load();
     if let Some(error) = &loaded.error {
         eprintln!("[config] {error}");
     }
     let config = loaded.config;
 
-    // 1. Configurar dimensiones iniciales (luego `resumed` las ajusta al tamaño real de la ventana)
+    // 1. Set the initial dimensions (`resumed` later fits them to the real window size)
     let cols = config.window.columns.unwrap_or(DEFAULT_COLUMNS);
     let rows = config.window.rows.unwrap_or(DEFAULT_ROWS);
 
-    // 2. Crear el bucle de eventos de Winit (la ventana se crea en `resumed`). Duerme hasta que
-    // llega un evento; los hilos de cada panel lo despiertan a través del proxy.
+    // 2. Create the winit event loop (the window is created in `resumed`). It sleeps until
+    // an event arrives; each pane's threads wake it through the proxy.
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    // 3. El primer panel: terminal, PTY, shell y los hilos que los atienden
+    // 3. The first pane: terminal, PTY, shell, and the threads that serve them
     let (lua_tx, lua_events) = channel::<(PaneId, LuaEvent)>();
     let first = PaneId(0);
     let pane = Pane::spawn(
@@ -1210,7 +1208,7 @@ fn main() {
     )
     .unwrap_or_else(|error| panic!("{error}"));
 
-    // El archivo de configuración se vigila para recargarlo al guardar
+    // The configuration file is watched so it is reloaded on save
     if let Some(path) = &loaded.path {
         watch_config(path.clone(), proxy.clone());
     }
@@ -1230,7 +1228,7 @@ fn main() {
         font_delta: 0.0,
         blink,
         cursor_blinks: false,
-        mouse: MouseState::new().expect("Error al inicializar el ratón"),
+        mouse: MouseState::new().expect("Failed to initialize the mouse"),
         window: None,
         renderer: None,
         focused: true,
@@ -1243,6 +1241,6 @@ fn main() {
         proxy,
     };
 
-    // 4. Bucle Principal de Eventos (Event Loop)
+    // 4. Main event loop
     let _ = event_loop.run_app(&mut app);
 }

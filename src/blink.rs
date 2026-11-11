@@ -1,5 +1,5 @@
-//! Fase del parpadeo del cursor. Es solo un reloj: no sabe nada de ventanas ni de renderizado, así
-//! que se prueba con instantes sintéticos.
+//! Cursor blink phase. It is only a clock: it knows nothing about windows or rendering, so
+//! it is tested with synthetic instants.
 
 use std::time::{Duration, Instant};
 
@@ -18,12 +18,12 @@ impl Blink {
         }
     }
 
-    /// ¿Toca dibujar el cursor en esta fase?
+    /// Should the cursor be drawn in this phase?
     pub fn visible(&self) -> bool {
         self.visible
     }
 
-    /// Cuándo hay que volver a alternar la fase
+    /// When the phase must toggle next
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -35,7 +35,7 @@ impl Blink {
         }
     }
 
-    /// Alterna la fase si ya venció. Devuelve `true` si cambió (hay que redibujar).
+    /// Toggles the phase if it is due. Returns `true` if it changed (a redraw is needed).
     pub fn tick(&mut self, now: Instant) -> bool {
         if now < self.deadline {
             return false;
@@ -45,8 +45,8 @@ impl Blink {
         true
     }
 
-    /// Vuelve a mostrar el cursor y reinicia el ciclo: mientras se escribe o llega salida el
-    /// cursor se queda fijo. Devuelve `true` si estaba oculto (hay que redibujar).
+    /// Shows the cursor again and restarts the cycle: while typing or while output arrives the
+    /// cursor stays solid. Returns `true` if it was hidden (a redraw is needed).
     pub fn reset(&mut self, now: Instant) -> bool {
         let was_hidden = !self.visible;
         self.visible = true;
@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn a_late_tick_does_not_try_to_catch_up() {
-        // Si el bucle se atrasó varios intervalos, solo se alterna una vez y el siguiente plazo
-        // cuenta desde ahora: no hay ráfagas de parpadeos acumulados
+        // If the loop fell several intervals behind, it toggles only once and the next deadline
+        // counts from now: no bursts of accumulated blinks
         let t0 = Instant::now();
         let mut blink = Blink::new(INTERVAL, t0);
         assert!(blink.tick(at(t0, 5000)));
@@ -112,17 +112,20 @@ mod tests {
         blink.tick(at(t0, 500));
         assert!(!blink.visible());
 
-        assert!(blink.reset(at(t0, 700)), "estaba oculto: hay que redibujar");
+        assert!(
+            blink.reset(at(t0, 700)),
+            "it was hidden: a redraw is needed"
+        );
         assert!(blink.visible());
         assert_eq!(blink.deadline(), at(t0, 1200));
-        // Con el cursor ya visible no hace falta redibujar
+        // With the cursor already visible no redraw is needed
         assert!(!blink.reset(at(t0, 800)));
         assert_eq!(blink.deadline(), at(t0, 1300));
     }
 
     #[test]
     fn typing_keeps_the_cursor_solid() {
-        // Cada pulsación reinicia el plazo, así que mientras se escribe nunca llega a alternar
+        // Every keypress restarts the deadline, so while typing it never gets to toggle
         let t0 = Instant::now();
         let mut blink = Blink::new(INTERVAL, t0);
         for step in 1..=10 {
@@ -138,7 +141,11 @@ mod tests {
         let t0 = Instant::now();
         let mut blink = Blink::new(INTERVAL, t0);
         blink.set_interval(INTERVAL, at(t0, 100));
-        assert_eq!(blink.deadline(), at(t0, 500), "mismo intervalo: no se toca");
+        assert_eq!(
+            blink.deadline(),
+            at(t0, 500),
+            "same interval: left untouched"
+        );
         blink.set_interval(Duration::from_millis(200), at(t0, 100));
         assert_eq!(blink.deadline(), at(t0, 300));
     }
