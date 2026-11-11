@@ -1258,7 +1258,9 @@ mod tests {
         );
 
         let mut seen = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // 5s: a cold Windows CI can take several seconds to spawn cmd.exe, tear down ConPTY and
+        // ride out the exit-notice grace; the assertion only needs the order, not the timing
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match events.recv_timeout(Duration::from_millis(50)) {
                 Ok(event) => seen.push(event),
