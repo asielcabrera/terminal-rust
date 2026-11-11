@@ -791,6 +791,7 @@ mod tests {
     }
 
     /// Reads what is available right now, without waiting for more
+    #[cfg(unix)] // only the exit-ordering test below uses it
     fn read_available(io: &mut ServerBlock) -> Vec<u8> {
         let mut output = Vec::new();
         loop {
