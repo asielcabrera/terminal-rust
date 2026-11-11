@@ -10,6 +10,7 @@ mod pane_io;
 #[cfg(unix)] // Windows has no API for another process' cwd; pane.rs only calls it on unix
 mod proc_cwd;
 mod renderer;
+mod server;
 
 use actions::{Action, Command, Direction, EventKind, LeaderOutcome, LeaderState, Script};
 use blink::Blink;
@@ -22,6 +23,7 @@ use mlua::Value;
 use mouse::MouseState;
 use pane::{MAX_CHUNKS_PER_WAKE, Pane, Spawn, apply_theme};
 use renderer::{PaneView, Renderer};
+use server::{Server, ServerHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -163,6 +165,8 @@ struct App {
     key_encoder: Encoder<'static>,
     mods: Mods,
     proxy: EventLoopProxy<UserEvent>,
+    /// Owns the programs behind the panes
+    server: ServerHandle,
 }
 
 impl App {
@@ -284,7 +288,13 @@ impl App {
             cwd,
             notice: None,
         };
-        match Pane::spawn(&self.config, spawn, self.lua_tx.clone(), self.proxy.clone()) {
+        match Pane::spawn(
+            &self.config,
+            &self.server,
+            spawn,
+            self.lua_tx.clone(),
+            self.proxy.clone(),
+        ) {
             Ok(pane) => {
                 self.next_pane_id += 1;
                 self.panes.push(pane);
@@ -336,7 +346,13 @@ impl App {
             cwd,
             notice: None,
         };
-        match Pane::spawn(&self.config, spawn, self.lua_tx.clone(), self.proxy.clone()) {
+        match Pane::spawn(
+            &self.config,
+            &self.server,
+            spawn,
+            self.lua_tx.clone(),
+            self.proxy.clone(),
+        ) {
             Ok(pane) => {
                 self.next_pane_id += 1;
                 self.panes.push(pane);
@@ -1194,8 +1210,10 @@ fn main() {
     // 3. The first pane: terminal, PTY, shell, and the threads that serve them
     let (lua_tx, lua_events) = channel::<(PaneId, LuaEvent)>();
     let first = PaneId(0);
+    let server = Server::start();
     let pane = Pane::spawn(
         &config,
+        &server,
         Spawn {
             id: first,
             cols,
@@ -1240,6 +1258,7 @@ fn main() {
         key_encoder: Encoder::new().unwrap(),
         mods: Mods::empty(),
         proxy,
+        server,
     };
 
     // 4. Main event loop
