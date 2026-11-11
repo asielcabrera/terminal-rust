@@ -114,6 +114,8 @@ fn to_byte(value: f32) -> u8 {
 
 /// The icon as a `.ico` file with one 32-bit image per size (at most 256). Windows embeds it in
 /// the executable and macOS reads it with `NSImage`.
+// Only the macOS binary calls it; Windows gets the `.ico` from build.rs, a separate compilation
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn ico(sizes: &[u32]) -> Vec<u8> {
     let images: Vec<Vec<u8>> = sizes.iter().map(|&size| ico_bitmap(size)).collect();
     let mut file = Vec::new();
@@ -141,6 +143,7 @@ pub fn ico(sizes: &[u32]) -> Vec<u8> {
 
 /// One `.ico` image: a BMP header, the pixels as BGRA from the bottom row up, and an empty AND
 /// mask (the alpha channel already says what is transparent)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn ico_bitmap(size: u32) -> Vec<u8> {
     let pixels = rgba(size);
     let mask_row = size.div_ceil(32) * 4;
