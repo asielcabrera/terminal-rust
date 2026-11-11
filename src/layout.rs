@@ -60,7 +60,7 @@ pub enum Dir {
 }
 
 impl Dir {
-    fn axis(self) -> Axis {
+    pub(crate) fn axis(self) -> Axis {
         match self {
             Dir::Left | Dir::Right => Axis::Horizontal,
             Dir::Up | Dir::Down => Axis::Vertical,
@@ -128,8 +128,8 @@ pub struct HitParams {
     pub move_ring: f64,
 }
 
-#[derive(Debug, Clone)]
-enum Node {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Node {
     Leaf(PaneId),
     Split {
         axis: Axis,
@@ -308,10 +308,25 @@ impl Node {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Float {
     pub id: PaneId,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// The whole layout as plain data. The server owns the authoritative layout and sends this to
+/// the window after every applied mutation; the window rebuilds a read-only projection from it
+/// ([`Layout::from_state`]). No serde needed yet: over IPC it maps to JSON one to one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutState {
+    pub root: Node,
+    pub focus: PaneId,
+    pub zoomed: Option<PaneId>,
+    pub floats: Vec<Float>,
+    pub floats_visible: bool,
+    /// Focused panes, oldest to most recent. Part of the state so the projection answers
+    /// recency queries (`split_target`, focus cycling) exactly like the server's layout.
+    pub history: Vec<PaneId>,
 }
 
 /// What happened when closing a pane
@@ -338,6 +353,9 @@ pub struct Layout {
     floats_visible: bool,
     /// Focused panes, oldest to most recent
     history: Vec<PaneId>,
+    /// Built by `from_state`: the window's projection of the server's layout, which must never
+    /// be mutated directly (debug builds catch it in `assert_authoritative`)
+    projection: bool,
 }
 
 impl Layout {
@@ -349,13 +367,57 @@ impl Layout {
             floats: Vec::new(),
             floats_visible: true,
             history: vec![first],
+            projection: false,
         }
+    }
+
+    /// Snapshot of the whole layout: what the server sends after every applied mutation
+    pub fn state(&self) -> LayoutState {
+        LayoutState {
+            root: self.root.clone(),
+            focus: self.focus,
+            zoomed: self.zoomed,
+            floats: self.floats.clone(),
+            floats_visible: self.floats_visible,
+            history: self.history.clone(),
+        }
+    }
+
+    /// Rebuilds a layout from plain data. The result is the window's read-only projection of
+    /// the server's layout: its mutations are refused in debug builds.
+    pub fn from_state(state: LayoutState) -> Self {
+        Self {
+            root: state.root,
+            focus: state.focus,
+            zoomed: state.zoomed,
+            floats: state.floats,
+            floats_visible: state.floats_visible,
+            history: state.history,
+            projection: true,
+        }
+    }
+
+    /// The window's projection is rebuilt from server events; mutating it here would diverge
+    /// from the server's authority
+    fn assert_authoritative(&self) {
+        debug_assert!(
+            !self.projection,
+            "the layout projection is read-only: mutations go through the server"
+        );
     }
 
     pub fn focus(&self) -> PaneId {
         self.focus
     }
 
+    /// The pane zoomed to fill the window, if any
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a projection query; the window currently reads zoom through rects"
+        )
+    )]
     pub fn zoomed(&self) -> Option<PaneId> {
         self.zoomed
     }
@@ -428,6 +490,7 @@ impl Layout {
     /// Gives focus to a pane. A floating pane is raised to the front; moving to another tiled pane
     /// clears zoom; focusing a hidden floating pane shows them all.
     pub fn set_focus(&mut self, id: PaneId) -> bool {
+        self.assert_authoritative();
         if !self.contains(id) {
             return false;
         }
@@ -481,6 +544,7 @@ impl Layout {
         area: Rect,
         limits: Limits,
     ) -> bool {
+        self.assert_authoritative();
         let before = self.zoomed.take();
         let Some((_, rect)) = self.rects(area).into_iter().find(|(id, _)| *id == target) else {
             self.zoomed = before;
@@ -507,9 +571,48 @@ impl Layout {
         true
     }
 
+    /// Rectangle a new pane would occupy if `target` were split in two along `axis`, without
+    /// changing anything. The window uses it to size the new pane's grid before asking the
+    /// server for the split. `None` when the server would refuse the split (target unknown,
+    /// or the halves would fall below the minimum size).
+    pub fn split_preview(
+        &self,
+        target: PaneId,
+        axis: Axis,
+        area: Rect,
+        limits: Limits,
+    ) -> Option<Rect> {
+        // When zoomed, `rects` only covers the zoomed pane: look at the tiling underneath
+        let rects = if self.zoomed.is_some() {
+            self.tiled_rects(area)
+        } else {
+            self.rects(area)
+        };
+        let (_, rect) = rects.into_iter().find(|(id, _)| *id == target)?;
+        let fits = match axis {
+            Axis::Horizontal => rect.w / 2 >= limits.min_w,
+            Axis::Vertical => rect.h / 2 >= limits.min_h,
+        };
+        if !fits {
+            return None;
+        }
+        // The new pane is the second child of the new split (right/bottom half), as `split_leaf`
+        // builds it with a 0.5 ratio
+        let total = match axis {
+            Axis::Horizontal => rect.w,
+            Axis::Vertical => rect.h,
+        };
+        let (first, _) = split_sizes(total, 0.5);
+        Some(match axis {
+            Axis::Horizontal => Rect::new(rect.x + first, rect.y, total - first, rect.h),
+            Axis::Vertical => Rect::new(rect.x, rect.y + first, rect.w, total - first),
+        })
+    }
+
     /// Closes a pane. Closing the last tiled pane changes nothing and reports it so the window
     /// can close.
     pub fn close(&mut self, id: PaneId) -> Closed {
+        self.assert_authoritative();
         if let Some(index) = self.floats.iter().position(|float| float.id == id) {
             self.floats.remove(index);
             self.forget(id);
@@ -553,6 +656,11 @@ impl Layout {
         if let Some(zoomed) = self.zoomed {
             return vec![(zoomed, area)];
         }
+        self.tiled_rects(area)
+    }
+
+    /// Rectangles of the tiling, without taking zoom into account
+    fn tiled_rects(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         let mut rects = Vec::new();
         let mut dividers = Vec::new();
         self.root
@@ -575,6 +683,7 @@ impl Layout {
     /// Moves focus to the neighboring pane in that direction (within the tiling). Clears zoom.
     /// `false` if focus is on a floating pane or there is no neighbor.
     pub fn focus_dir(&mut self, dir: Dir, area: Rect) -> bool {
+        self.assert_authoritative();
         if self.is_float(self.focus) {
             return false;
         }
@@ -625,6 +734,7 @@ impl Layout {
 
     /// Next (or previous) pane: tiled panes first, then visible floating panes
     pub fn focus_cycle(&mut self, forward: bool) -> bool {
+        self.assert_authoritative();
         let mut order = self.tiled_ids();
         if self.floats_visible {
             order.extend(self.floats.iter().map(|float| float.id));
@@ -644,6 +754,7 @@ impl Layout {
     /// side). If the pane has no edge there (it sits at the window boundary) the opposite edge
     /// moves instead and the pane shrinks. For a floating pane, right/down grow; left/up shrink.
     pub fn resize(&mut self, id: PaneId, dir: Dir, delta: u32, area: Rect, limits: Limits) -> bool {
+        self.assert_authoritative();
         if self.is_float(id) {
             let delta = delta as i64;
             let (dw, dh) = match dir {
@@ -751,6 +862,7 @@ impl Layout {
         area: Rect,
         limits: Limits,
     ) -> bool {
+        self.assert_authoritative();
         let Some(rect) = self.node_rect(area, path) else {
             return false;
         };
@@ -767,6 +879,7 @@ impl Layout {
     /// Zooms the focused pane to fill the window, or returns to the tiling. Only with a tiled pane
     /// focused and at least one other.
     pub fn toggle_zoom(&mut self) -> bool {
+        self.assert_authoritative();
         if self.zoomed.is_some() {
             self.zoomed = None;
             return true;
@@ -780,22 +893,47 @@ impl Layout {
 
     // ---- Floating panes --------------------------------------------------------------------
 
-    /// Adds a centered floating pane (with a small offset for each existing one), shows it
-    /// and focuses it
-    pub fn add_float(&mut self, id: PaneId, width: f32, height: f32) {
+    /// Placement (fractions) of a new floating pane: centered, with a small offset for each
+    /// existing one. Shared by `add_float` and `float_preview`.
+    fn float_placement(&self, width: f32, height: f32) -> (f32, f32, f32, f32) {
         let w = width.clamp(MIN_FLOAT_FRACTION, 1.0);
         let h = height.clamp(MIN_FLOAT_FRACTION, 1.0);
         let shift = FLOAT_CASCADE * (self.floats.len() % 5) as f32;
         let x = ((1.0 - w) / 2.0 + shift).clamp(0.0, 1.0 - w);
         let y = ((1.0 - h) / 2.0 + shift).clamp(0.0, 1.0 - h);
+        (x, y, w, h)
+    }
+
+    /// Adds a centered floating pane (with a small offset for each existing one), shows it
+    /// and focuses it
+    pub fn add_float(&mut self, id: PaneId, width: f32, height: f32) {
+        self.assert_authoritative();
+        let (x, y, w, h) = self.float_placement(width, height);
         self.floats.push(Float { id, x, y, w, h });
         self.floats_visible = true;
         self.set_focus(id);
     }
 
+    /// Rectangle a new floating pane would occupy, without changing anything. The window uses
+    /// it to size the new pane's grid before asking the server for the float.
+    pub fn float_preview(&self, width: f32, height: f32, window: Rect) -> Rect {
+        let (x, y, w, h) = self.float_placement(width, height);
+        self.float_px(
+            &Float {
+                id: PaneId(0),
+                x,
+                y,
+                w,
+                h,
+            },
+            window,
+        )
+    }
+
     /// Hides or shows all floating panes. Hiding returns focus to the tiling; showing returns
     /// it to the last floating pane that had it. Returns whether any exist (else nothing to show).
     pub fn toggle_floats(&mut self) -> bool {
+        self.assert_authoritative();
         if self.floats.is_empty() {
             return false;
         }
@@ -861,6 +999,7 @@ impl Layout {
 
     /// Moves a floating pane without leaving the window
     pub fn move_float(&mut self, id: PaneId, dx: i64, dy: i64, window: Rect) -> bool {
+        self.assert_authoritative();
         let Some(rect) = self.float_rect(id, window) else {
             return false;
         };
@@ -911,6 +1050,7 @@ impl Layout {
         window: Rect,
         limits: Limits,
     ) -> bool {
+        self.assert_authoritative();
         let Some(rect) = self.float_rect(id, window) else {
             return false;
         };
@@ -1554,5 +1694,79 @@ mod tests {
                 assert!(a >= 1 && b >= 1, "total={total} ratio={ratio} -> {a}+{b}");
             }
         }
+    }
+
+    #[test]
+    fn split_preview_predicts_exactly_what_the_split_will_do() {
+        let mut layout = Layout::new(id(1));
+        let preview = layout
+            .split_preview(id(1), Axis::Horizontal, WINDOW, LIMITS)
+            .expect("the split fits");
+        assert!(layout.split(id(1), Axis::Horizontal, id(2), WINDOW, LIMITS));
+        assert_eq!(rect_of(&layout, 2), preview);
+
+        // With zoom on, the preview still sees the real rectangles
+        layout.toggle_zoom();
+        let preview = layout
+            .split_preview(id(1), Axis::Vertical, WINDOW, LIMITS)
+            .expect("the split fits");
+        assert!(layout.split(id(1), Axis::Vertical, id(3), WINDOW, LIMITS));
+        assert_eq!(rect_of(&layout, 3), preview);
+
+        // A refused split has no preview, and a pane that does not exist either
+        let tiny = Rect::new(0, 0, 150, 600);
+        assert!(
+            Layout::new(id(1))
+                .split_preview(id(1), Axis::Horizontal, tiny, LIMITS)
+                .is_none()
+        );
+        assert!(!Layout::new(id(1)).split(id(1), Axis::Horizontal, id(2), tiny, LIMITS));
+        assert!(
+            layout
+                .split_preview(id(9), Axis::Vertical, WINDOW, LIMITS)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn float_preview_predicts_exactly_what_add_float_will_do() {
+        let mut layout = Layout::new(id(1));
+        let first = layout.float_preview(0.5, 0.5, WINDOW);
+        layout.add_float(id(2), 0.5, 0.5);
+        assert_eq!(layout.float_rect(id(2), WINDOW).unwrap(), first);
+        // The second one accounts for the cascade offset of the first
+        let second = layout.float_preview(0.5, 0.5, WINDOW);
+        layout.add_float(id(3), 0.5, 0.5);
+        assert_eq!(layout.float_rect(id(3), WINDOW).unwrap(), second);
+        assert!(second.x > first.x && second.y > first.y);
+    }
+
+    #[test]
+    #[should_panic(expected = "projection is read-only")]
+    fn a_projection_refuses_mutations() {
+        let layout = grid();
+        let state = layout.state();
+        let mut projection = Layout::from_state(state);
+        // Mutating a projection would diverge it from the server's authority
+        projection.set_focus(id(1));
+    }
+
+    #[test]
+    fn a_layout_survives_a_state_round_trip() {
+        let mut layout = grid();
+        layout.add_float(id(5), 0.5, 0.5);
+        layout.toggle_floats();
+        layout.set_focus(id(1));
+        layout.toggle_zoom();
+
+        let state = layout.state();
+        let rebuilt = Layout::from_state(state.clone());
+        assert_eq!(rebuilt.state(), state);
+        // The pure queries of the projection match the original
+        assert_eq!(rebuilt.rects(WINDOW), layout.rects(WINDOW));
+        assert_eq!(rebuilt.focus(), layout.focus());
+        assert_eq!(rebuilt.zoomed(), layout.zoomed());
+        assert_eq!(rebuilt.visible_ids(), layout.visible_ids());
+        assert_eq!(rebuilt.split_target(), layout.split_target());
     }
 }

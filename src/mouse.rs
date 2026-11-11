@@ -25,6 +25,7 @@ use crate::App;
 use crate::actions;
 use crate::config::{Decorations, RightClick};
 use crate::layout::{Axis, Edge, Hit, HitParams, PaneId, Path};
+use crate::server::{MoveFloatOp, Request, ResizeFloatEdgeOp, SetDividerOp};
 
 /// How often one line scrolls while a selection is dragged outside the window
 pub const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -99,6 +100,22 @@ impl MouseState {
         if self.capture == Some(Capture::Pane(id)) {
             self.capture = None;
             self.autoscroll_deadline = None;
+        }
+    }
+
+    /// Takes the capture of an ongoing layout drag (a divider, or a floating pane being
+    /// moved or resized), if there is one. The release that ends it can arrive through
+    /// two channels that both fire for one physical release (the window's mouse-up and
+    /// the device-level backstop), so running this twice must be a no-op.
+    pub fn take_layout_drag(&mut self) -> bool {
+        if matches!(
+            self.capture,
+            Some(Capture::Divider(..) | Capture::FloatMove(_) | Capture::FloatResize(..))
+        ) {
+            self.capture = None;
+            true
+        } else {
+            false
         }
     }
 }
@@ -306,7 +323,8 @@ impl App {
     }
 
     /// Moves (`edge` = `None`) or resizes a floating pane by however much the pointer moved since
-    /// the last step
+    /// the last step. One message per step; the server answers with a state event and the
+    /// window relayouts from its projection.
     fn drag_float(&mut self, id: PaneId, edge: Option<Edge>) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -318,18 +336,28 @@ impl App {
             return;
         }
         self.mouse.drag_from = (x, y);
-        let changed = match edge {
-            None => self.layout.move_float(id, dx, dy, area),
-            Some(edge) => self
-                .layout
-                .resize_float_edge(id, edge, dx, dy, area, limits),
-        };
-        if changed {
-            self.relayout(area);
+        match edge {
+            None => self.server.send(Request::LayoutMoveFloat(MoveFloatOp {
+                pane: id,
+                dx,
+                dy,
+                window: area,
+            })),
+            Some(edge) => {
+                self.server
+                    .send(Request::LayoutResizeFloatEdge(ResizeFloatEdgeOp {
+                        pane: id,
+                        edge,
+                        dx,
+                        dy,
+                        window: area,
+                        limits,
+                    }));
+            }
         }
     }
 
-    /// Moves the captured divider to where the pointer is
+    /// Moves the captured divider to where the pointer is: one message per drag step
     fn drag_divider(&mut self, path: &[bool], axis: Axis) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -339,12 +367,12 @@ impl App {
             Axis::Horizontal => x,
             Axis::Vertical => y,
         };
-        if self
-            .layout
-            .set_divider(path, boundary.round() as i64, area, limits)
-        {
-            self.relayout(area);
-        }
+        self.server.send(Request::LayoutSetDivider(SetDividerOp {
+            path: path.to_vec(),
+            boundary: boundary.round() as i64,
+            area,
+            limits,
+        }));
     }
 
     /// Pointer position relative to the pane's corner
@@ -539,26 +567,7 @@ impl App {
                     self.begin_selection(idx);
                 }
             }
-            (MouseButton::Left, false) => {
-                if matches!(
-                    self.mouse.capture,
-                    Some(Capture::Divider(..) | Capture::FloatMove(_) | Capture::FloatResize(..))
-                ) {
-                    self.mouse.capture = None;
-                    self.update_pointer_icon();
-                    return;
-                }
-                let Some(idx) = self.captured_pane() else {
-                    return;
-                };
-                if self.panes[idx].reported == Some(mouse::Button::Left) {
-                    self.send_mouse(idx, mouse::Action::Release, Some(mouse::Button::Left));
-                    self.panes[idx].reported = None;
-                } else if self.panes[idx].selecting {
-                    self.finish_selection(idx);
-                }
-                self.release_capture(idx);
-            }
+            (MouseButton::Left, false) => self.on_left_released(),
             (MouseButton::Right, true) => {
                 let Some(idx) = hover else {
                     return;
@@ -597,6 +606,27 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The left button went up, whichever channel reported it: the window's mouse-up or
+    /// the device-level backstop (some setups eat the window-level release, and AppKit
+    /// then keeps delivering drags as if the button were still down). Ends a layout drag
+    /// or a pane's report or selection; running twice for one release is a no-op.
+    pub fn on_left_released(&mut self) {
+        if self.mouse.take_layout_drag() {
+            self.update_pointer_icon();
+            return;
+        }
+        let Some(idx) = self.captured_pane() else {
+            return;
+        };
+        if self.panes[idx].reported == Some(mouse::Button::Left) {
+            self.send_mouse(idx, mouse::Action::Release, Some(mouse::Button::Left));
+            self.panes[idx].reported = None;
+        } else if self.panes[idx].selecting {
+            self.finish_selection(idx);
+        }
+        self.release_capture(idx);
     }
 
     /// Once the pane no longer has a button pressed, it stops holding the mouse capture
@@ -1148,6 +1178,36 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn a_late_release_signal_clears_a_layout_drag_exactly_once() {
+        // The device-level release backstop and the window release can both fire for
+        // one physical release: the first clears the drag, the second must not re-arm
+        // or need the first's state
+        let mut mouse = MouseState::new().unwrap();
+        mouse.capture = Some(Capture::Divider(vec![], Axis::Horizontal));
+        assert!(mouse.take_layout_drag());
+        assert_eq!(mouse.capture, None);
+        assert!(!mouse.take_layout_drag());
+        assert_eq!(mouse.capture, None);
+
+        mouse.capture = Some(Capture::FloatMove(PaneId(7)));
+        assert!(mouse.take_layout_drag());
+        assert_eq!(mouse.capture, None);
+
+        mouse.capture = Some(Capture::FloatResize(PaneId(7), Edge::default()));
+        assert!(mouse.take_layout_drag());
+        assert_eq!(mouse.capture, None);
+
+        // A pane capture is not a layout drag: its release goes through the pane flow
+        mouse.capture = Some(Capture::Pane(PaneId(3)));
+        assert!(!mouse.take_layout_drag());
+        assert_eq!(mouse.capture, Some(Capture::Pane(PaneId(3))));
+
+        // Nothing held: the backstop is a no-op
+        mouse.capture = None;
+        assert!(!mouse.take_layout_drag());
     }
 
     fn terminal_with(input: &[u8]) -> libghostty_vt::Terminal<'static, 'static> {

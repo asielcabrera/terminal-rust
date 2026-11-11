@@ -2,7 +2,6 @@
 //! selection state. The app has one or more, arranged by `layout`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use libghostty_vt::mouse;
@@ -14,13 +13,12 @@ use libghostty_vt::terminal::{
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 use portable_pty::CommandBuilder;
-use winit::event_loop::EventLoopProxy;
 
+use crate::LuaEvent;
 use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
-use crate::pane_io::{IoEvent, Notify, PaneIo};
-use crate::server::ServerHandle;
-use crate::{LuaEvent, UserEvent};
+use crate::pane_io::PaneIo;
+use crate::server::CreatedPane;
 
 /// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
 /// events (redraw, close) interleave instead of waiting until the end.
@@ -123,7 +121,7 @@ fn runs_a_command(args: &[String]) -> bool {
 
 /// The shell with directory integration (see `ShellConfig::integration`) when applicable: it is
 /// PowerShell, integration is enabled, and the arguments do not already include a command
-fn with_integration(mut shell: ShellConfig) -> ShellConfig {
+pub(crate) fn with_integration(mut shell: ShellConfig) -> ShellConfig {
     let powershell = shell.program.as_deref().is_some_and(is_powershell);
     if shell.integration && powershell && !runs_a_command(&shell.args) {
         shell.args.extend([
@@ -234,20 +232,6 @@ fn terminal_dir(terminal: &Terminal<'static, 'static>) -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-/// What to launch, and where, for a new pane
-pub struct Spawn<'a> {
-    pub id: PaneId,
-    pub cols: u16,
-    pub rows: u16,
-    /// Program and arguments instead of the configured shell (a floating pane launched with
-    /// `program`). If it fails to start, it does not fall back to the default shell: no pane opens.
-    pub program: Option<(String, Vec<String>)>,
-    /// Working directory; if missing, `shell.cwd`
-    pub cwd: Option<PathBuf>,
-    /// Red notice (label and message) written before the shell starts
-    pub notice: Option<(&'a str, &'a str)>,
-}
-
 pub struct Pane {
     pub id: PaneId,
     pub terminal: Terminal<'static, 'static>,
@@ -270,25 +254,28 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Creates the terminal and asks `server` to launch the shell in a new block. The server wakes
-    /// the event loop with `UserEvent::PtyOutput(id)` / `ShellExited(id)`.
-    pub fn spawn(
+    /// Builds the window-side pane around a block the server already started: a layout op
+    /// reported it in a [`CreatedPane`]. `notice` is written into the terminal before anything
+    /// else (e.g. the configuration error of the first pane).
+    pub fn from_block(
         config: &Config,
-        server: &ServerHandle,
-        spawn: Spawn,
+        created: CreatedPane,
+        notice: Option<(&str, &str)>,
         lua_events: Sender<(PaneId, LuaEvent)>,
-        proxy: EventLoopProxy<UserEvent>,
     ) -> Result<Pane, String> {
-        let id = spawn.id;
+        let id = created.pane;
         let mut terminal = Terminal::new(TerminalOptions {
-            cols: spawn.cols,
-            rows: spawn.rows,
+            cols: created.cols,
+            rows: created.rows,
             max_scrollback: config.scrollback,
         })
         .map_err(vt_error)?;
         apply_theme(&mut terminal, config);
-        if let Some((tag, message)) = spawn.notice {
+        if let Some((tag, message)) = notice {
             write_notice(&mut terminal, tag, message);
+        }
+        if let Some(message) = &created.notice {
+            write_notice(&mut terminal, "shell", message);
         }
 
         // By default libghostty ignores the shell's queries. Their replies are queued here and the
@@ -317,42 +304,13 @@ impl Pane {
             })
             .map_err(vt_error)?;
 
-        // The shell (or the requested program). If the configured program cannot be started, a
-        // notice is shown and the default shell is used.
-        let explicit = spawn.program.is_some();
-        let mut shell = config.shell.clone();
-        if let Some((program, args)) = spawn.program {
-            shell.program = Some(program);
-            shell.args = args;
-        }
-        if let Some(cwd) = spawn.cwd {
-            shell.cwd = Some(cwd);
-        }
-        let notify: Notify = Arc::new(move |event| {
-            let _ = proxy.send_event(match event {
-                IoEvent::Output => UserEvent::PtyOutput(id),
-                IoEvent::Exited => UserEvent::ShellExited(id),
-            });
-        });
-        let (io, fallback) = server.create_block(
-            &with_integration(shell),
-            explicit,
-            spawn.cols,
-            spawn.rows,
-            config.scrollback,
-            notify,
-        )?;
-        if let Some(message) = fallback {
-            write_notice(&mut terminal, "shell", &message);
-        }
-
         Ok(Pane {
             id,
             terminal,
             render_state: RenderState::new().map_err(vt_error)?,
             rect: Rect::new(0, 0, 0, 0),
-            grid: (spawn.cols, spawn.rows),
-            io: Box::new(io),
+            grid: (created.cols, created.rows),
+            io: Box::new(created.block),
             replies,
             gesture: Gesture::new().map_err(vt_error)?,
             selecting: false,
