@@ -155,15 +155,15 @@ without any additional terms or conditions.
 	<tbody>
 		<tr>
             <td align="center">
-                <a href="https://github.com/cabrerasiel">
-                    <img src="https://avatars.githubusercontent.com/u/296233108?v=4" width="100;" alt="cabrerasiel"/>
+                <a href="https://github.com/asielcabrera">
+                    <img src="https://avatars.githubusercontent.com/u/24819851?v=4" width="100;" alt="asielcabrera"/>
                     <br />
                     <sub><b>Asiel Cabrera</b></sub>
                 </a>
             </td>
             <td align="center">
-                <a href="https://github.com/asielcabrera">
-                    <img src="https://avatars.githubusercontent.com/u/24819851?v=4" width="100;" alt="asielcabrera"/>
+                <a href="https://github.com/cabrerasiel">
+                    <img src="https://avatars.githubusercontent.com/u/296233108?v=4" width="100;" alt="cabrerasiel"/>
                     <br />
                     <sub><b>Asiel Cabrera</b></sub>
                 </a>
