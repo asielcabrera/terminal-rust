@@ -21,13 +21,14 @@ use std::time::{Duration, Instant};
 
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::{Terminal, TerminalOptions};
+use serde::{Deserialize, Serialize};
 
 use crate::config::ShellConfig;
 use crate::layout::{Closed, Dir, Edge, Layout, LayoutState, Limits, PaneId, Path, Rect};
 use crate::pane_io::{CHANNEL_CAPACITY, IoEvent, LocalPty, Notify, PaneIo};
 
 /// Identifies a block within its server
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub u64);
 
 /// A pane the server just created for a layout op: the server-allocated pane id, the block
@@ -201,6 +202,38 @@ pub(crate) enum Request {
     Shutdown,
 }
 
+impl fmt::Debug for Request {
+    /// Requests carry reply channels the debug output never needs; only the kind matters
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Request::Init { .. } => "Init(..)",
+            Request::LayoutSplit(_) => "LayoutSplit(..)",
+            Request::LayoutClose { .. } => "LayoutClose{..}",
+            Request::LayoutSetFocus { .. } => "LayoutSetFocus{..}",
+            Request::LayoutFocusDir(_) => "LayoutFocusDir(..)",
+            Request::LayoutFocusCycle { .. } => "LayoutFocusCycle{..}",
+            Request::LayoutResize(_) => "LayoutResize(..)",
+            Request::LayoutSetDivider(_) => "LayoutSetDivider(..)",
+            Request::LayoutToggleZoom => "LayoutToggleZoom",
+            Request::LayoutAddFloat(_) => "LayoutAddFloat(..)",
+            Request::LayoutToggleFloats => "LayoutToggleFloats",
+            Request::LayoutMoveFloat(_) => "LayoutMoveFloat(..)",
+            Request::LayoutResizeFloatEdge(_) => "LayoutResizeFloatEdge(..)",
+            #[cfg(test)]
+            Request::Create { .. } => "Create{..}",
+            Request::Write(_, _) => "Write(..)",
+            Request::Resize(_, _, _) => "Resize(..)",
+            Request::Kill(_) => "Kill(..)",
+            Request::Close(_) => "Close(..)",
+            Request::ForegroundDir(_, _) => "ForegroundDir(..)",
+            Request::Snapshot(_, _) => "Snapshot(..)",
+            Request::Drain(_) => "Drain(..)",
+            Request::Exited(_) => "Exited(..)",
+            Request::Shutdown => "Shutdown",
+        })
+    }
+}
+
 /// The state a block shares with its client ([`ServerBlock`])
 pub(crate) struct Client {
     notify: Notify,
@@ -263,7 +296,7 @@ impl Server {
             })
             .expect("could not start the terminal server thread");
         let handle = ServerHandle {
-            connection: Arc::new(Connection { requests }),
+            link: Arc::new(ServerLink::InProcess(Connection { requests })),
         };
         (handle, outgoing)
     }
@@ -813,7 +846,496 @@ fn exported_scrolling_region(bytes: &[u8]) -> (u16, u16) {
     region
 }
 
-/// Sends `Shutdown` when the last handle goes away
+// ---- The wire format (stage 3) -----------------------------------------------------------
+
+/// The wire format of the control channel: length-prefixed JSON, versioned, carrying the same
+/// ops and events the in-process channel carries today. Only the mapping lives here (framing
+/// included); the transport joins in stage 3. Everything in this module is dead until then.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the wire format goes live when the server process arrives in stage 3"
+    )
+)]
+pub(crate) mod wire {
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Serialize};
+
+    use crate::config::ShellConfig;
+    use crate::layout::{Dir, Edge, LayoutState, Limits, PaneId, Path, Rect};
+
+    use super::{BlockId, CreatedPane, LayoutEvent, Request};
+
+    /// `v` of the protocol; a client and a server whose versions differ refuse to talk
+    pub(crate) const WIRE_VERSION: u32 = 1;
+
+    /// Largest control frame accepted. A serialized state of a many-pane tree and a reply fit
+    /// with room to spare; anything larger is a corrupt length prefix, never a message.
+    pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+    /// One request for the server, versioned. `rid` names the sender's correlation id for the
+    /// requests that answer (foreground_dir, snapshot, init); the rest send `None`.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct WireRequest {
+        pub v: u32,
+        pub rid: Option<u64>,
+        pub op: WireOp,
+    }
+
+    /// What a request asks. Mirrors the in-process [`Request`] ops: the same layout mutations,
+    /// the block ops, and `Init`; the server-internal traffic (drains, exit notices,
+    /// shutdown, the test-only create) never travels, and a reply needs no request field.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    pub(crate) enum WireOp {
+        Init {
+            shell: WireShell,
+            cols: u16,
+            rows: u16,
+            scrollback: usize,
+        },
+        Split {
+            pane: PaneId,
+            dir: Dir,
+            shell: WireShell,
+            explicit: bool,
+            cols: u16,
+            rows: u16,
+            scrollback: usize,
+            area: Rect,
+            limits: Limits,
+        },
+        Close {
+            pane: PaneId,
+        },
+        SetFocus {
+            pane: PaneId,
+        },
+        FocusDir {
+            dir: Dir,
+            area: Rect,
+        },
+        FocusCycle {
+            forward: bool,
+        },
+        Resize {
+            pane: PaneId,
+            dir: Dir,
+            delta: u32,
+            area: Rect,
+            limits: Limits,
+        },
+        SetDivider {
+            path: Path,
+            boundary: i64,
+            area: Rect,
+            limits: Limits,
+        },
+        ToggleZoom,
+        AddFloat {
+            shell: WireShell,
+            explicit: bool,
+            width: f32,
+            height: f32,
+            cols: u16,
+            rows: u16,
+            scrollback: usize,
+        },
+        ToggleFloats,
+        MoveFloat {
+            pane: PaneId,
+            dx: i64,
+            dy: i64,
+            window: Rect,
+        },
+        ResizeFloatEdge {
+            pane: PaneId,
+            edge: Edge,
+            dx: i64,
+            dy: i64,
+            window: Rect,
+            limits: Limits,
+        },
+        Write {
+            block: BlockId,
+            bytes: Vec<u8>,
+        },
+        ResizeBlock {
+            block: BlockId,
+            cols: u16,
+            rows: u16,
+        },
+        Kill {
+            block: BlockId,
+        },
+        CloseBlock {
+            block: BlockId,
+        },
+        ForegroundDir {
+            block: BlockId,
+        },
+        Snapshot {
+            block: BlockId,
+        },
+    }
+
+    impl WireOp {
+        /// The wire form of a request that travels. Server-internal traffic (drains, exit
+        /// notices, shutdown) and the test-only create stay in the process.
+        pub(crate) fn from_request(request: &Request) -> Option<Self> {
+            let op = match request {
+                Request::Init {
+                    shell,
+                    cols,
+                    rows,
+                    scrollback,
+                    ..
+                } => Self::Init {
+                    shell: WireShell::from_config(shell),
+                    cols: *cols,
+                    rows: *rows,
+                    scrollback: *scrollback,
+                },
+                Request::LayoutSplit(op) => Self::Split {
+                    pane: op.pane,
+                    dir: op.dir,
+                    shell: WireShell::from_config(&op.shell),
+                    explicit: op.explicit,
+                    cols: op.cols,
+                    rows: op.rows,
+                    scrollback: op.scrollback,
+                    area: op.area,
+                    limits: op.limits,
+                },
+                Request::LayoutClose { pane } => Self::Close { pane: *pane },
+                Request::LayoutSetFocus { pane } => Self::SetFocus { pane: *pane },
+                Request::LayoutFocusDir(op) => Self::FocusDir {
+                    dir: op.dir,
+                    area: op.area,
+                },
+                Request::LayoutFocusCycle { forward } => Self::FocusCycle { forward: *forward },
+                Request::LayoutResize(op) => Self::Resize {
+                    pane: op.pane,
+                    dir: op.dir,
+                    delta: op.delta,
+                    area: op.area,
+                    limits: op.limits,
+                },
+                Request::LayoutSetDivider(op) => Self::SetDivider {
+                    path: op.path.clone(),
+                    boundary: op.boundary,
+                    area: op.area,
+                    limits: op.limits,
+                },
+                Request::LayoutToggleZoom => Self::ToggleZoom,
+                Request::LayoutAddFloat(op) => Self::AddFloat {
+                    shell: WireShell::from_config(&op.shell),
+                    explicit: op.explicit,
+                    width: op.width,
+                    height: op.height,
+                    cols: op.cols,
+                    rows: op.rows,
+                    scrollback: op.scrollback,
+                },
+                Request::LayoutToggleFloats => Self::ToggleFloats,
+                Request::LayoutMoveFloat(op) => Self::MoveFloat {
+                    pane: op.pane,
+                    dx: op.dx,
+                    dy: op.dy,
+                    window: op.window,
+                },
+                Request::LayoutResizeFloatEdge(op) => Self::ResizeFloatEdge {
+                    pane: op.pane,
+                    edge: op.edge,
+                    dx: op.dx,
+                    dy: op.dy,
+                    window: op.window,
+                    limits: op.limits,
+                },
+                Request::Write(id, bytes) => Self::Write {
+                    block: *id,
+                    bytes: bytes.clone(),
+                },
+                Request::Resize(id, cols, rows) => Self::ResizeBlock {
+                    block: *id,
+                    cols: *cols,
+                    rows: *rows,
+                },
+                Request::Kill(id) => Self::Kill { block: *id },
+                Request::Close(id) => Self::CloseBlock { block: *id },
+                Request::ForegroundDir(id, _) => Self::ForegroundDir { block: *id },
+                Request::Snapshot(id, _) => Self::Snapshot { block: *id },
+                // Not on the wire: the server's own plumbing and the test-only create
+                Request::Drain(_) | Request::Exited(_) | Request::Shutdown => return None,
+                #[cfg(test)]
+                Request::Create { .. } => return None,
+            };
+            Some(op)
+        }
+    }
+
+    /// A [`ShellConfig`] as it travels: same fields, wire-owned (config.rs stays untouched)
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct WireShell {
+        pub program: Option<String>,
+        pub args: Vec<String>,
+        pub cwd: Option<PathBuf>,
+        pub env: BTreeMap<String, String>,
+        pub integration: bool,
+    }
+
+    impl WireShell {
+        /// The wire form of a shell config
+        pub(crate) fn from_config(shell: &ShellConfig) -> Self {
+            Self {
+                program: shell.program.clone(),
+                args: shell.args.clone(),
+                cwd: shell.cwd.clone(),
+                env: shell.env.clone(),
+                integration: shell.integration,
+            }
+        }
+
+        /// Rebuilds the shell config on the server side
+        #[cfg_attr(
+            test,
+            expect(dead_code, reason = "the server side rebuilds shells in stage 3")
+        )]
+        pub(crate) fn into_config(self) -> ShellConfig {
+            ShellConfig {
+                program: self.program,
+                args: self.args,
+                cwd: self.cwd,
+                env: self.env,
+                integration: self.integration,
+            }
+        }
+    }
+
+    /// A pane the server just created, as it travels: the pane id, the size it was spawned at
+    /// and the fallback notice. The block itself does not ride the control channel: its token
+    /// and the screen snapshot arrive over the data channel (stage 3).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct IpcCreatedPane {
+        pub pane: PaneId,
+        pub cols: u16,
+        pub rows: u16,
+        pub notice: Option<String>,
+    }
+
+    impl IpcCreatedPane {
+        /// The wire form of a created pane
+        pub(crate) fn from_created(created: &CreatedPane) -> Self {
+            Self {
+                pane: created.pane,
+                cols: created.cols,
+                rows: created.rows,
+                notice: created.notice.clone(),
+            }
+        }
+    }
+
+    /// One answer from the server, correlated by `rid`
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct WireReply {
+        pub v: u32,
+        pub rid: u64,
+        pub reply: WireReplyKind,
+    }
+
+    impl WireReply {
+        /// Wraps any answer with the protocol version
+        fn new(rid: u64, reply: WireReplyKind) -> Self {
+            Self {
+                v: WIRE_VERSION,
+                rid,
+                reply,
+            }
+        }
+
+        /// The answer to `Init`: the first pane's state and its created pane, or why it refused
+        pub(crate) fn init(
+            rid: u64,
+            result: Result<(LayoutState, Option<CreatedPane>), String>,
+        ) -> Self {
+            Self::new(
+                rid,
+                result
+                    .map(|(state, created)| WireReplyKind::Init {
+                        state,
+                        created: created.as_ref().map(IpcCreatedPane::from_created),
+                    })
+                    .unwrap_or_else(|error| WireReplyKind::InitFailed { error }),
+            )
+        }
+
+        /// The answer to `ForegroundDir`
+        pub(crate) fn foreground_dir(rid: u64, dir: Option<PathBuf>) -> Self {
+            Self::new(rid, WireReplyKind::ForegroundDir { dir })
+        }
+
+        /// The answer to `Snapshot` (stage 3 carries it over the data channel instead, but the
+        /// shape is here so the control path can be tested end to end)
+        pub(crate) fn snapshot(rid: u64, bytes: Vec<u8>) -> Self {
+            Self::new(rid, WireReplyKind::Snapshot { bytes })
+        }
+    }
+
+    /// What a reply answers with
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "reply", rename_all = "snake_case")]
+    pub(crate) enum WireReplyKind {
+        Init {
+            state: LayoutState,
+            created: Option<IpcCreatedPane>,
+        },
+        InitFailed {
+            error: String,
+        },
+        ForegroundDir {
+            dir: Option<PathBuf>,
+        },
+        Snapshot {
+            bytes: Vec<u8>,
+        },
+    }
+
+    /// One event from the server, as the event drain maps it
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct WireEvent {
+        pub v: u32,
+        pub event: WireEventKind,
+    }
+
+    impl WireEvent {
+        /// The wire form of a layout event: exactly what the server broadcasts today, with the
+        /// created pane reduced to what travels (the block itself goes over the data channel)
+        pub(crate) fn from_layout_event(event: &LayoutEvent) -> Option<Self> {
+            let event = match event {
+                LayoutEvent::State(state, created) => WireEventKind::State {
+                    state: state.clone(),
+                    created: created.as_ref().map(IpcCreatedPane::from_created),
+                },
+                LayoutEvent::LastPaneClosed => WireEventKind::LastPaneClosed,
+                LayoutEvent::Error(error) => WireEventKind::Error {
+                    message: error.clone(),
+                },
+                LayoutEvent::PaneOutput(pane) => WireEventKind::PaneOutput { pane: *pane },
+                LayoutEvent::PaneExited(pane) => WireEventKind::PaneExited { pane: *pane },
+            };
+            Some(Self {
+                v: WIRE_VERSION,
+                event,
+            })
+        }
+    }
+
+    /// What an event reports
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "event", rename_all = "snake_case")]
+    pub(crate) enum WireEventKind {
+        State {
+            state: LayoutState,
+            created: Option<IpcCreatedPane>,
+        },
+        LastPaneClosed,
+        Error {
+            message: String,
+        },
+        PaneOutput {
+            pane: PaneId,
+        },
+        PaneExited {
+            pane: PaneId,
+        },
+    }
+
+    /// What decoding a frame can answer with
+    #[derive(Debug)]
+    pub(crate) enum WireError {
+        /// The length prefix is not a frame this protocol carries
+        Frame,
+        /// The JSON inside the frame did not decode
+        Json(serde_json::Error),
+    }
+
+    impl fmt::Display for WireError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                WireError::Frame => f.write_str("the control frame's length prefix is invalid"),
+                WireError::Json(error) => {
+                    write!(f, "the control message's JSON did not decode: {error}")
+                }
+            }
+        }
+    }
+
+    /// Frames one control message: 4-byte little-endian length followed by the message bytes
+    pub(crate) fn frame(message: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + message.len());
+        out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        out.extend_from_slice(message);
+        out
+    }
+
+    /// Reads the first framed message out of `buf`
+    pub(crate) fn deframe(buf: &[u8]) -> Deframed {
+        let Some(len) = buf
+            .first_chunk::<4>()
+            .map(|prefix| u32::from_le_bytes(*prefix) as usize)
+        else {
+            return Deframed::Incomplete;
+        };
+        if len > MAX_FRAME {
+            return Deframed::Invalid;
+        }
+        match buf.get(4..4 + len) {
+            Some(message) => Deframed::Message {
+                bytes: message.to_vec(),
+                consumed: 4 + len,
+            },
+            None => Deframed::Incomplete,
+        }
+    }
+
+    /// What [`deframe`] found in the buffer
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Deframed {
+        /// One complete message, plus how many bytes of the buffer it took
+        Message { bytes: Vec<u8>, consumed: usize },
+        /// The buffer does not hold a whole message yet: wait for more bytes
+        Incomplete,
+        /// The length prefix is not a frame this protocol carries: give up on the connection
+        Invalid,
+    }
+
+    /// Frames one control message as JSON
+    pub(crate) fn frame_json<T: serde::Serialize>(
+        message: &T,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        Ok(frame(&serde_json::to_vec(message)?))
+    }
+
+    /// Decodes the next JSON control message out of `buf`, if a whole framed message is there;
+    /// whatever follows stays for the next call
+    pub(crate) fn deframe_json<T: serde::de::DeserializeOwned>(
+        buf: &[u8],
+    ) -> Result<Option<(T, usize)>, WireError> {
+        match deframe(buf) {
+            Deframed::Incomplete => Ok(None),
+            Deframed::Invalid => Err(WireError::Frame),
+            Deframed::Message { bytes, consumed } => serde_json::from_slice(&bytes)
+                .map(|message| Some((message, consumed)))
+                .map_err(WireError::Json),
+        }
+    }
+}
+
+/// Sends `Shutdown` when the last holder of the in-process link goes away
 struct Connection {
     requests: Sender<Request>,
 }
@@ -824,23 +1346,95 @@ impl Drop for Connection {
     }
 }
 
-/// Cheap, cloneable access to the server thread
+/// How a handle reaches its server: in-process channels today. With the server process
+/// (stage 3) an IPC connection joins as another arm, and the same handles keep working: every
+/// fire-and-forget request crosses the link through [`ServerLink::send`], and every
+/// request-with-reply through the one boundary method for its reply kind.
+enum ServerLink {
+    /// The server thread of this very process
+    InProcess(Connection),
+}
+
+impl ServerLink {
+    /// The one boundary fire-and-forget requests cross. Errors are ignored: the server may be
+    /// gone, and then there is nothing to report to anyway.
+    fn send(&self, request: Request) {
+        match self {
+            ServerLink::InProcess(connection) => {
+                let _ = connection.requests.send(request);
+            }
+        }
+    }
+
+    /// The boundary for `Init`: creates the first pane and the authoritative layout. `None`
+    /// when the server is gone; the caller words that error.
+    fn ask_init(
+        &self,
+        shell: &ShellConfig,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> Option<Result<(LayoutState, CreatedPane), String>> {
+        match self {
+            ServerLink::InProcess(connection) => {
+                let (reply, answer) = channel();
+                connection
+                    .requests
+                    .send(Request::Init {
+                        shell: shell.clone(),
+                        cols,
+                        rows,
+                        scrollback,
+                        reply,
+                    })
+                    .ok()?;
+                answer.recv().ok()
+            }
+        }
+    }
+
+    /// The boundary for `Create` (tests only): starts a block outside the layout
+    #[cfg(test)]
+    fn ask_create(
+        &self,
+        client: Client,
+        shell: &ShellConfig,
+        explicit: bool,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> Option<Created> {
+        match self {
+            ServerLink::InProcess(connection) => {
+                let (reply, answer) = channel();
+                connection
+                    .requests
+                    .send(Request::Create {
+                        shell: shell.clone(),
+                        explicit,
+                        cols,
+                        rows,
+                        scrollback,
+                        client,
+                        reply,
+                    })
+                    .ok()?;
+                answer.recv().ok()
+            }
+        }
+    }
+}
+
+/// Cheap, cloneable access to the server thread, over its [`ServerLink`]
 #[derive(Clone)]
 pub struct ServerHandle {
-    connection: Arc<Connection>,
+    link: Arc<ServerLink>,
 }
 
 impl ServerHandle {
     /// Queues a message for the server thread; errors are ignored (the server may be gone)
     pub(crate) fn send(&self, request: Request) {
-        let _ = self.connection.requests.send(request);
-    }
-
-    /// Asks the server for an answer and waits for it; `None` if the server is gone
-    fn ask<T>(&self, request: impl FnOnce(Sender<T>) -> Request) -> Option<T> {
-        let (reply, answer) = channel();
-        self.send(request(reply));
-        answer.recv().ok()
+        self.link.send(request);
     }
 
     /// Creates the first pane and the authoritative layout. Called once, before the event loop
@@ -852,14 +1446,9 @@ impl ServerHandle {
         rows: u16,
         scrollback: usize,
     ) -> Result<(LayoutState, CreatedPane), String> {
-        self.ask(|reply| Request::Init {
-            shell: shell.clone(),
-            cols,
-            rows,
-            scrollback,
-            reply,
-        })
-        .ok_or_else(|| "the terminal server stopped".to_string())?
+        self.link
+            .ask_init(shell, cols, rows, scrollback)
+            .ok_or_else(|| "the terminal server stopped".to_string())?
     }
 
     /// Starts `shell` in a new block of `cols`×`rows`, with the same fallback and errors as
@@ -884,18 +1473,11 @@ impl ServerHandle {
             paused: paused.clone(),
         };
         let (id, output, notice) = self
-            .ask(|reply| Request::Create {
-                shell: shell.clone(),
-                explicit,
-                cols,
-                rows,
-                scrollback,
-                client,
-                reply,
-            })
+            .link
+            .ask_create(client, shell, explicit, cols, rows, scrollback)
             .ok_or_else(|| "the terminal server stopped".to_string())??;
         let block = ServerBlock {
-            requests: self.connection.requests.clone(),
+            requests: self.link_channel(),
             id,
             output,
             wake_pending,
@@ -903,6 +1485,14 @@ impl ServerHandle {
             notify,
         };
         Ok((block, notice))
+    }
+
+    /// The raw channel behind the link, for a block that sends its own requests
+    #[cfg(test)]
+    fn link_channel(&self) -> Sender<Request> {
+        match &*self.link {
+            ServerLink::InProcess(connection) => connection.requests.clone(),
+        }
     }
 }
 
@@ -917,7 +1507,9 @@ pub struct ServerBlock {
 }
 
 impl ServerBlock {
-    /// Asks the server for an answer and waits for it; `None` if the server is gone
+    /// Asks the server for an answer and waits for it; `None` if the server is gone. The one
+    /// ask boundary of a block: stage 3 keeps the same shape over IPC, with the answer
+    /// correlated by rid.
     fn ask<T>(&self, request: impl FnOnce(Sender<T>) -> Request) -> Option<T> {
         let (reply, answer) = channel();
         self.requests.send(request(reply)).ok()?;
@@ -1586,5 +2178,414 @@ mod tests {
             "no output notification follows the exit"
         );
         block.kill();
+    }
+
+    // ---- Wire format (stage 3) ------------------------------------------------------------
+    // The same ops and events travel over the wire as cross the in-process links today; these
+    // tests pin the JSON round trip so stage 3 can reuse the mapping without behavior drift.
+
+    use crate::layout::Axis;
+    use serde::{Serialize, de::DeserializeOwned};
+    use std::collections::BTreeMap;
+    use wire::{
+        Deframed, IpcCreatedPane, WIRE_VERSION, WireEvent, WireEventKind, WireOp, WireReply,
+        WireReplyKind, WireRequest, WireShell, deframe, deframe_json, frame, frame_json,
+    };
+
+    /// Encode, decode, and check nothing changed
+    fn round_trip<T>(original: T) -> T
+    where
+        T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_vec(&original).expect("serializes");
+        serde_json::from_slice(&json).expect("deserializes")
+    }
+
+    /// Shell config exercising every field
+    fn full_shell() -> ShellConfig {
+        ShellConfig {
+            program: Some("zsh".to_string()),
+            args: vec!["-l".to_string()],
+            cwd: Some(PathBuf::from("/tmp")),
+            env: BTreeMap::from([("TERM".to_string(), "xterm".to_string())]),
+            integration: true,
+        }
+    }
+
+    /// A representative request for each op that travels over the wire
+    fn wire_ops() -> Vec<WireOp> {
+        let limits = Limits {
+            min_w: 80,
+            min_h: 60,
+        };
+        vec![
+            WireOp::Init {
+                shell: WireShell::from_config(&full_shell()),
+                cols: 80,
+                rows: 24,
+                scrollback: 1000,
+            },
+            WireOp::Split {
+                pane: PaneId(3),
+                dir: Dir::Down,
+                shell: WireShell::from_config(&full_shell()),
+                explicit: true,
+                cols: 40,
+                rows: 20,
+                scrollback: 500,
+                area: Rect::new(1, 2, 300, 400),
+                limits,
+            },
+            WireOp::Close { pane: PaneId(1) },
+            WireOp::SetFocus { pane: PaneId(2) },
+            WireOp::FocusDir {
+                dir: Dir::Left,
+                area: Rect::new(0, 0, 800, 600),
+            },
+            WireOp::FocusCycle { forward: false },
+            WireOp::Resize {
+                pane: PaneId(4),
+                dir: Dir::Up,
+                delta: 33,
+                area: Rect::new(0, 0, 800, 600),
+                limits,
+            },
+            WireOp::SetDivider {
+                path: vec![false, true, true],
+                boundary: 512,
+                area: Rect::new(0, 0, 800, 600),
+                limits,
+            },
+            WireOp::ToggleZoom,
+            WireOp::AddFloat {
+                shell: WireShell::from_config(&full_shell()),
+                explicit: false,
+                width: 0.5,
+                height: 0.25,
+                cols: 60,
+                rows: 10,
+                scrollback: 0,
+            },
+            WireOp::ToggleFloats,
+            WireOp::MoveFloat {
+                pane: PaneId(5),
+                dx: -10,
+                dy: 24,
+                window: Rect::new(0, 0, 800, 600),
+            },
+            WireOp::ResizeFloatEdge {
+                pane: PaneId(6),
+                edge: Edge {
+                    left: true,
+                    right: true,
+                    top: false,
+                    bottom: true,
+                },
+                dx: 5,
+                dy: -7,
+                window: Rect::new(0, 0, 800, 600),
+                limits,
+            },
+            WireOp::Write {
+                block: BlockId(9),
+                bytes: vec![0x1b, 0xFF, 0x00, b'a'],
+            },
+            WireOp::ResizeBlock {
+                block: BlockId(9),
+                cols: 100,
+                rows: 40,
+            },
+            WireOp::Kill { block: BlockId(9) },
+            WireOp::CloseBlock { block: BlockId(9) },
+            WireOp::ForegroundDir { block: BlockId(2) },
+            WireOp::Snapshot { block: BlockId(2) },
+        ]
+    }
+
+    #[test]
+    fn wire_requests_carry_the_same_ops_the_in_process_channel_does() {
+        // A real request maps to exactly the wire op a client would have written
+        let request = Request::LayoutSplit(SplitOp {
+            pane: PaneId(0),
+            dir: Dir::Right,
+            shell: full_shell(),
+            explicit: true,
+            cols: 40,
+            rows: 20,
+            scrollback: 500,
+            area: Rect::new(1, 2, 300, 400),
+            limits: Limits {
+                min_w: 80,
+                min_h: 60,
+            },
+        });
+        assert_eq!(
+            WireOp::from_request(&request).expect("a layout split travels"),
+            WireOp::Split {
+                pane: PaneId(0),
+                dir: Dir::Right,
+                shell: WireShell::from_config(&full_shell()),
+                explicit: true,
+                cols: 40,
+                rows: 20,
+                scrollback: 500,
+                area: Rect::new(1, 2, 300, 400),
+                limits: Limits {
+                    min_w: 80,
+                    min_h: 60,
+                },
+            }
+        );
+
+        for request in [
+            Request::LayoutSetFocus { pane: PaneId(2) },
+            Request::LayoutToggleZoom,
+            Request::LayoutToggleFloats,
+            Request::LayoutFocusCycle { forward: true },
+            Request::Write(BlockId(3), vec![0xFF]),
+            Request::Resize(BlockId(3), 90, 30),
+            Request::Kill(BlockId(3)),
+            Request::Close(BlockId(3)),
+        ] {
+            WireOp::from_request(&request).unwrap_or_else(|| panic!("{request:?} travels"));
+        }
+
+        // Server-internal traffic does not travel
+        assert!(
+            WireOp::from_request(&Request::Shutdown).is_none(),
+            "shutdown stays in the process"
+        );
+
+        // Every op that travels survives JSON wrapped in the versioned envelope
+        for op in wire_ops() {
+            let request = WireRequest {
+                v: WIRE_VERSION,
+                rid: None,
+                op,
+            };
+            let json = serde_json::to_vec(&request).expect("serializes");
+            assert!(
+                String::from_utf8_lossy(&json).contains(&format!("\"v\":{WIRE_VERSION}")),
+                "the protocol version is pinned: {:?}",
+                String::from_utf8_lossy(&json)
+            );
+            assert_eq!(round_trip(request.clone()), request, "{request:?}");
+        }
+    }
+
+    #[test]
+    fn wire_requests_name_their_op_and_a_rid_survives_the_round_trip() {
+        let request = WireRequest {
+            v: WIRE_VERSION,
+            rid: Some(42),
+            op: WireOp::Snapshot { block: BlockId(1) },
+        };
+        let json = serde_json::to_string(&request).expect("serializes");
+        assert!(json.starts_with("{\"v\":1"), "{json}");
+        assert!(json.contains("\"op\":\"snapshot\""), "{json}");
+        assert_eq!(round_trip(request.clone()), request);
+    }
+
+    #[test]
+    fn the_layout_state_survives_the_wire() {
+        // A nested tree with zoom, floats and history: every field of LayoutState
+        let mut layout = Layout::new(PaneId(1));
+        assert!(layout.split(
+            PaneId(1),
+            Axis::Horizontal,
+            PaneId(2),
+            Rect::new(0, 0, 800, 600),
+            Limits {
+                min_w: 80,
+                min_h: 60,
+            }
+        ));
+        assert!(layout.split(
+            PaneId(2),
+            Axis::Vertical,
+            PaneId(3),
+            Rect::new(0, 0, 800, 600),
+            Limits {
+                min_w: 80,
+                min_h: 60,
+            }
+        ));
+        assert!(layout.toggle_zoom());
+        layout.add_float(PaneId(4), 0.5, 0.5);
+        assert!(layout.toggle_floats());
+        assert!(layout.set_focus(PaneId(3)));
+
+        let state = layout.state();
+        assert_eq!(state.zoomed, Some(PaneId(3)));
+        assert_eq!(state.floats.len(), 1);
+        assert!(!state.floats_visible);
+
+        let json = serde_json::to_string(&state).expect("serializes");
+        assert!(json.contains("\"root\""), "{json}");
+        let back: LayoutState = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, state, "the state round trips field for field");
+        // And a projection rebuilt from a decoded state answers exactly like the original
+        assert_eq!(Layout::from_state(back).state(), state);
+    }
+
+    #[test]
+    fn wire_events_map_layout_events_without_the_block() {
+        // A created pane carries its block in-process; on the wire only pane, size and notice go
+        let (server, _events) = Server::start();
+        let (block, notice, _rx) =
+            create(&server, &shell("no-such-program-wire", &[]), false).expect("the fallback");
+        let created = CreatedPane {
+            pane: PaneId(7),
+            block,
+            cols: 80,
+            rows: 24,
+            notice,
+        };
+        let layout = Layout::new(PaneId(7));
+        let state = layout.state();
+
+        let event = WireEvent::from_layout_event(&LayoutEvent::State(state.clone(), Some(created)))
+            .expect("a state event travels");
+        let WireEventKind::State {
+            state: wire_state,
+            created: wire_created,
+        } = &event.event
+        else {
+            panic!("mapped to a state event: {event:?}");
+        };
+        assert_eq!(wire_state, &state, "the state travels whole");
+        let wire_created = wire_created.as_ref().expect("the created pane travels");
+        assert_eq!(wire_created.pane, PaneId(7));
+        assert_eq!(wire_created.cols, 80);
+        assert_eq!(wire_created.rows, 24);
+        let notice = wire_created
+            .notice
+            .clone()
+            .expect("the fallback notice travels");
+        assert!(notice.ends_with("; using the default shell"), "{notice}");
+        assert_eq!(round_trip(event.clone()), event);
+        assert!(
+            serde_json::to_string(&event)
+                .unwrap()
+                .contains("\"event\":\"state\""),
+            "events name their kind"
+        );
+
+        // A state event with no created pane, and the other kinds, map and round trip too
+        for event in [
+            WireEvent::from_layout_event(&LayoutEvent::State(layout.state(), None))
+                .expect("travels"),
+            WireEvent::from_layout_event(&LayoutEvent::LastPaneClosed).expect("travels"),
+            WireEvent::from_layout_event(&LayoutEvent::Error("boom".to_string())).expect("travels"),
+            WireEvent::from_layout_event(&LayoutEvent::PaneOutput(PaneId(1))).expect("travels"),
+            WireEvent::from_layout_event(&LayoutEvent::PaneExited(PaneId(1))).expect("travels"),
+        ] {
+            assert_eq!(round_trip(event.clone()), event, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn wire_replies_carry_the_state_with_a_blockless_created_pane() {
+        let (server, _events) = Server::start();
+        let (block, notice, _rx) =
+            create(&server, &shell("no-such-program-wire-reply", &[]), false)
+                .expect("the fallback");
+        let created = CreatedPane {
+            pane: PaneId(7),
+            block,
+            cols: 80,
+            rows: 24,
+            notice,
+        };
+        // What the wire should carry for this pane: pane, size and notice, nothing else
+        let expected = IpcCreatedPane::from_created(&created);
+        let reply = WireReply::init(11, Ok((Layout::new(PaneId(7)).state(), Some(created))));
+        assert_eq!(reply.rid, 11);
+        assert_eq!(reply.v, WIRE_VERSION);
+        let json = serde_json::to_string(&reply).expect("serializes");
+        assert!(json.contains("\"reply\":\"init\""), "{json}");
+        assert!(!json.contains("block"), "the block does not travel: {json}");
+        assert_eq!(round_trip(reply.clone()), reply);
+        // The decoded created pane is exactly what the window needs to size its pane
+        let WireReplyKind::Init {
+            state,
+            created: Some(wire_created),
+        } = reply.reply
+        else {
+            panic!("an init reply");
+        };
+        assert_eq!(state.focus, PaneId(7));
+        assert_eq!(
+            wire_created, expected,
+            "the created pane carries pane, size and notice only"
+        );
+        let notice = wire_created.notice.expect("the fallback notice travels");
+        assert!(notice.ends_with("; using the default shell"), "{notice}");
+
+        // The failure of an init, the foreground directory and bytes that are not UTF-8 too
+        let failed = WireReply::init(12, Err("did not start".to_string()));
+        assert_eq!(round_trip(failed.clone()), failed);
+        match failed.reply {
+            WireReplyKind::InitFailed { error } => assert_eq!(error, "did not start"),
+            other => panic!("an init failure: {other:?}"),
+        }
+        let dir = WireReply::foreground_dir(13, Some(PathBuf::from("/home")));
+        assert_eq!(round_trip(dir.clone()), dir);
+        let snapshot = WireReply::snapshot(14, vec![0xFF, b'\x1b', 0x00]);
+        assert_eq!(round_trip(snapshot.clone()), snapshot);
+    }
+
+    #[test]
+    fn frames_carry_whole_messages_and_reject_corrupt_lengths() {
+        // A frame round trips
+        let framed = frame(b"hello wire");
+        assert_eq!(&framed[..4], &10u32.to_le_bytes(), "4-byte LE length first");
+        match deframe(&framed) {
+            Deframed::Message { bytes, consumed } => {
+                assert_eq!(bytes, b"hello wire");
+                assert_eq!(consumed, framed.len());
+            }
+            other => panic!("decodes the frame: {other:?}"),
+        }
+
+        // Two frames in one buffer decode one at a time
+        let two = [framed.clone(), frame(b"{}")].concat();
+        let (first, used) = match deframe(&two) {
+            Deframed::Message { bytes, consumed } => (bytes, consumed),
+            other => panic!("decodes the first: {other:?}"),
+        };
+        assert_eq!(first, b"hello wire");
+        match deframe(&two[used..]) {
+            Deframed::Message { bytes, consumed } => {
+                assert_eq!(bytes, b"{}");
+                assert_eq!(consumed, two.len() - used);
+            }
+            other => panic!("decodes the second: {other:?}"),
+        }
+
+        // Incomplete frames wait for more bytes
+        assert_eq!(deframe(&framed[..3]), Deframed::Incomplete);
+        assert_eq!(deframe(&framed[..framed.len() - 1]), Deframed::Incomplete);
+
+        // A length over the protocol cap is refused, never waited for
+        assert_eq!(deframe(&u32::MAX.to_le_bytes()), Deframed::Invalid);
+
+        // And the JSON helpers compose them
+        let request = WireRequest {
+            v: WIRE_VERSION,
+            rid: Some(1),
+            op: WireOp::FocusCycle { forward: true },
+        };
+        let mut wire = frame_json(&request).expect("serializes");
+        wire.extend_from_slice(&frame_json(&request).expect("serializes"));
+        let (first, used) = deframe_json::<WireRequest>(&wire)
+            .expect("decodes")
+            .expect("a whole message");
+        assert_eq!(first, request);
+        let (second, rest) = deframe_json::<WireRequest>(&wire[used..])
+            .expect("decodes")
+            .expect("a whole message");
+        assert_eq!(second, request);
+        assert_eq!(used + rest, wire.len());
     }
 }
