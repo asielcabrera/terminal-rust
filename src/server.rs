@@ -358,7 +358,6 @@ impl Server {
                     self.maybe_exit(id, finished);
                 }
                 Request::Exited(id) => {
-                    eprintln!("[exit-debug] Exited request block={id:?}");
                     // The last thing the program wrote goes before the exit: the notice waits
                     // until every chunk was forwarded
                     if let Some(block) = self.blocks.get_mut(&id)
@@ -694,7 +693,6 @@ impl Server {
             return false;
         }
         if block.pty.output_finished() || requested.elapsed() >= EXIT_GRACE {
-            eprintln!("[exit-debug] maybe_exit fires block={id:?} finished={finished}");
             block.exit_requested = None;
             (block.client.notify)(IoEvent::Exited);
             return true;
@@ -1251,7 +1249,8 @@ mod tests {
         let (server, events) = Server::start();
         let _ = init(&server);
         // The program exits immediately: its output and exit are queued while the split is
-        // applied, so the event order proves State always announces a pane first
+        // applied, so the event order proves State always announces a pane first (State, then
+        // the pane's output, then its exit)
         split(
             &server,
             PaneId(0),
@@ -1259,83 +1258,52 @@ mod tests {
             Rect::new(0, 0, 800, 600),
         );
 
-        let mut seen = Vec::new();
-        // 10s: a cold Windows CI can take a while to spawn cmd.exe, tear down ConPTY and ride
-        // out the exit-notice grace; the assertion only needs the order, not the timing
+        // The test plays the client's role for the spawned pane, including answering ConPTY's
+        // cursor-position query: an unanswered one keeps the child's teardown from completing on
+        // Windows, so the exit would never be reported
+        let mut created: Option<CreatedPane> = None;
+        let mut state_tick = None;
+        let mut output_tick = None;
+        let mut exit_tick = None;
+        // 10s: a cold Windows CI takes a while to spawn cmd.exe and tear down ConPTY; the
+        // assertion only needs the order, not the timing
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        let mut tick = 0usize;
+        while exit_tick.is_none() && Instant::now() < deadline {
             match events.recv_timeout(Duration::from_millis(50)) {
-                Ok(event) => seen.push(event),
-                Err(_) if Instant::now() >= deadline => break,
+                Ok(LayoutEvent::State(_, mut pane)) => match pane.take() {
+                    Some(created_pane) => {
+                        assert_eq!(created_pane.pane, PaneId(1), "the split creates pane 1");
+                        created = Some(created_pane);
+                        state_tick = Some(tick);
+                    }
+                    None => panic!("the split reports its pane"),
+                },
+                Ok(LayoutEvent::PaneOutput(PaneId(1))) => output_tick = Some(tick),
+                Ok(LayoutEvent::PaneExited(PaneId(1))) => exit_tick = Some(tick),
+                Ok(_) => {}
                 Err(_) => {}
             }
-            if seen
-                .iter()
-                .any(|event| matches!(event, LayoutEvent::PaneExited(PaneId(1))))
-            {
-                break;
-            }
-        }
-
-        let (state_pos, mut created) = {
-            // Keep the CreatedPane so the failure dump can read its notice and output
-            let seen_pos = seen
-                .iter()
-                .position(|event| {
-                    matches!(
-                        event,
-                        LayoutEvent::State(_, Some(created)) if created.pane == PaneId(1)
-                    )
-                })
-                .expect("the split reports its pane");
-            match &mut seen[seen_pos] {
-                LayoutEvent::State(_, created) => (seen_pos, created.take()),
-                _ => unreachable!(),
-            }
-        };
-        if let Some(output_pos) = seen
-            .iter()
-            .position(|event| matches!(event, LayoutEvent::PaneOutput(PaneId(1))))
-        {
-            assert!(output_pos > state_pos, "output arrived before the state");
-        }
-        // Dump what the probe saw when the exit is missing: the events list is the diagnosis
-        let dump: Vec<String> = seen
-            .iter()
-            .map(|event| match event {
-                LayoutEvent::State(_, created) => match created {
-                    Some(created) => format!("State(created pane {:?})", created.pane),
-                    None => "State(no created)".to_string(),
-                },
-                LayoutEvent::LastPaneClosed => "LastPaneClosed".to_string(),
-                LayoutEvent::Error(error) => format!("Error({error})"),
-                LayoutEvent::PaneOutput(pane) => format!("PaneOutput({pane:?})"),
-                LayoutEvent::PaneExited(pane) => format!("PaneExited({pane:?})"),
-            })
-            .collect();
-        let exit_pos = seen
-            .iter()
-            .position(|event| matches!(event, LayoutEvent::PaneExited(PaneId(1))))
-            .unwrap_or_else(|| {
-                // What the split's block produced says whether echo ran at all (and whether the
-                // spawned program fell back to the default shell), so the dump carries it
-                let mut block_output = Vec::new();
-                let notice = created.as_ref().and_then(|created| created.notice.clone());
-                if let Some(block) = created.as_mut().map(|created| &mut created.block) {
-                    for _ in 0..16 {
-                        #[allow(clippy::single_match)]
-                        match block.try_read() {
-                            Some(chunk) => block_output.extend(chunk),
-                            None => break,
-                        }
+            tick += 1;
+            // Drain the pane's output and answer the cursor query, as the app does
+            if let Some(block) = created.as_mut().map(|created| &mut created.block) {
+                #[cfg(unix)]
+                block.rearm();
+                while let Some(chunk) = block.try_read() {
+                    if chunk.windows(4).any(|query| query == b"\x1b[6n") {
+                        block.write(b"\x1b[1;1R");
                     }
                 }
-                panic!(
-                    "the program exits; saw {dump:?} notice={notice:?} block-output={:?}",
-                    String::from_utf8_lossy(&block_output)
-                );
-            });
-        assert!(exit_pos > state_pos, "the exit arrived before the state");
+            }
+        }
+        drop(created);
+
+        let state_tick = state_tick.expect("the split reports its pane");
+        if let Some(output_tick) = output_tick {
+            assert!(output_tick > state_tick, "output arrived before the state");
+        }
+        let exit_tick = exit_tick.expect("the exit is reported");
+        assert!(exit_tick > state_tick, "the exit arrived before the state");
     }
 
     #[test]
