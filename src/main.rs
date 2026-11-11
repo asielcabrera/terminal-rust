@@ -37,7 +37,7 @@ use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows, Win
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, KeyEvent, StartCause, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, KeyEvent, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{KeyCode, PhysicalKey},
     window::{Fullscreen, Window, WindowId},
@@ -1075,6 +1075,28 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Layout(LayoutEvent::PaneOutput(id)) => self.drain_pty(event_loop, id),
             UserEvent::Layout(LayoutEvent::PaneExited(id)) => self.shell_exited(event_loop, id),
             UserEvent::ConfigChanged => self.reload_config(event_loop),
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Some setups (window managers, event taps) eat the window-level mouse-up, so
+        // AppKit never routes `WindowEvent::MouseInput Released` to the view and a
+        // dragged divider or selection would follow the pointer forever. The device-level
+        // button event is dispatched from NSApplication's sendEvent before window
+        // routing, so it survives: treat a device-level left release (button 0) as the
+        // authoritative release. Both channels fire for one physical release; the second
+        // call is a no-op.
+        if let DeviceEvent::Button {
+            button: 0,
+            state: ElementState::Released,
+        } = event
+        {
+            self.on_left_released();
         }
     }
 
