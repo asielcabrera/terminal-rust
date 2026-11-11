@@ -358,6 +358,7 @@ impl Server {
                     self.maybe_exit(id, finished);
                 }
                 Request::Exited(id) => {
+                    eprintln!("[exit-debug] Exited request block={id:?}");
                     // The last thing the program wrote goes before the exit: the notice waits
                     // until every chunk was forwarded
                     if let Some(block) = self.blocks.get_mut(&id)
@@ -693,6 +694,7 @@ impl Server {
             return false;
         }
         if block.pty.output_finished() || requested.elapsed() >= EXIT_GRACE {
+            eprintln!("[exit-debug] maybe_exit fires block={id:?} finished={finished}");
             block.exit_requested = None;
             (block.client.notify)(IoEvent::Exited);
             return true;
