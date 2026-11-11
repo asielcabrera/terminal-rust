@@ -267,7 +267,14 @@ mod tests {
         while pending(&String::from_utf8_lossy(&output)) && Instant::now() < deadline {
             io.rearm();
             match io.try_read() {
-                Some(chunk) => output.extend(chunk),
+                Some(chunk) => {
+                    // ConPTY asks for the cursor position at startup and shows nothing until the
+                    // terminal answers; in the app libghostty answers, here the test does
+                    if chunk.windows(4).any(|query| query == b"\x1b[6n") {
+                        io.write(b"\x1b[1;1R");
+                    }
+                    output.extend(chunk);
+                }
                 None => std::thread::sleep(Duration::from_millis(10)),
             }
         }
