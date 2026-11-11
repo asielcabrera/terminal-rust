@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::{Terminal, TerminalOptions};
@@ -27,6 +28,10 @@ pub struct BlockId(pub u64);
 /// Chunks forwarded per drain request; past that the block queues another request so the other
 /// blocks' messages interleave
 const MAX_CHUNKS_PER_DRAIN: usize = 16;
+
+/// How long the exit notice waits for the reader thread to close the output channel before it
+/// reports the exit anyway (ConPTY can keep the pipe open forever after the child dies)
+const EXIT_GRACE: Duration = Duration::from_millis(250);
 
 /// What the server answers to a create request: the block and its output channel, plus the
 /// fallback notice
@@ -76,8 +81,8 @@ struct Block {
     output: SyncSender<Vec<u8>>,
     /// The chunk that did not fit in `output`; it goes first when the client reads
     pending: Option<Vec<u8>>,
-    /// The program exited and the exit notice waits until every chunk was forwarded
-    exiting: bool,
+    /// When the program's exit was noticed; the exit notice waits until every chunk was forwarded
+    exit_requested: Option<Instant>,
     client: Client,
 }
 
@@ -171,11 +176,24 @@ impl Server {
                 Request::Exited(id) => {
                     // The last thing the program wrote goes before the exit: the notice waits
                     // until every chunk was forwarded
-                    if let Some(block) = self.blocks.get_mut(&id) {
-                        block.exiting = true;
+                    if let Some(block) = self.blocks.get_mut(&id)
+                        && block.exit_requested.is_none()
+                    {
+                        block.exit_requested = Some(Instant::now());
+                    } // The reader usually closes right after the child dies, which fires the exit
+                    // on the next drain. ConPTY can keep the pipe open forever, so wait a bounded
+                    // grace for it while the block is drained
+                    let grace = Instant::now() + EXIT_GRACE;
+                    loop {
+                        let finished = self.drain(id);
+                        if self.maybe_exit(id, finished) || !finished {
+                            break; // reported, or paused: a later drain (a client read) re-checks
+                        }
+                        if Instant::now() >= grace {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
                     }
-                    let finished = self.drain(id);
-                    self.maybe_exit(id, finished);
                 }
                 Request::Shutdown => break,
             }
@@ -224,7 +242,7 @@ impl Server {
                 terminal,
                 output,
                 pending: None,
-                exiting: false,
+                exit_requested: None,
                 client,
             },
         );
@@ -273,17 +291,26 @@ impl Server {
         finished
     }
 
-    /// Reports the exit to the client, but only once every chunk was forwarded: `exiting` is set
-    /// by the PTY's exit notice, `finished` says this drain emptied the block, and the reader
-    /// thread only closes the output channel after its last chunk.
-    fn maybe_exit(&mut self, id: BlockId, finished: bool) {
+    /// Reports the exit to the client, but only once every chunk was forwarded: `exit_requested`
+    /// is set by the PTY's exit notice and `finished` says this drain emptied the block. The
+    /// reader thread only closes the output channel after its last chunk, but ConPTY can keep the
+    /// channel open forever after the child dies, so the notice also fires after a grace period.
+    fn maybe_exit(&mut self, id: BlockId, finished: bool) -> bool {
         let Some(block) = self.blocks.get_mut(&id) else {
-            return;
+            return false;
         };
-        if finished && block.exiting && block.pty.output_finished() {
-            block.exiting = false;
-            (block.client.notify)(IoEvent::Exited);
+        let Some(requested) = block.exit_requested else {
+            return false;
+        };
+        if !finished {
+            return false;
         }
+        if block.pty.output_finished() || requested.elapsed() >= EXIT_GRACE {
+            block.exit_requested = None;
+            (block.client.notify)(IoEvent::Exited);
+            return true;
+        }
+        false
     }
 }
 
