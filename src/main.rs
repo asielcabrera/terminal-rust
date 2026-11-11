@@ -2,6 +2,7 @@ mod actions;
 mod blink;
 mod config;
 mod glyphs;
+mod icon;
 mod layout;
 mod mouse;
 mod pane;
@@ -100,6 +101,30 @@ fn corner_preference(rounded: bool) -> CornerPreference {
     } else {
         CornerPreference::DoNotRound
     }
+}
+
+/// El icono de la aplicación a `size`×`size` para winit (barra de título y de tareas)
+fn window_icon(size: u32) -> Option<winit::window::Icon> {
+    winit::window::Icon::from_rgba(icon::rgba(size), size, size).ok()
+}
+
+/// Pone el icono en el Dock y en el selector de aplicaciones (Cmd+Tab). Sin un bundle `.app` macOS
+/// muestra el de un ejecutable genérico; esto lo cambia mientras la aplicación está abierta.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(&icon::ico(&[256, 128, 64, 32, 16]));
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // SAFETY: called on the main thread, after winit created the shared NSApplication
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
 }
 
 struct App {
@@ -968,7 +993,14 @@ impl ApplicationHandler<UserEvent> for App {
             let decorated = self.config.window.decorations == config::Decorations::Full;
             let attrs = Window::default_attributes()
                 .with_title(self.window_title())
-                .with_decorations(decorated);
+                .with_decorations(decorated)
+                .with_window_icon(window_icon(64));
+            // La barra de tareas usa un icono grande aparte del de la barra de título
+            #[cfg(windows)]
+            let attrs = attrs.with_taskbar_icon(window_icon(256));
+            // macOS ignora el icono de la ventana: el del Dock es el de la aplicación
+            #[cfg(target_os = "macos")]
+            set_dock_icon();
             // Sin barra, la sombra del sistema es lo que separa la ventana del fondo
             #[cfg(windows)]
             let attrs = attrs
