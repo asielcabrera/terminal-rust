@@ -2069,7 +2069,6 @@ mod windows_pipe {
     use std::ffi::OsStr;
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
 
     type Handle = isize;
 
@@ -2099,7 +2098,6 @@ mod windows_pipe {
             security: *const core::ffi::c_void,
         ) -> Handle;
         fn ConnectNamedPipe(handle: Handle, overlapped: *const core::ffi::c_void) -> i32;
-        fn DisconnectNamedPipe(handle: Handle) -> i32;
         fn CreateFileW(
             name: *const u16,
             access: u32,
@@ -3248,7 +3246,7 @@ impl IpcConn {
         not(test),
         expect(
             dead_code,
-            reason = "the window's process exit ends the connection; the explicit close is for tests"
+            reason = "the window's process exit ends the connection; the explicit close is test-only today"
         )
     )]
     pub fn close(&self) {
