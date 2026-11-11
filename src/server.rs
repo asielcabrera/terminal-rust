@@ -1277,15 +1277,22 @@ mod tests {
             }
         }
 
-        let state_pos = seen
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    LayoutEvent::State(_, Some(created)) if created.pane == PaneId(1)
-                )
-            })
-            .expect("the split reports its pane");
+        let (state_pos, mut created) = {
+            // Keep the CreatedPane so the failure dump can read its notice and output
+            let seen_pos = seen
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        LayoutEvent::State(_, Some(created)) if created.pane == PaneId(1)
+                    )
+                })
+                .expect("the split reports its pane");
+            match &mut seen[seen_pos] {
+                LayoutEvent::State(_, created) => (seen_pos, created.take()),
+                _ => unreachable!(),
+            }
+        };
         if let Some(output_pos) = seen
             .iter()
             .position(|event| matches!(event, LayoutEvent::PaneOutput(PaneId(1))))
@@ -1309,7 +1316,25 @@ mod tests {
         let exit_pos = seen
             .iter()
             .position(|event| matches!(event, LayoutEvent::PaneExited(PaneId(1))))
-            .unwrap_or_else(|| panic!("the program exits; saw {dump:?}"));
+            .unwrap_or_else(|| {
+                // What the split's block produced says whether echo ran at all (and whether the
+                // spawned program fell back to the default shell), so the dump carries it
+                let mut block_output = Vec::new();
+                let notice = created.as_ref().and_then(|created| created.notice.clone());
+                if let Some(block) = created.as_mut().map(|created| &mut created.block) {
+                    for _ in 0..16 {
+                        #[allow(clippy::single_match)]
+                        match block.try_read() {
+                            Some(chunk) => block_output.extend(chunk),
+                            None => break,
+                        }
+                    }
+                }
+                panic!(
+                    "the program exits; saw {dump:?} notice={notice:?} block-output={:?}",
+                    String::from_utf8_lossy(&block_output)
+                );
+            });
         assert!(exit_pos > state_pos, "the exit arrived before the state");
     }
 
