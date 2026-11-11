@@ -162,7 +162,11 @@ impl LocalPty {
             let notify = notify.clone();
             move || {
                 let mut child = child;
+                #[cfg(windows)]
+                eprintln!("[pty-debug] waiter waiting for the child");
                 let _ = child.wait();
+                #[cfg(windows)]
+                eprintln!("[pty-debug] waiter: child.wait() returned");
                 notify(IoEvent::Exited);
             }
         });
