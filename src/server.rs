@@ -656,7 +656,8 @@ mod tests {
         // screen never scrolls, which is slow in debug builds of libghostty.
         let flood = running(
             "yes \"$(printf 'flood\\033[H')\"",
-            "powershell -NoProfile -Command \"while($true){[Console]::Out.Write(('flood' + [char]27 + '[H') * 40000)}\"",
+            // decodes to: while($true){[Console]::Out.Write(('flood' + [char]27 + '[H') * 40000)}
+            "powershell -NoProfile -EncodedCommand dwBoAGkAbABlACgAJAB0AHIAdQBlACkAewBbAEMAbwBuAHMAbwBsAGUAXQA6ADoATwB1AHQALgBXAHIAaQB0AGUAKAAoACcAZgBsAG8AbwBkACcAIAArACAAWwBjAGgAYQByAF0AMgA3ACAAKwAgACcAWwBIACcAKQAgACoAIAA0ADAAMAAwADAAKQB9AA==",
         );
         let (mut flooding, _, flood_events) = create(&server, &flood, true).unwrap();
         assert!(wait_for(&flood_events, IoEvent::Output));
