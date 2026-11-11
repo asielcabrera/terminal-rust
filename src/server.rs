@@ -2087,7 +2087,7 @@ mod windows_pipe {
     const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
     const WAIT_BUSY_MS: u32 = 2_000;
 
-    extern "system" {
+    unsafe extern "system" {
         fn CreateNamedPipeW(
             name: *const u16,
             open_mode: u32,
