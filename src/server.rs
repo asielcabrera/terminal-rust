@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::{Terminal, TerminalOptions};
@@ -27,6 +28,10 @@ pub struct BlockId(pub u64);
 /// Chunks forwarded per drain request; past that the block queues another request so the other
 /// blocks' messages interleave
 const MAX_CHUNKS_PER_DRAIN: usize = 16;
+
+/// How long the exit notice waits for the reader thread to close the output channel before it
+/// reports the exit anyway (ConPTY can keep the pipe open forever after the child dies)
+const EXIT_GRACE: Duration = Duration::from_millis(250);
 
 /// What the server answers to a create request: the block and its output channel, plus the
 /// fallback notice
@@ -76,6 +81,8 @@ struct Block {
     output: SyncSender<Vec<u8>>,
     /// The chunk that did not fit in `output`; it goes first when the client reads
     pending: Option<Vec<u8>>,
+    /// When the program's exit was noticed; the exit notice waits until every chunk was forwarded
+    exit_requested: Option<Instant>,
     client: Client,
 }
 
@@ -162,12 +169,30 @@ impl Server {
                         .unwrap_or_default();
                     let _ = reply.send(bytes);
                 }
-                Request::Drain(id) => self.drain(id),
+                Request::Drain(id) => {
+                    let finished = self.drain(id);
+                    self.maybe_exit(id, finished);
+                }
                 Request::Exited(id) => {
-                    // The last thing the program wrote goes before the exit
-                    self.drain(id);
-                    if let Some(block) = self.blocks.get(&id) {
-                        (block.client.notify)(IoEvent::Exited);
+                    // The last thing the program wrote goes before the exit: the notice waits
+                    // until every chunk was forwarded
+                    if let Some(block) = self.blocks.get_mut(&id)
+                        && block.exit_requested.is_none()
+                    {
+                        block.exit_requested = Some(Instant::now());
+                    } // The reader usually closes right after the child dies, which fires the exit
+                    // on the next drain. ConPTY can keep the pipe open forever, so wait a bounded
+                    // grace for it while the block is drained
+                    let grace = Instant::now() + EXIT_GRACE;
+                    loop {
+                        let finished = self.drain(id);
+                        if self.maybe_exit(id, finished) || !finished {
+                            break; // reported, or paused: a later drain (a client read) re-checks
+                        }
+                        if Instant::now() >= grace {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
                     }
                 }
                 Request::Shutdown => break,
@@ -217,6 +242,7 @@ impl Server {
                 terminal,
                 output,
                 pending: None,
+                exit_requested: None,
                 client,
             },
         );
@@ -226,14 +252,17 @@ impl Server {
     /// Moves a block's output from its PTY to its client, feeding the server-side terminal on the
     /// way. Never blocks: if the client's channel is full, the block pauses (its PTY gets the
     /// backpressure) until the client reads again.
-    fn drain(&mut self, id: BlockId) {
+    /// Forwards what is pending. Answers whether the block has no more output to forward right
+    /// now: nothing paused, and no per-drain cap hit.
+    fn drain(&mut self, id: BlockId) -> bool {
         let Some(block) = self.blocks.get_mut(&id) else {
-            return;
+            return true;
         };
         // Re-armed BEFORE reading, as the pane does: output arriving meanwhile sends another
         // drain request
         block.pty.rearm();
         let mut forwarded = 0;
+        let mut finished = true;
         loop {
             let chunk = match block.pending.take() {
                 Some(chunk) => chunk,
@@ -246,23 +275,54 @@ impl Server {
                 },
             };
             if !block.forward(chunk) {
+                finished = false; // the client has not read: the block is paused
                 break;
             }
             forwarded += 1;
             if forwarded == MAX_CHUNKS_PER_DRAIN {
                 let _ = self.requests.send(Request::Drain(id));
+                finished = false; // more is waiting behind the cap
                 break;
             }
         }
         if forwarded > 0 && !block.client.wake_pending.swap(true, Ordering::AcqRel) {
             (block.client.notify)(IoEvent::Output);
         }
+        finished
+    }
+
+    /// Reports the exit to the client, but only once every chunk was forwarded: `exit_requested`
+    /// is set by the PTY's exit notice and `finished` says this drain emptied the block. The
+    /// reader thread only closes the output channel after its last chunk, but ConPTY can keep the
+    /// channel open forever after the child dies, so the notice also fires after a grace period.
+    fn maybe_exit(&mut self, id: BlockId, finished: bool) -> bool {
+        let Some(block) = self.blocks.get_mut(&id) else {
+            return false;
+        };
+        let Some(requested) = block.exit_requested else {
+            return false;
+        };
+        if !finished {
+            return false;
+        }
+        if block.pty.output_finished() || requested.elapsed() >= EXIT_GRACE {
+            block.exit_requested = None;
+            (block.client.notify)(IoEvent::Exited);
+            return true;
+        }
+        false
     }
 }
 
 impl Block {
     /// Sends a chunk to the client. If its channel is full, keeps the chunk and pauses; returns
     /// whether the chunk went out.
+    ///
+    /// The pause/resume handshake is lock-free: the server sets `paused` before a second
+    /// `try_send`, and the client clears it on its next read and then asks for a drain. It only
+    /// works because std's bounded `sync_channel` uses SeqCst ordering on its internal state: a
+    /// client read that happens after the flag is set sees it and resumes, and one that happened
+    /// before left room for the second `try_send` to succeed.
     fn forward(&mut self, chunk: Vec<u8>) -> bool {
         let chunk = match self.output.try_send(chunk) {
             Ok(()) => return true,
@@ -311,9 +371,59 @@ fn snapshot(terminal: &Terminal<'static, 'static>) -> Vec<u8> {
             Vec::new()
         });
     if let (Ok(x), Ok(y)) = (terminal.cursor_x(), terminal.cursor_y()) {
-        bytes.extend_from_slice(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
+        // With origin mode (DECOM) on, CUP is relative to the scrolling region's origin (and
+        // enabling DECOM homes the cursor), so the move must be written in region coordinates.
+        if terminal
+            .mode(libghostty_vt::terminal::Mode::ORIGIN)
+            .unwrap_or(false)
+        {
+            let (top, left) = exported_scrolling_region(&bytes);
+            bytes.extend_from_slice(
+                format!(
+                    "\x1b[{};{}H",
+                    (y + 2).saturating_sub(top),
+                    (x + 2).saturating_sub(left)
+                )
+                .as_bytes(),
+            );
+        } else {
+            bytes.extend_from_slice(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
+        }
     }
     bytes
+}
+
+/// The scrolling region as the snapshot exports it: the top margin from DECSTBM (`CSI top;bottom r`)
+/// and the left margin from DECSLRM (`CSI left;right s`), 1-based, or (1, 1) when unset
+fn exported_scrolling_region(bytes: &[u8]) -> (u16, u16) {
+    let mut region = (1u16, 1u16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut j = start;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j > start && j < bytes.len() && (bytes[j] == b'r' || bytes[j] == b's') {
+                let params: Vec<u16> = String::from_utf8_lossy(&bytes[start..j])
+                    .split(';')
+                    .filter(|part| !part.is_empty())
+                    .filter_map(|part| part.parse().ok())
+                    .collect();
+                if bytes[j] == b'r' && (params.len() == 2 || params.len() == 4) {
+                    region.0 = params[0].max(1);
+                }
+                if bytes[j] == b's' && params.len() == 2 {
+                    region.1 = params[0].max(1);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    region
 }
 
 /// Sends `Shutdown` when the last handle goes away
@@ -616,6 +726,34 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_keeps_the_cursor_with_origin_mode_and_a_scrolling_region() {
+        // DECOM plus a scroll region makes the final CUP relative to the region's origin, so the
+        // restored cursor would land somewhere else than where the client saw it
+        let mut expected = terminal();
+        expected.vt_write(b"hello\x1b[5;20r\x1b[?6h\x1b[3;7Hmark");
+        assert!(
+            expected
+                .mode(libghostty_vt::terminal::Mode::ORIGIN)
+                .unwrap(),
+            "the repro actually sets origin mode"
+        );
+
+        let mut restored = terminal();
+        restored.vt_write(&snapshot(&expected));
+
+        assert_eq!(
+            (restored.cursor_x().unwrap(), restored.cursor_y().unwrap()),
+            (expected.cursor_x().unwrap(), expected.cursor_y().unwrap())
+        );
+        assert!(
+            restored
+                .mode(libghostty_vt::terminal::Mode::ORIGIN)
+                .unwrap(),
+            "origin mode survives the snapshot"
+        );
+    }
+
+    #[test]
     fn a_snapshot_reproduces_the_screen_and_the_cursor() {
         let server = Server::start();
         let program = running(
@@ -677,5 +815,66 @@ mod tests {
         let resumed = read_until(&mut flooding, |text| text.len() < 512 * 1024);
         assert!(resumed.len() >= 512 * 1024, "{}", resumed.len());
         flooding.kill();
+    }
+
+    /// Reads what is available right now, without waiting for more
+    #[cfg(unix)] // only the exit-ordering test below uses it
+    fn read_available(io: &mut ServerBlock) -> Vec<u8> {
+        let mut output = Vec::new();
+        loop {
+            io.rearm();
+            match io.try_read() {
+                Some(chunk) => output.extend(chunk),
+                None => break,
+            }
+        }
+        output
+    }
+
+    #[test]
+    #[cfg(unix)] // Windows floods through ConPTY too slowly for this volume in the test window
+    fn the_exit_is_notified_after_all_the_output_was_forwarded() {
+        let server = Server::start();
+        // 30000 fixed-width lines (~360KB, ~88 chunks) overrun the 16-chunks-per-drain cap and
+        // the 64-chunk client channel: when the program exits, chunks are still queued, so the
+        // exit must wait until every line was forwarded to the client. Each line homes the cursor
+        // first: scrolling is slow in debug builds of libghostty.
+        let program = running(
+            "awk 'BEGIN{for(i=0;i<30000;i++) printf \"\\033[Hline %06d\\n\", i}'",
+            "echo unused on unix",
+        );
+        let (mut block, _, rx) = create(&server, &program, true).unwrap();
+
+        // A client that treats the exit as the end: polls for the exit, and reads a pass only
+        // after each wait. The exit must come only when every chunk was already forwarded.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_millis(30)) {
+                Ok(IoEvent::Exited) => break,
+                Ok(_) => {}
+                Err(_) if Instant::now() < deadline => {}
+                Err(_) => panic!("the exit was never reported"),
+            }
+            output.extend(read_available(&mut block));
+        }
+        output.extend(read_available(&mut block));
+
+        // The first and the last line must be there
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("line 000000"), "the first line is kept");
+        assert!(
+            text.contains("line 029999"),
+            "the last line is not lost: got {} bytes",
+            text.len()
+        );
+
+        // And the exit is the last notification: no output follows it
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            rx.try_recv().is_err(),
+            "no output notification follows the exit"
+        );
+        block.kill();
     }
 }

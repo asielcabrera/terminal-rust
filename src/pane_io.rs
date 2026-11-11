@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::thread;
 
 use portable_pty::{ChildKiller, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -54,6 +54,8 @@ pub struct LocalPty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     rx: Receiver<Vec<u8>>,
+    /// A chunk taken out by [`LocalPty::output_finished`] to not lose it
+    stashed: Option<Vec<u8>>,
     /// The reader thread sends one notification at a time; it is re-armed before draining
     wake_pending: Arc<AtomicBool>,
     /// To terminate the program (the `Child` lives in the thread that waits on it)
@@ -147,6 +149,9 @@ impl LocalPty {
                         _ => break,
                     }
                 }
+                // One more notification after the reader is done, so the last drain runs after
+                // every chunk and can tell the client the output really ended
+                notify(IoEvent::Output);
             }
         });
 
@@ -165,6 +170,7 @@ impl LocalPty {
         let pty = LocalPty {
             master: pair.master,
             writer,
+            stashed: None,
             rx,
             wake_pending,
             killer,
@@ -181,7 +187,7 @@ impl PaneIo for LocalPty {
     }
 
     fn try_read(&mut self) -> Option<Vec<u8>> {
-        self.rx.try_recv().ok()
+        self.stashed.take().or_else(|| self.rx.try_recv().ok())
     }
 
     fn rearm(&self) {
@@ -215,6 +221,22 @@ impl PaneIo for LocalPty {
 
     fn kill(&mut self) {
         let _ = self.killer.kill();
+    }
+}
+
+impl LocalPty {
+    /// Whether the output really ended: the reader thread finished (the channel is disconnected)
+    /// and nothing is left, so no chunk can arrive anymore. A chunk met on the way is stashed for
+    /// the next [`LocalPty::try_read`].
+    pub(crate) fn output_finished(&mut self) -> bool {
+        match self.rx.try_recv() {
+            Ok(chunk) => {
+                self.stashed = Some(chunk);
+                false
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => true,
+        }
     }
 }
 
