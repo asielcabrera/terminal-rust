@@ -1245,6 +1245,77 @@ mod tests {
     }
 
     #[test]
+    fn an_exit_never_precedes_the_state_event_for_a_spawned_pane() {
+        let (server, events) = Server::start();
+        let _ = init(&server);
+        // The program exits immediately: its output and exit are queued while the split is
+        // applied, so the event order proves State always announces a pane first
+        split(
+            &server,
+            PaneId(0),
+            printing("bye"),
+            Rect::new(0, 0, 800, 600),
+        );
+
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match events.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => seen.push(event),
+                Err(_) if Instant::now() >= deadline => break,
+                Err(_) => {}
+            }
+            if seen
+                .iter()
+                .any(|event| matches!(event, LayoutEvent::PaneExited(PaneId(1))))
+            {
+                break;
+            }
+        }
+
+        let state_pos = seen
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    LayoutEvent::State(_, Some(created)) if created.pane == PaneId(1)
+                )
+            })
+            .expect("the split reports its pane");
+        if let Some(output_pos) = seen
+            .iter()
+            .position(|event| matches!(event, LayoutEvent::PaneOutput(PaneId(1))))
+        {
+            assert!(output_pos > state_pos, "output arrived before the state");
+        }
+        let exit_pos = seen
+            .iter()
+            .position(|event| matches!(event, LayoutEvent::PaneExited(PaneId(1))))
+            .expect("the program exits");
+        assert!(exit_pos > state_pos, "the exit arrived before the state");
+    }
+
+    #[test]
+    fn a_closed_twice_pane_stays_silent() {
+        let (server, events) = Server::start();
+        let _ = init(&server);
+        split(&server, PaneId(0), waiting(), Rect::new(0, 0, 800, 600));
+        let _ = wait_state(&events);
+
+        server.send(Request::LayoutClose { pane: PaneId(1) });
+        let _ = wait_state(&events);
+        // Drain whatever the kill still has in flight before the silence check
+        while events.try_recv().is_ok() {}
+
+        // Closing an unknown pane again answers nothing
+        server.send(Request::LayoutClose { pane: PaneId(1) });
+        assert!(
+            events.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the second close is silent"
+        );
+    }
+
+    #[test]
     fn pane_ids_are_allocated_by_the_server_and_never_reused() {
         let (server, events) = Server::start();
         let (_state, first) = init(&server);

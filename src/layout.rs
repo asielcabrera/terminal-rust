@@ -1742,6 +1742,16 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "projection is read-only")]
+    fn a_projection_refuses_mutations() {
+        let layout = grid();
+        let state = layout.state();
+        let mut projection = Layout::from_state(state);
+        // Mutating a projection would diverge it from the server's authority
+        projection.set_focus(id(1));
+    }
+
+    #[test]
     fn a_layout_survives_a_state_round_trip() {
         let mut layout = grid();
         layout.add_float(id(5), 0.5, 0.5);
