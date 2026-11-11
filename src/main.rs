@@ -6,6 +6,7 @@ mod icon;
 mod layout;
 mod mouse;
 mod pane;
+mod pane_io;
 #[cfg(unix)] // Windows has no API for another process' cwd; pane.rs only calls it on unix
 mod proc_cwd;
 mod renderer;
@@ -846,7 +847,7 @@ impl App {
 
         if chunks == MAX_CHUNKS_PER_WAKE {
             // There may be more: signal again to let other events through in between
-            self.panes[index].request_more(&self.proxy);
+            self.panes[index].request_more();
         }
         // If the terminal's internal state changed, redraw the frame
         if chunks > 0 {

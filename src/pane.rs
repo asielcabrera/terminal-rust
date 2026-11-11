@@ -1,12 +1,9 @@
 //! A pane: a libghostty terminal with its PTY, the threads that serve it, and the mouse
 //! selection state. The app has one or more, arranged by `layout`.
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
-use std::thread;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use libghostty_vt::mouse;
 use libghostty_vt::selection::gesture::Gesture;
@@ -16,18 +13,17 @@ use libghostty_vt::terminal::{
     DeviceType, PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::CommandBuilder;
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
+use crate::pane_io::{IoEvent, LocalPty, Notify, PaneIo};
 use crate::{LuaEvent, UserEvent};
 
 /// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
 /// events (redraw, close) interleave instead of waiting until the end.
 pub const MAX_CHUNKS_PER_WAKE: usize = 256;
-/// Chunks that fit in the PTY channel before the reader thread blocks (backpressure to ConPTY)
-const PTY_CHANNEL_CAPACITY: usize = 64;
 
 // Reply to the device attributes query (CSI c). ConPTY sends it at startup, along with the cursor
 // position query, and waits up to 3 s for the terminal to answer before showing anything.
@@ -138,7 +134,7 @@ fn with_integration(mut shell: ShellConfig) -> ShellConfig {
     shell
 }
 
-fn build_command(shell: &ShellConfig) -> CommandBuilder {
+pub(crate) fn build_command(shell: &ShellConfig) -> CommandBuilder {
     // `args` panics with the default shell; config.rs validation already guarantees
     // there are only arguments when there is a program.
     let mut command = match &shell.program {
@@ -161,7 +157,7 @@ fn build_command(shell: &ShellConfig) -> CommandBuilder {
 /// `portable-pty` returns the `CreateProcessW` failure as plain text ("CreateProcessW `...`
 /// in cwd `...` failed: <cause>") with escaped NUL characters. For display this keeps only the
 /// cause; if the format ever changes, it returns the full message.
-fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
+pub(crate) fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
     let text = error.to_string();
     match text.rsplit_once(" failed: ") {
         Some((_, cause)) => cause.to_string(),
@@ -260,16 +256,10 @@ pub struct Pane {
     pub rect: Rect,
     /// Columns and rows last reported to the PTY and to libghostty
     pub grid: (u16, u16),
-    master: Box<dyn MasterPty + Send>,
-    pty_writer: Box<dyn Write + Send>,
-    rx: Receiver<Vec<u8>>,
+    /// The program behind the pane: its input, output, and lifetime
+    io: Box<dyn PaneIo>,
     /// Terminal replies to the shell's queries (cursor position, attributes...)
     replies: Receiver<Vec<u8>>,
-    /// The reader thread sends one notification at a time; it is re-armed before reading the
-    /// channel
-    wake_pending: Arc<AtomicBool>,
-    /// To terminate the shell (the `Child` lives in the thread that waits on it)
-    killer: Box<dyn ChildKiller + Send + Sync>,
     /// State of the selection gesture (click, double-click, drag) in this terminal
     pub gesture: Gesture<'static>,
     /// A selection drag is in progress
@@ -325,18 +315,8 @@ impl Pane {
             })
             .map_err(vt_error)?;
 
-        // The operating system's PTY (pseudo-terminal)
-        let pty_pair = NativePtySystem::default()
-            .openpty(PtySize {
-                rows: spawn.rows,
-                cols: spawn.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| format!("could not open the PTY: {error}"))?;
-
-        // The shell (or the requested program) inside the PTY. If the configured program cannot
-        // be started, a notice is shown and the default shell is used.
+        // The shell (or the requested program). If the configured program cannot be started, a
+        // notice is shown and the default shell is used.
         let explicit = spawn.program.is_some();
         let mut shell = config.shell.clone();
         if let Some((program, args)) = spawn.program {
@@ -346,86 +326,22 @@ impl Pane {
         if let Some(cwd) = spawn.cwd {
             shell.cwd = Some(cwd);
         }
-        let shell = with_integration(shell);
-        let child = match pty_pair.slave.spawn_command(build_command(&shell)) {
-            Ok(child) => child,
-            Err(error) => {
-                let Some(program) = &shell.program else {
-                    return Err(format!("could not start the default shell: {error}"));
-                };
-                if explicit {
-                    return Err(format!(
-                        "could not start {program:?}: {}",
-                        spawn_failure_cause(&error)
-                    ));
-                }
-                eprintln!("[shell] could not start {program:?}: {error}");
-                // On screen only the cause ("file not found"); the CreateProcessW details
-                // go to stderr
-                write_notice(
-                    &mut terminal,
-                    "shell",
-                    &format!(
-                        "could not start {program:?}: {}; using the default shell",
-                        spawn_failure_cause(&error)
-                    ),
-                );
-                let default_shell = ShellConfig {
-                    program: None,
-                    args: Vec::new(),
-                    ..shell.clone()
-                };
-                pty_pair
-                    .slave
-                    .spawn_command(build_command(&default_shell))
-                    .map_err(|error| format!("could not start the default shell: {error}"))?
-            }
-        };
-
-        let mut pty_reader = pty_pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| format!("could not read from the PTY: {error}"))?;
-        let pty_writer = pty_pair
-            .master
-            .take_writer()
-            .map_err(|error| format!("could not write to the PTY: {error}"))?;
-
-        // Reader thread: reads from the PTY and sends the bytes to the channel. The channel is
-        // bounded: if the UI falls behind, `send` blocks and ConPTY gets backpressure instead of
-        // memory growing without limit.
-        let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_CAPACITY);
-        let wake_pending = Arc::new(AtomicBool::new(false));
-        thread::spawn({
-            let proxy = proxy.clone();
-            let wake_pending = wake_pending.clone();
-            move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match pty_reader.read(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break; // the pane was closed
-                            }
-                            // One pending notification at a time: the handler drains the
-                            // whole channel
-                            if !wake_pending.swap(true, Ordering::AcqRel) {
-                                let _ = proxy.send_event(UserEvent::PtyOutput(id));
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-            }
+        let notify: Notify = Arc::new(move |event| {
+            let _ = proxy.send_event(match event {
+                IoEvent::Output => UserEvent::PtyOutput(id),
+                IoEvent::Exited => UserEvent::ShellExited(id),
+            });
         });
-
-        // Thread that waits on the shell. PTY end-of-read is not used: it is unreliable on Windows.
-        let killer = child.clone_killer();
-        thread::spawn(move || {
-            let mut child = child;
-            let _ = child.wait();
-            let _ = proxy.send_event(UserEvent::ShellExited(id));
-        });
+        let (io, fallback) = LocalPty::spawn(
+            &with_integration(shell),
+            explicit,
+            spawn.cols,
+            spawn.rows,
+            notify,
+        )?;
+        if let Some(message) = fallback {
+            write_notice(&mut terminal, "shell", &message);
+        }
 
         Ok(Pane {
             id,
@@ -433,12 +349,8 @@ impl Pane {
             render_state: RenderState::new().map_err(vt_error)?,
             rect: Rect::new(0, 0, 0, 0),
             grid: (spawn.cols, spawn.rows),
-            master: pty_pair.master,
-            pty_writer,
-            rx,
+            io: Box::new(io),
             replies,
-            wake_pending,
-            killer,
             gesture: Gesture::new().map_err(vt_error)?,
             selecting: false,
             reported: None,
@@ -447,19 +359,18 @@ impl Pane {
 
     /// Writes to the shell's input
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.pty_writer.write_all(bytes);
-        let _ = self.pty_writer.flush();
+        self.io.write(bytes);
     }
 
     /// Feeds libghostty what the shell wrote (up to `max_chunks` chunks) and answers its
     /// queries. Returns how many chunks were processed.
     pub fn drain(&mut self, max_chunks: usize) -> usize {
         // Re-armed BEFORE reading: a chunk arriving during the drain triggers another notification
-        self.wake_pending.store(false, Ordering::Release);
+        self.io.rearm();
 
         let mut chunks = 0;
         while chunks < max_chunks
-            && let Ok(bytes) = self.rx.try_recv()
+            && let Some(bytes) = self.io.try_read()
         {
             // Write the raw bytes into libghostty so it processes the ANSI escapes
             self.terminal.vt_write(&bytes);
@@ -474,20 +385,14 @@ impl Pane {
     }
 
     /// Requests another wakeup to keep draining what is left in the channel
-    pub fn request_more(&self, proxy: &EventLoopProxy<UserEvent>) {
-        self.wake_pending.store(true, Ordering::Release);
-        let _ = proxy.send_event(UserEvent::PtyOutput(self.id));
+    pub fn request_more(&self) {
+        self.io.notify_again();
     }
 
     /// Notifies the PTY and libghostty (which reflows the buffer) of the new size
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u32, cell_height: u32) {
         self.grid = (cols, rows);
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        self.io.resize(cols, rows);
         let _ = self.terminal.resize(cols, rows, cell_width, cell_height);
     }
 
@@ -503,22 +408,11 @@ impl Pane {
     /// if it reported nothing, the foreground process's directory according to the OS (macOS and
     /// Linux), so it works with any shell without integration
     pub fn current_dir(&self) -> Option<PathBuf> {
-        terminal_dir(&self.terminal).or_else(|| self.foreground_dir())
-    }
-
-    #[cfg(unix)]
-    fn foreground_dir(&self) -> Option<PathBuf> {
-        let pid = self.master.process_group_leader()?;
-        crate::proc_cwd::process_cwd(pid).filter(|path| path.is_dir())
-    }
-
-    #[cfg(not(unix))]
-    fn foreground_dir(&self) -> Option<PathBuf> {
-        None
+        terminal_dir(&self.terminal).or_else(|| self.io.foreground_dir())
     }
 
     pub fn kill(&mut self) {
-        let _ = self.killer.kill();
+        self.io.kill();
     }
 }
 
@@ -526,7 +420,7 @@ impl Drop for Pane {
     fn drop(&mut self) {
         // Releases the gesture's pins in the terminal and kills the shell if it is still alive
         self.gesture.reset(&self.terminal);
-        let _ = self.killer.kill();
+        self.io.kill();
     }
 }
 
