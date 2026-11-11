@@ -2280,7 +2280,7 @@ mod windows_pipe {
                 }
             }
             let write = duplicate(owned.0)?;
-            Ok((PipeReader(owned), write))
+            Ok((PipeReader(owned), PipeWriter(write)))
         }
     }
 
@@ -2309,7 +2309,7 @@ mod windows_pipe {
             };
             if handle != INVALID_HANDLE {
                 let write = duplicate(handle)?;
-                return Ok((PipeReader(PipeHandle(handle)), write));
+                return Ok((PipeReader(PipeHandle(handle)), PipeWriter(write)));
             }
             if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
                 waits += 1;
