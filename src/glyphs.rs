@@ -681,6 +681,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn the_default_macos_fonts_draw_media_control_symbols() {
+        // Claude Code and other TUIs use ⏺ and ⏵: on macOS only STIX Two Math has them as
+        // outlines (Apple Color Emoji is a bitmap font that fontdue cannot rasterize)
+        let db = database();
+        let mut fonts = Fonts::load(&db, &FontConfig::default(), 1.0).unwrap();
+        for ch in ['\u{23FA}', '\u{23F5}'] {
+            assert_drawn(&mut fonts, &db, ch);
+        }
+    }
+
+    #[test]
     fn private_use_ranges_are_recognized() {
         assert!(
             is_private_use('\u{E0B0}') && is_private_use('\u{F8FF}') && is_private_use('\u{F0001}')

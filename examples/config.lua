@@ -22,7 +22,7 @@ if terminal.os == "macos" then size = 14 end
 -- Each system ships different fonts: a family that is not installed stops the terminal from starting
 local family, fallback = "Consolas", { "Symbols Nerd Font Mono", "Segoe UI Symbol", "Microsoft YaHei", "Malgun Gothic", "Segoe UI Emoji" }
 if terminal.os == "macos" then
-  family, fallback = "Menlo", { "Symbols Nerd Font Mono", "Apple Symbols", "PingFang SC", "Apple SD Gothic Neo" }
+  family, fallback = "Menlo", { "Symbols Nerd Font Mono", "Apple Symbols", "STIX Two Math", "PingFang SC", "Apple SD Gothic Neo" }
 elseif terminal.os == "linux" then
   family, fallback = "DejaVu Sans Mono", { "Symbols Nerd Font Mono", "DejaVu Sans" }
 end

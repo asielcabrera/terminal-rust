@@ -36,6 +36,8 @@ const DEFAULT_FALLBACK: &[&str] = &[
     "Symbols Nerd Font Mono",
     "Symbols Nerd Font",
     "Apple Symbols",
+    // Only outline font on macOS with media-control symbols (⏺ ⏵) used by TUIs like Claude Code
+    "STIX Two Math",
     "PingFang SC",
     "Apple SD Gothic Neo",
 ];
