@@ -15,15 +15,18 @@ mod server;
 use actions::{Action, Command, Direction, EventKind, LeaderOutcome, LeaderState, Script};
 use blink::Blink;
 use config::Config;
-use layout::{Axis, Closed, Layout, Limits, PaneId, Rect};
+use layout::{Axis, Layout, LayoutState, Limits, PaneId, Rect};
 use libghostty_vt::key::{Action as KeyAction, Encoder, Event as GhosttyKeyEvent, Key, Mods};
 use libghostty_vt::paste;
 use libghostty_vt::terminal::{Mode, ScrollViewport};
 use mlua::Value;
 use mouse::MouseState;
-use pane::{MAX_CHUNKS_PER_WAKE, Pane, Spawn, apply_theme};
+use pane::{MAX_CHUNKS_PER_WAKE, Pane, apply_theme, with_integration};
 use renderer::{PaneView, Renderer};
-use server::{Server, ServerHandle};
+use server::{
+    AddFloatOp, CreatedPane, FocusDirOp, LayoutEvent, MoveFloatOp, Request, ResizeOp, Server,
+    ServerHandle, SplitOp,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -51,10 +54,8 @@ const MIN_PANE_ROWS: u32 = 3;
 /// Events other threads send to the UI loop to wake it up
 #[derive(Debug)]
 enum UserEvent {
-    /// A pane's shell has new bytes in its channel
-    PtyOutput(PaneId),
-    /// A pane's child process exited
-    ShellExited(PaneId),
+    /// The server applied a layout mutation, or a pane's program wrote or exited
+    Layout(LayoutEvent),
     /// The configuration file changed on disk
     ConfigChanged,
 }
@@ -156,15 +157,14 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     focused: bool,
-    /// All panes; `layout` decides where each one goes and which one has focus
+    /// All panes; the layout projection decides where each one goes and which one has focus.
+    /// The layout is rebuilt from server state events and never mutated here.
     panes: Vec<Pane>,
     layout: Layout,
-    next_pane_id: u32,
     /// The prefix (like tmux's Ctrl+B) is pressed and waiting for the next key
     leader: LeaderState,
     key_encoder: Encoder<'static>,
     mods: Mods,
-    proxy: EventLoopProxy<UserEvent>,
     /// Owns the programs behind the panes
     server: ServerHandle,
 }
@@ -205,21 +205,12 @@ impl App {
         }
     }
 
-    /// Focuses a pane (a click, an action). If the layout changes (a floating pane is raised, zoom
-    /// is removed) everything is repositioned.
+    /// Focuses a pane (a click, an action): one message, and the state event applies it
     fn focus_pane(&mut self, id: PaneId) {
         if self.layout.focus() == id {
             return;
         }
-        let zoomed_before = self.layout.zoomed();
-        if !self.layout.set_focus(id) {
-            return;
-        }
-        self.refresh_title();
-        if self.layout.zoomed() != zoomed_before {
-            self.relayout_window();
-        }
-        self.redraw_window();
+        self.server.send(Request::LayoutSetFocus { pane: id });
     }
 
     fn redraw_window(&self) {
@@ -257,56 +248,41 @@ impl App {
             .current_dir()
     }
 
-    /// Splits the focused pane (or the last tiled one, from a floating pane) and focuses the new one
+    /// Splits the focused pane (or the last tiled one, from a floating pane): one message to
+    /// the server, which applies it, starts the block and reports both back
     fn split(&mut self, axis: Axis) {
-        let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
+        let (Some(area), Some(limits), Some(renderer)) =
+            (self.window_area(), self.pane_limits(), &self.renderer)
+        else {
             return;
         };
         let target = self.layout.split_target();
         let cwd = self.inherited_cwd(target);
-        let id = PaneId(self.next_pane_id);
-        if !self.layout.split(target, axis, id, area, limits) {
+        // The preview is exactly what the server will apply: the new pane's grid is sized
+        // before the block starts, so the shell sees its real size from the first prompt
+        let Some(rect) = self.layout.split_preview(target, axis, area, limits) else {
             eprintln!("[panes] not enough room to split the pane");
             return;
-        }
-        let Some(renderer) = &self.renderer else {
-            return;
         };
-        let rect = self
-            .layout
-            .rects(area)
-            .into_iter()
-            .find(|(pane, _)| *pane == id)
-            .map(|(_, rect)| rect)
-            .unwrap_or(area);
         let (cols, rows) = renderer.grid_size(rect.w, rect.h);
-        let spawn = Spawn {
-            id,
+        let mut shell = self.config.shell.clone();
+        if let Some(cwd) = cwd {
+            shell.cwd = Some(cwd);
+        }
+        self.server.send(Request::LayoutSplit(SplitOp {
+            pane: target,
+            dir: match axis {
+                Axis::Horizontal => layout::Dir::Right,
+                Axis::Vertical => layout::Dir::Down,
+            },
+            shell: with_integration(shell),
+            explicit: false,
             cols,
             rows,
-            program: None,
-            cwd,
-            notice: None,
-        };
-        match Pane::spawn(
-            &self.config,
-            &self.server,
-            spawn,
-            self.lua_tx.clone(),
-            self.proxy.clone(),
-        ) {
-            Ok(pane) => {
-                self.next_pane_id += 1;
-                self.panes.push(pane);
-                self.refresh_title();
-                self.relayout(area);
-            }
-            Err(error) => {
-                eprintln!("[panes] {error}");
-                // Undo the split: the previous pane gets its space and focus back
-                self.layout.close(id);
-            }
-        }
+            scrollback: self.config.scrollback,
+            area,
+            limits,
+        }));
     }
 
     /// Opens a floating pane and focuses it. With `program` it runs that program instead of the
@@ -318,54 +294,35 @@ impl App {
         height: Option<f32>,
         cwd: Option<String>,
     ) {
-        let Some(area) = self.window_area() else {
+        let (Some(area), Some(renderer)) = (self.window_area(), &self.renderer) else {
             return;
         };
         let cwd = cwd
             .map(PathBuf::from)
             .or_else(|| self.inherited_cwd(self.layout.focus()));
-        let id = PaneId(self.next_pane_id);
         let panes = &self.config.panes;
-        self.layout.add_float(
-            id,
-            width.unwrap_or(panes.float_width),
-            height.unwrap_or(panes.float_height),
-        );
-        let Some(rect) = self.layout.float_rect(id, area) else {
-            return;
-        };
-        let Some(renderer) = &self.renderer else {
-            return;
-        };
+        let width = width.unwrap_or(panes.float_width);
+        let height = height.unwrap_or(panes.float_height);
+        let rect = self.layout.float_preview(width, height, area);
         let (cols, rows) = renderer.grid_size(rect.w, rect.h);
-        let spawn = Spawn {
-            id,
+        let mut shell = self.config.shell.clone();
+        let explicit = program.is_some();
+        if let Some((program, args)) = program {
+            shell.program = Some(program);
+            shell.args = args;
+        }
+        if let Some(cwd) = cwd {
+            shell.cwd = Some(cwd);
+        }
+        self.server.send(Request::LayoutAddFloat(AddFloatOp {
+            shell: with_integration(shell),
+            explicit,
+            width,
+            height,
             cols,
             rows,
-            program,
-            cwd,
-            notice: None,
-        };
-        match Pane::spawn(
-            &self.config,
-            &self.server,
-            spawn,
-            self.lua_tx.clone(),
-            self.proxy.clone(),
-        ) {
-            Ok(pane) => {
-                self.next_pane_id += 1;
-                self.panes.push(pane);
-                self.refresh_title();
-                self.relayout(area);
-            }
-            Err(error) => {
-                eprintln!("[panes] {error}");
-                self.layout.close(id);
-                self.refresh_title();
-                self.redraw_window();
-            }
-        }
+            scrollback: self.config.scrollback,
+        }));
     }
 
     /// Hides or shows the floating panes; if there are none, opens one
@@ -374,10 +331,7 @@ impl App {
             self.new_float(None, None, None, None);
             return;
         }
-        self.layout.toggle_floats();
-        self.refresh_title();
-        // When showing them they must be given the current window size
-        self.relayout_window();
+        self.server.send(Request::LayoutToggleFloats);
     }
 
     /// Moves the focused floating pane `amount` cells toward `direction`
@@ -400,33 +354,26 @@ impl App {
             Direction::Up => (0, -vertical),
             Direction::Down => (0, vertical),
         };
-        if self.layout.move_float(focus, dx, dy, area) {
-            self.relayout(area);
-        }
-    }
-
-    /// After a focus change: title, and relayout if zoom was removed
-    fn after_focus_change(&mut self, zoom_before: Option<PaneId>) {
-        self.refresh_title();
-        if self.layout.zoomed() != zoom_before {
-            self.relayout_window();
-        }
-        self.redraw_window();
+        self.server.send(Request::LayoutMoveFloat(MoveFloatOp {
+            pane: focus,
+            dx,
+            dy,
+            window: area,
+        }));
     }
 
     fn focus_direction(&mut self, direction: Direction) {
         let Some(area) = self.window_area() else {
             return;
         };
-        let zoomed = self.layout.zoomed();
-        self.layout.focus_dir(layout_dir(direction), area);
-        self.after_focus_change(zoomed);
+        self.server.send(Request::LayoutFocusDir(FocusDirOp {
+            dir: layout_dir(direction),
+            area,
+        }));
     }
 
     fn focus_cycle(&mut self, forward: bool) {
-        let zoomed = self.layout.zoomed();
-        self.layout.focus_cycle(forward);
-        self.after_focus_change(zoomed);
+        self.server.send(Request::LayoutFocusCycle { forward });
     }
 
     /// Moves the focused pane's border `amount` cells toward `direction`
@@ -441,16 +388,13 @@ impl App {
             Direction::Left | Direction::Right => cell_width,
             Direction::Up | Direction::Down => cell_height,
         };
-        let focus = self.layout.focus();
-        if self.layout.resize(
-            focus,
-            layout_dir(direction),
-            u32::from(amount) * step,
+        self.server.send(Request::LayoutResize(ResizeOp {
+            pane: self.layout.focus(),
+            dir: layout_dir(direction),
+            delta: u32::from(amount) * step,
             area,
             limits,
-        ) {
-            self.relayout(area);
-        }
+        }));
     }
 
     /// Rectangles of the lines separating the tiled panes
@@ -466,24 +410,39 @@ impl App {
             .collect()
     }
 
-    /// Closes a pane. If it was the last tiled one, the window closes.
-    fn close_pane(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
-        match self.layout.close(id) {
-            Closed::LastTiled => {
-                for pane in &mut self.panes {
-                    pane.kill();
-                }
-                event_loop.exit();
-            }
-            Closed::Pane => {
-                // Dropping the `Pane` terminates its shell if it was still alive
-                self.panes.retain(|pane| pane.id != id);
-                self.mouse.forget_pane(id);
-                self.refresh_title();
-                self.relayout_window();
-            }
-            Closed::Unknown => {}
+    /// Closes a pane. If it was the last tiled one, the server kills everything and tells the
+    /// window to quit.
+    fn close_pane(&mut self, id: PaneId) {
+        self.server.send(Request::LayoutClose { pane: id });
+    }
+
+    /// Rebuilds the projection from a server state event and syncs the panes with it
+    fn apply_state(&mut self, state: LayoutState, created: Option<CreatedPane>) {
+        self.layout = Layout::from_state(state);
+        // Panes the server removed are gone: dropping them kills their blocks
+        let gone: Vec<PaneId> = self
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .filter(|id| !self.layout.contains(*id))
+            .collect();
+        for id in gone {
+            self.panes.retain(|pane| pane.id != id);
+            self.mouse.forget_pane(id);
         }
+        if let Some(created) = created {
+            let pane_id = created.pane;
+            match Pane::from_block(&self.config, created, None, self.lua_tx.clone()) {
+                Ok(pane) => self.panes.push(pane),
+                Err(error) => {
+                    eprintln!("[panes] {error}");
+                    // The window could not wrap the block: close the pane server-side too
+                    self.server.send(Request::LayoutClose { pane: pane_id });
+                }
+            }
+        }
+        self.refresh_title();
+        self.relayout_window();
     }
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, key_event: &KeyEvent) {
@@ -612,17 +571,13 @@ impl App {
             Action::SplitDown => self.split(Axis::Vertical),
             Action::ClosePane => {
                 let id = self.layout.focus();
-                self.close_pane(event_loop, id);
+                self.close_pane(id);
             }
             Action::FocusPane { dir } => self.focus_direction(dir),
             Action::FocusNext => self.focus_cycle(true),
             Action::FocusPrevious => self.focus_cycle(false),
             Action::ResizePane { dir, amount } => self.resize_pane(dir, amount),
-            Action::ToggleZoom => {
-                if self.layout.toggle_zoom() {
-                    self.relayout_window();
-                }
-            }
+            Action::ToggleZoom => self.server.send(Request::LayoutToggleZoom),
             Action::NewFloat {
                 program,
                 args,
@@ -962,6 +917,26 @@ impl App {
         self.cursor_blinks = renderer.draw(&mut views, &dividers, self.blink.visible());
     }
 
+    /// A pane's program exited: drain its last output, fire the hook, and close or hold
+    fn shell_exited(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
+        // A pane that was already closed by hand has nothing left to do
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        // The last thing the shell wrote before exiting
+        self.drain_pty(event_loop, id);
+        self.fire_event(event_loop, EventKind::ShellExit, Vec::new());
+        match self.config.on_shell_exit {
+            config::ShellExit::Close => self.close_pane(id),
+            config::ShellExit::Hold => {
+                self.panes[index]
+                    .terminal
+                    .vt_write(b"\r\n\x1b[2m[process exited]\x1b[0m\r\n");
+                self.redraw_window();
+            }
+        }
+    }
+
     /// The cursor becomes visible again and the blink cycle restarts: while typing or while
     /// output arrives it stays solid
     fn reset_blink(&mut self) {
@@ -1087,25 +1062,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::PtyOutput(id) => self.drain_pty(event_loop, id),
-            UserEvent::ShellExited(id) => {
-                // A pane that was already closed by hand has nothing left to do
-                let Some(index) = self.index_of(id) else {
-                    return;
-                };
-                // The last thing the shell wrote before exiting
-                self.drain_pty(event_loop, id);
-                self.fire_event(event_loop, EventKind::ShellExit, Vec::new());
-                match self.config.on_shell_exit {
-                    config::ShellExit::Close => self.close_pane(event_loop, id),
-                    config::ShellExit::Hold => {
-                        self.panes[index]
-                            .terminal
-                            .vt_write(b"\r\n\x1b[2m[process exited]\x1b[0m\r\n");
-                        self.redraw_window();
-                    }
-                }
+            UserEvent::Layout(LayoutEvent::State(state, created)) => {
+                self.apply_state(state, created);
             }
+            UserEvent::Layout(LayoutEvent::LastPaneClosed) => {
+                for pane in &mut self.panes {
+                    pane.kill();
+                }
+                event_loop.exit();
+            }
+            UserEvent::Layout(LayoutEvent::Error(error)) => eprintln!("[panes] {error}"),
+            UserEvent::Layout(LayoutEvent::PaneOutput(id)) => self.drain_pty(event_loop, id),
+            UserEvent::Layout(LayoutEvent::PaneExited(id)) => self.shell_exited(event_loop, id),
             UserEvent::ConfigChanged => self.reload_config(event_loop),
         }
     }
@@ -1207,23 +1175,29 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    // 3. The first pane: terminal, PTY, shell, and the threads that serve them
+    // 3. The server owns the layout and the blocks. The first pane is created through it, and
+    //    its events (layout state after every mutation, pane output and exits) wake the UI loop.
     let (lua_tx, lua_events) = channel::<(PaneId, LuaEvent)>();
-    let first = PaneId(0);
-    let server = Server::start();
-    let pane = Pane::spawn(
+    let (server, layout_events) = Server::start();
+    {
+        let proxy = proxy.clone();
+        thread::spawn(move || {
+            while let Ok(event) = layout_events.recv() {
+                if proxy.send_event(UserEvent::Layout(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let shell = with_integration(config.shell.clone());
+    let (state, created) = server
+        .init(&shell, cols, rows, config.scrollback)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let pane = Pane::from_block(
         &config,
-        &server,
-        Spawn {
-            id: first,
-            cols,
-            rows,
-            program: None,
-            cwd: None,
-            notice: loaded.error.as_deref().map(|error| ("config", error)),
-        },
+        created,
+        loaded.error.as_deref().map(|error| ("config", error)),
         lua_tx.clone(),
-        proxy.clone(),
     )
     .unwrap_or_else(|error| panic!("{error}"));
 
@@ -1252,12 +1226,10 @@ fn main() {
         renderer: None,
         focused: true,
         panes: vec![pane],
-        layout: Layout::new(first),
-        next_pane_id: 1,
+        layout: Layout::from_state(state),
         leader: LeaderState::default(),
         key_encoder: Encoder::new().unwrap(),
         mods: Mods::empty(),
-        proxy,
         server,
     };
 

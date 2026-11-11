@@ -60,7 +60,7 @@ pub enum Dir {
 }
 
 impl Dir {
-    fn axis(self) -> Axis {
+    pub(crate) fn axis(self) -> Axis {
         match self {
             Dir::Left | Dir::Right => Axis::Horizontal,
             Dir::Up | Dir::Down => Axis::Vertical,
@@ -317,10 +317,6 @@ pub struct Float {
 /// The whole layout as plain data. The server owns the authoritative layout and sends this to
 /// the window after every applied mutation; the window rebuilds a read-only projection from it
 /// ([`Layout::from_state`]). No serde needed yet: over IPC it maps to JSON one to one.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the server slice starts sending it")
-)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutState {
     pub root: Node,
@@ -376,10 +372,6 @@ impl Layout {
     }
 
     /// Snapshot of the whole layout: what the server sends after every applied mutation
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the server slice starts sending it")
-    )]
     pub fn state(&self) -> LayoutState {
         LayoutState {
             root: self.root.clone(),
@@ -393,10 +385,6 @@ impl Layout {
 
     /// Rebuilds a layout from plain data. The result is the window's read-only projection of
     /// the server's layout: its mutations are refused in debug builds.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the server slice starts sending it")
-    )]
     pub fn from_state(state: LayoutState) -> Self {
         Self {
             root: state.root,
@@ -422,6 +410,14 @@ impl Layout {
         self.focus
     }
 
+    /// The pane zoomed to fill the window, if any
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a projection query; the window currently reads zoom through rects"
+        )
+    )]
     pub fn zoomed(&self) -> Option<PaneId> {
         self.zoomed
     }
@@ -579,10 +575,6 @@ impl Layout {
     /// changing anything. The window uses it to size the new pane's grid before asking the
     /// server for the split. `None` when the server would refuse the split (target unknown,
     /// or the halves would fall below the minimum size).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the window slice starts calling it")
-    )]
     pub fn split_preview(
         &self,
         target: PaneId,
@@ -924,10 +916,6 @@ impl Layout {
 
     /// Rectangle a new floating pane would occupy, without changing anything. The window uses
     /// it to size the new pane's grid before asking the server for the float.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the window slice starts calling it")
-    )]
     pub fn float_preview(&self, width: f32, height: f32, window: Rect) -> Rect {
         let (x, y, w, h) = self.float_placement(width, height);
         self.float_px(

@@ -25,6 +25,7 @@ use crate::App;
 use crate::actions;
 use crate::config::{Decorations, RightClick};
 use crate::layout::{Axis, Edge, Hit, HitParams, PaneId, Path};
+use crate::server::{MoveFloatOp, Request, ResizeFloatEdgeOp, SetDividerOp};
 
 /// How often one line scrolls while a selection is dragged outside the window
 pub const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -306,7 +307,8 @@ impl App {
     }
 
     /// Moves (`edge` = `None`) or resizes a floating pane by however much the pointer moved since
-    /// the last step
+    /// the last step. One message per step; the server answers with a state event and the
+    /// window relayouts from its projection.
     fn drag_float(&mut self, id: PaneId, edge: Option<Edge>) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -318,18 +320,28 @@ impl App {
             return;
         }
         self.mouse.drag_from = (x, y);
-        let changed = match edge {
-            None => self.layout.move_float(id, dx, dy, area),
-            Some(edge) => self
-                .layout
-                .resize_float_edge(id, edge, dx, dy, area, limits),
-        };
-        if changed {
-            self.relayout(area);
+        match edge {
+            None => self.server.send(Request::LayoutMoveFloat(MoveFloatOp {
+                pane: id,
+                dx,
+                dy,
+                window: area,
+            })),
+            Some(edge) => {
+                self.server
+                    .send(Request::LayoutResizeFloatEdge(ResizeFloatEdgeOp {
+                        pane: id,
+                        edge,
+                        dx,
+                        dy,
+                        window: area,
+                        limits,
+                    }));
+            }
         }
     }
 
-    /// Moves the captured divider to where the pointer is
+    /// Moves the captured divider to where the pointer is: one message per drag step
     fn drag_divider(&mut self, path: &[bool], axis: Axis) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
@@ -339,12 +351,12 @@ impl App {
             Axis::Horizontal => x,
             Axis::Vertical => y,
         };
-        if self
-            .layout
-            .set_divider(path, boundary.round() as i64, area, limits)
-        {
-            self.relayout(area);
-        }
+        self.server.send(Request::LayoutSetDivider(SetDividerOp {
+            path: path.to_vec(),
+            boundary: boundary.round() as i64,
+            area,
+            limits,
+        }));
     }
 
     /// Pointer position relative to the pane's corner
