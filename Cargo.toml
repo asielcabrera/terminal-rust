@@ -2,6 +2,12 @@
 name = "terminal"
 version = "0.1.0"
 edition = "2024"
+description = "A GPU-accelerated, cross-platform terminal emulator built on libghostty-vt and wgpu"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cabrerasiel/terminal"
+readme = "README.md"
+keywords = ["terminal", "terminal-emulator", "gpu", "wgpu", "ghostty"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 arboard = { version = "3.7.0", default-features = false }
