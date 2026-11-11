@@ -48,6 +48,19 @@ fn find_face(db: &Database, family: &str, bold: bool, italic: bool) -> Option<ID
     (is_bold == bold && is_italic == italic).then_some(id)
 }
 
+/// Glyph of `ch` according to the font's Unicode cmap. fontdue merges every cmap subtable into a
+/// single map, so in fonts that also ship a Mac Roman table (Menlo) U+0080..U+00FF end up pointing
+/// at the Mac Roman glyph ('ó' drawn as 'Û'). ttf-parser only reads the Unicode subtables, and it
+/// works on the memory-mapped file without loading the font.
+fn unicode_glyph(db: &Database, id: ID, ch: char) -> Option<u16> {
+    db.with_face_data(id, |data, index| {
+        ttf_parser::Face::parse(data, index).ok()?.glyph_index(ch)
+    })
+    .flatten()
+    .map(|glyph| glyph.0)
+    .filter(|&glyph| glyph != 0)
+}
+
 fn load_face(db: &Database, id: ID, px: f32) -> Option<Font> {
     db.with_face_data(id, |data, collection_index| {
         let settings = FontSettings {
@@ -87,18 +100,15 @@ impl LazyFont {
             .get_or_insert_with(|| find_face(db, &self.family, false, false))
     }
 
+    /// Glifo de `ch` en esta fuente, si lo tiene. No carga la fuente.
+    fn glyph(&mut self, db: &Database, ch: char) -> Option<u16> {
+        unicode_glyph(db, self.face(db)?, ch)
+    }
+
     /// ¿Tiene esta fuente un glifo para `ch`? No carga la fuente.
+    #[cfg(test)]
     fn covers(&mut self, db: &Database, ch: char) -> bool {
-        let Some(id) = self.face(db) else {
-            return false;
-        };
-        db.with_face_data(id, |data, index| {
-            ttf_parser::Face::parse(data, index)
-                .ok()
-                .and_then(|face| face.glyph_index(ch))
-                .is_some()
-        })
-        .unwrap_or(false)
+        self.glyph(db, ch).is_some()
     }
 
     fn get(&mut self, db: &Database, px: f32) -> Option<&Font> {
@@ -168,6 +178,7 @@ fn is_private_use(ch: char) -> bool {
 }
 
 struct Fonts {
+    regular_id: ID,
     regular: Font,
     bold: StyledFace,
     italic: StyledFace,
@@ -179,8 +190,8 @@ struct Fonts {
 impl Fonts {
     fn load(db: &Database, config: &FontConfig, scale_factor: f64) -> Result<Self, String> {
         let px = config.size * scale_factor as f32;
-        let regular = find_face(db, &config.family, false, false)
-            .and_then(|id| load_face(db, id, px))
+        let (regular_id, regular) = find_face(db, &config.family, false, false)
+            .and_then(|id| Some((id, load_face(db, id, px)?)))
             .ok_or_else(|| {
                 format!(
                     "no se encontró la fuente \"{}\" en el sistema",
@@ -199,6 +210,7 @@ impl Fonts {
         }
 
         Ok(Self {
+            regular_id,
             regular,
             bold: StyledFace::new(db, &config.family, true, false),
             italic: StyledFace::new(db, &config.family, false, true),
@@ -210,19 +222,23 @@ impl Fonts {
 
     fn rasterize(&mut self, db: &Database, key: GlyphKey) -> (Metrics, Vec<u8>) {
         let px = self.px;
+        // Glyphs are always looked up in the Unicode cmap (`unicode_glyph`) and drawn by index:
+        // fontdue's own char lookup can return the Mac Roman glyph instead
         let styled = match (key.bold, key.italic) {
             (false, false) => None,
-            (true, false) => self.bold.get(db, px),
-            (false, true) => self.italic.get(db, px),
-            (true, true) => self.bold_italic.get(db, px),
+            (true, false) => Some(&mut self.bold),
+            (false, true) => Some(&mut self.italic),
+            (true, true) => Some(&mut self.bold_italic),
         };
-        if let Some(font) = styled
-            && font.has_glyph(key.ch)
+        if let Some(face) = styled
+            && let Some(id) = face.id
+            && let Some(glyph) = unicode_glyph(db, id, key.ch)
+            && let Some(font) = face.get(db, px)
         {
-            return font.rasterize(key.ch, px);
+            return font.rasterize_indexed(glyph, px);
         }
-        if self.regular.has_glyph(key.ch) {
-            return self.regular.rasterize(key.ch, px);
+        if let Some(glyph) = unicode_glyph(db, self.regular_id, key.ch) {
+            return self.regular.rasterize_indexed(glyph, px);
         }
 
         // Las de reserva, en orden. En el área de uso privado las fuentes de CJK y de símbolos del
@@ -238,11 +254,10 @@ impl Fonts {
                 if nerd_pass && !slot.nerd {
                     continue;
                 }
-                if slot.covers(db, key.ch)
+                if let Some(glyph) = slot.glyph(db, key.ch)
                     && let Some(font) = slot.get(db, px)
-                    && font.has_glyph(key.ch)
                 {
-                    return font.rasterize(key.ch, px);
+                    return font.rasterize_indexed(glyph, px);
                 }
             }
         }
@@ -632,6 +647,37 @@ mod tests {
         );
         assert!(fonts.bold.font.is_some(), "la negrita se carga al usarla");
         assert!(fonts.italic.font.is_none() && fonts.bold_italic.font.is_none());
+    }
+
+    #[test]
+    fn latin1_characters_use_the_unicode_cmap_not_the_mac_roman_one() {
+        // Menlo also ships a Mac Roman cmap: read naively, 'ó' (U+00F3) is drawn as byte 0xF3
+        // in Mac Roman, which is 'Û'
+        let db = database();
+        let Some(id) = find_face(&db, "Menlo", false, false) else {
+            eprintln!("skipped: Menlo is not installed");
+            return;
+        };
+        let mut fonts = Fonts::load(&db, &config("Menlo"), 1.0).unwrap();
+        for ch in ['ó', 'é', 'á', 'ñ', '×', '¿', '·'] {
+            let index = db
+                .with_face_data(id, |data, index| {
+                    ttf_parser::Face::parse(data, index).ok()?.glyph_index(ch)
+                })
+                .flatten()
+                .unwrap_or_else(|| panic!("Menlo should have {ch:?}"));
+            let (metrics, bitmap) = fonts.rasterize(&db, plain(ch));
+            let (expected_metrics, expected) = fonts.regular.rasterize_indexed(index.0, fonts.px);
+            assert_eq!(
+                (metrics.width, metrics.height),
+                (expected_metrics.width, expected_metrics.height),
+                "{ch:?}"
+            );
+            assert_eq!(
+                bitmap, expected,
+                "{ch:?} was not drawn with its Unicode glyph"
+            );
+        }
     }
 
     #[test]
