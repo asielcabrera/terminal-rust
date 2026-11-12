@@ -64,6 +64,8 @@ pub struct Config {
     /// Drops the keys the terminal binds by default (copy, paste, scroll). Keys defined in `keys`
     /// always take precedence over the defaults.
     pub disable_default_keys: bool,
+    /// Remote access over the tailnet (`terminal gateway`)
+    pub remote: RemoteConfig,
 }
 
 impl Default for Config {
@@ -80,6 +82,7 @@ impl Default for Config {
             scrollback: 10_000,
             on_shell_exit: ShellExit::Close,
             disable_default_keys: false,
+            remote: RemoteConfig::default(),
         }
     }
 }
@@ -117,6 +120,21 @@ impl Default for PanesConfig {
             float_height: 0.7,
         }
     }
+}
+
+/// Remote access over the tailnet (stage 5a): `terminal gateway` fronts the local server for
+/// one remote client over a loopback WebSocket, and Tailscale provides both the transport
+/// (`tailscale serve`, TLS included) and the identity headers.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteConfig {
+    /// Tailscale logins (`Tailscale-User-Login`, falling back to `Tailscale-User-Name`) that
+    /// may attach through `terminal gateway`. **Empty denies everyone**: remote access stays
+    /// owner-off until this names at least one login, e.g.
+    /// `remote = { allow = { "you@example.com" } }`. The identity headers are only
+    /// trustworthy in front of `tailscale serve` — the gateway binds 127.0.0.1 only, and a
+    /// direct loopback hit could set them freely.
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1790,5 +1808,29 @@ mod tests {
             .join("config.lua");
         let (config, _script) = load_script_path(&path).unwrap();
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn remote_allow_lists_tailscale_logins_and_denies_everyone_by_default() {
+        let defaults = Config::default();
+        assert!(
+            defaults.remote.allow.is_empty(),
+            "empty remote.allow denies everyone"
+        );
+
+        let config = parse_str(
+            r#"return { remote = { allow = { "dev@example.com", "other@tailnet.ts.net" } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.remote.allow,
+            vec![
+                "dev@example.com".to_string(),
+                "other@tailnet.ts.net".to_string()
+            ]
+        );
+
+        let error = parse_str("return { remote = { allow = 4 } }").unwrap_err();
+        assert!(error.contains("remote"), "{error}");
     }
 }

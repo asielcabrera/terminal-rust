@@ -182,6 +182,41 @@ struct App {
 /// How often a starting window retries the server connection after spawning (and spawning) it
 const CONNECT_RETRIES: usize = 50;
 
+/// Connects to the server (starting it detached if it is not running), exactly like the
+/// window does before attaching. The gateway dials again per remote client; this only
+/// guarantees the server is up.
+fn ensure_server_running(endpoint: &IpcEndpoint) {
+    if IpcConn::connect(endpoint).is_ok() {
+        return;
+    }
+    spawn_detached_server();
+    for _ in 0..CONNECT_RETRIES {
+        thread::sleep(Duration::from_millis(100));
+        if IpcConn::connect(endpoint).is_ok() {
+            return;
+        }
+    }
+    panic!("could not start or reach the terminal server");
+}
+
+/// Reads the gateway subcommand's arguments: `--port N`, or the default port
+fn gateway_port(args: &[String]) -> u16 {
+    let mut port = server::DEFAULT_GATEWAY_PORT;
+    let mut values = args.iter().skip(2);
+    while let Some(flag) = values.next() {
+        if flag != "--port" {
+            eprintln!("terminal gateway: unknown argument {flag:?}");
+            std::process::exit(2);
+        }
+        let Some(value) = values.next().and_then(|value| value.parse().ok()) else {
+            eprintln!("terminal gateway: --port needs a port number");
+            std::process::exit(2);
+        };
+        port = value;
+    }
+    port
+}
+
 /// Starts `terminal server` detached, when no server answered: its own process group (nothing
 /// dies with this window's process group), no console window on Windows, and no inherited output.
 fn spawn_detached_server() {
@@ -1151,6 +1186,9 @@ impl ApplicationHandler<UserEvent> for App {
             // Gating is server-side: a viewer's mutating ops are dropped there, so there is
             // nothing to change locally (it keeps rendering and sending ops)
             UserEvent::Layout(WireEventKind::DriverChanged { .. }) => {}
+            // A gateway-only notice (another remote client holds the single remote slot): a
+            // window never receives one, so there is nothing to do
+            UserEvent::Layout(WireEventKind::Busy) => {}
             UserEvent::ConfigChanged => self.reload_config(event_loop),
         }
     }
@@ -1255,15 +1293,31 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
-    // 0. `terminal server` runs the headless server process and never returns to this window
-    match std::env::args().nth(1).as_deref() {
+    // 0. The subcommands: `terminal server` runs the headless server process, `terminal
+    //    gateway` fronts it for remote clients over the tailnet; the bare binary is the window
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
         Some("server") => {
             server::run_server_process();
             unreachable!("the server process serves until it is killed");
         }
-        // Reachable for future subcommands only; today the binary is the window and the server
+        Some("gateway") => {
+            // The allow-list lives in the configuration (empty denies everyone)
+            let loaded = config::load();
+            if let Some(error) = &loaded.error {
+                eprintln!("[config] {error}");
+            }
+            // Same endpoint resolution as the window: connect, or start the server detached
+            // and retry
+            let endpoint = IpcEndpoint::resolve();
+            ensure_server_running(&endpoint);
+            server::run_gateway_process(loaded.config.remote.allow, gateway_port(&args));
+            unreachable!("the gateway serves until it is killed");
+        }
+        // Reachable for future subcommands only; today the binary is the window, the server
+        // and the gateway
         Some(other) => {
-            eprintln!("unknown subcommand {other:?}; usage: terminal [server]");
+            eprintln!("unknown subcommand {other:?}; usage: terminal [server|gateway]");
             std::process::exit(2);
         }
         None => {}
