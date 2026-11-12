@@ -2,11 +2,13 @@
 //! point. It knows nothing about windows, the GPU or PTYs: it takes rectangles in physical
 //! pixels and returns rectangles, so everything can be tested with plain tests.
 
+use serde::{Deserialize, Serialize};
+
 /// Pane identifier; never reused during the app's lifetime
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PaneId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
@@ -36,14 +38,14 @@ impl Rect {
 }
 
 /// Minimum pane size (padding included), in pixels
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     pub min_w: u32,
     pub min_h: u32,
 }
 
 /// How a split's children are laid out
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Axis {
     /// Side by side (the divider is a vertical line): "split right"
     Horizontal,
@@ -51,7 +53,7 @@ pub enum Axis {
     Vertical,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dir {
     Left,
     Right,
@@ -74,7 +76,7 @@ impl Dir {
 }
 
 /// Edges of a floating pane under the pointer (two at once at a corner)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub left: bool,
     pub right: bool,
@@ -128,7 +130,7 @@ pub struct HitParams {
     pub move_ring: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     Leaf(PaneId),
     Split {
@@ -305,7 +307,7 @@ impl Node {
 }
 
 /// A floating pane, in window fractions, so it stays in place when the window resizes
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Float {
     pub id: PaneId,
     pub x: f32,
@@ -316,8 +318,8 @@ pub struct Float {
 
 /// The whole layout as plain data. The server owns the authoritative layout and sends this to
 /// the window after every applied mutation; the window rebuilds a read-only projection from it
-/// ([`Layout::from_state`]). No serde needed yet: over IPC it maps to JSON one to one.
-#[derive(Clone, Debug, PartialEq)]
+/// ([`Layout::from_state`]). It also travels: the wire carries it as JSON, field for field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayoutState {
     pub root: Node,
     pub focus: PaneId,
@@ -327,6 +329,16 @@ pub struct LayoutState {
     /// Focused panes, oldest to most recent. Part of the state so the projection answers
     /// recency queries (`split_target`, focus cycling) exactly like the server's layout.
     pub history: Vec<PaneId>,
+}
+
+impl LayoutState {
+    /// Every pane in the state, tiled and floating
+    pub fn pane_ids(&self) -> Vec<PaneId> {
+        let mut ids = Vec::new();
+        self.root.leaves(&mut ids);
+        ids.extend(self.floats.iter().map(|pane| pane.id));
+        ids
+    }
 }
 
 /// What happened when closing a pane

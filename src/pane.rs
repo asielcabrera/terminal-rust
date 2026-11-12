@@ -18,7 +18,6 @@ use crate::LuaEvent;
 use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
 use crate::pane_io::PaneIo;
-use crate::server::CreatedPane;
 
 /// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
 /// events (redraw, close) interleave instead of waiting until the end.
@@ -253,20 +252,38 @@ pub struct Pane {
     pub reported: Option<mouse::Button>,
 }
 
+/// What a pane is built from: the server-allocated pane id, the grid size it was spawned at,
+/// the fallback notice, and the connection to the program behind it (a [`ServerBlock`]
+/// in-process, an `IpcBlock` over the wire). The pane never knows which kind it got.
+pub struct PaneSeed {
+    pub pane: PaneId,
+    pub cols: u16,
+    pub rows: u16,
+    pub notice: Option<String>,
+    pub io: Box<dyn PaneIo>,
+}
+
 impl Pane {
     /// Builds the window-side pane around a block the server already started: a layout op
-    /// reported it in a [`CreatedPane`]. `notice` is written into the terminal before anything
-    /// else (e.g. the configuration error of the first pane).
-    pub fn from_block(
+    /// reported it (a `CreatedPane` locally, a wire pane over IPC), and its [`PaneSeed`] was
+    /// assembled here. `notice` is written into the terminal before anything else (e.g. the
+    /// configuration error of the first pane).
+    pub fn from_source(
         config: &Config,
-        created: CreatedPane,
+        source: PaneSeed,
         notice: Option<(&str, &str)>,
         lua_events: Sender<(PaneId, LuaEvent)>,
     ) -> Result<Pane, String> {
-        let id = created.pane;
+        let PaneSeed {
+            pane: id,
+            cols,
+            rows,
+            notice: shell_notice,
+            io,
+        } = source;
         let mut terminal = Terminal::new(TerminalOptions {
-            cols: created.cols,
-            rows: created.rows,
+            cols,
+            rows,
             max_scrollback: config.scrollback,
         })
         .map_err(vt_error)?;
@@ -274,7 +291,7 @@ impl Pane {
         if let Some((tag, message)) = notice {
             write_notice(&mut terminal, tag, message);
         }
-        if let Some(message) = &created.notice {
+        if let Some(message) = &shell_notice {
             write_notice(&mut terminal, "shell", message);
         }
 
@@ -309,8 +326,8 @@ impl Pane {
             terminal,
             render_state: RenderState::new().map_err(vt_error)?,
             rect: Rect::new(0, 0, 0, 0),
-            grid: (created.cols, created.rows),
-            io: Box::new(created.block),
+            grid: (cols, rows),
+            io,
             replies,
             gesture: Gesture::new().map_err(vt_error)?,
             selecting: false,
