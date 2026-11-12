@@ -2619,11 +2619,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 mod windows_pipe {
     //! Named pipes over the `kernel32` bindings: std has no named-pipe API, and the server must
-    //! stay dependency-free. Only byte mode, blocking calls, and handle duplication are used.
+    //! stay dependency-free. Only byte mode and blocking waits are used, but every handle is
+    //! opened for overlapped I/O. A synchronous handle serializes all I/O on its file object,
+    //! duplicates included, so a reader parked in `ReadFile` would keep `WriteFile` from ever
+    //! running: neither end could answer the other, and every ask timed out.
 
     use std::ffi::OsStr;
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::Arc;
 
     type Handle = isize;
 
@@ -2631,6 +2635,7 @@ mod windows_pipe {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     // Byte mode, blocking: 0
     const PIPE_MODE_BYTE_WAIT: u32 = 0;
@@ -2638,8 +2643,19 @@ mod windows_pipe {
     const BUFFER_BYTES: u32 = 64 * 1024;
     const ERROR_PIPE_CONNECTED: u32 = 535;
     const ERROR_PIPE_BUSY: u32 = 231;
-    const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+    const ERROR_IO_PENDING: u32 = 997;
     const WAIT_BUSY_MS: u32 = 2_000;
+
+    /// The kernel's `OVERLAPPED`: the offset pair stands for its union with a pointer (both are
+    /// eight bytes), and a pipe ignores it
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: Handle,
+    }
 
     unsafe extern "system" {
         fn CreateNamedPipeW(
@@ -2652,7 +2668,7 @@ mod windows_pipe {
             default_timeout_ms: u32,
             security: *const core::ffi::c_void,
         ) -> Handle;
-        fn ConnectNamedPipe(handle: Handle, overlapped: *const core::ffi::c_void) -> i32;
+        fn ConnectNamedPipe(handle: Handle, overlapped: *mut Overlapped) -> i32;
         fn CreateFileW(
             name: *const u16,
             access: u32,
@@ -2668,27 +2684,29 @@ mod windows_pipe {
             buffer: *mut u8,
             count: u32,
             read: *mut u32,
-            overlapped: *const core::ffi::c_void,
+            overlapped: *mut Overlapped,
         ) -> i32;
         fn WriteFile(
             handle: Handle,
             buffer: *const u8,
             count: u32,
             written: *mut u32,
-            overlapped: *const core::ffi::c_void,
+            overlapped: *mut Overlapped,
         ) -> i32;
         fn FlushFileBuffers(handle: Handle) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
         fn GetLastError() -> u32;
-        fn GetCurrentProcess() -> Handle;
-        fn DuplicateHandle(
-            source_process: Handle,
-            source: Handle,
-            target_process: Handle,
-            target: *mut Handle,
-            access: u32,
-            inherit: i32,
-            options: u32,
+        fn CreateEventW(
+            security: *const core::ffi::c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> Handle;
+        fn GetOverlappedResult(
+            handle: Handle,
+            overlapped: *mut Overlapped,
+            transferred: *mut u32,
+            wait: i32,
         ) -> i32;
     }
 
@@ -2707,25 +2725,54 @@ mod windows_pipe {
         }
     }
 
-    /// Duplicates a handle so the reader and the writer threads work on independent ones
-    fn duplicate(handle: Handle) -> io::Result<PipeHandle> {
-        let process = unsafe { GetCurrentProcess() };
-        let mut target = 0 as Handle;
-        let ok = unsafe {
-            DuplicateHandle(
-                process,
-                handle,
-                process,
-                &mut target,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if ok == 0 {
+    /// An event for one thread to wait on while its overlapped calls complete
+    fn new_event() -> io::Result<PipeHandle> {
+        // Manual reset, not signalled; a failure is NULL here, unlike the file handles
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event == 0 {
             return Err(last_error());
         }
-        Ok(PipeHandle(target))
+        Ok(PipeHandle(event))
+    }
+
+    /// Runs one overlapped call to its end and returns the bytes it moved. The call either
+    /// completes at once or reports that it is pending; the outcome is read the same way.
+    fn complete(
+        pipe: &PipeHandle,
+        event: &PipeHandle,
+        start: impl FnOnce(*mut Overlapped) -> i32,
+    ) -> io::Result<u32> {
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: event.0,
+        };
+        if start(&mut overlapped) == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
+            return Err(last_error());
+        }
+        let mut moved = 0u32;
+        if unsafe { GetOverlappedResult(pipe.0, &mut overlapped, &mut moved, 1) } == 0 {
+            return Err(last_error());
+        }
+        Ok(moved)
+    }
+
+    /// Splits a connected pipe into its reader and writer. They share the handle (the pipe
+    /// closes with the last of them) and each waits on an event of its own, so a parked read
+    /// never holds a write back.
+    fn halves(handle: PipeHandle) -> io::Result<(PipeReader, PipeWriter)> {
+        let pipe = Arc::new(handle);
+        let reader = PipeReader {
+            pipe: pipe.clone(),
+            event: new_event()?,
+        };
+        let writer = PipeWriter {
+            pipe,
+            event: new_event()?,
+        };
+        Ok((reader, writer))
     }
 
     fn last_error() -> io::Error {
@@ -2737,51 +2784,41 @@ mod windows_pipe {
     }
 
     /// The read half of a pipe
-    pub(crate) struct PipeReader(PipeHandle);
+    pub(crate) struct PipeReader {
+        pipe: Arc<PipeHandle>,
+        event: PipeHandle,
+    }
 
     impl Read for PipeReader {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let mut read = 0u32;
-            let ok = unsafe {
-                ReadFile(
-                    self.0.0,
-                    buffer.as_mut_ptr(),
-                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
-                    &mut read,
-                    std::ptr::null(),
-                )
-            };
-            if ok == 0 {
-                return Err(last_error());
-            }
+            let count = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+            let target = buffer.as_mut_ptr();
+            let read = complete(&self.pipe, &self.event, |overlapped| unsafe {
+                ReadFile(self.pipe.0, target, count, std::ptr::null_mut(), overlapped)
+            })?;
             Ok(read as usize)
         }
     }
 
     /// The write half of a pipe
-    pub(crate) struct PipeWriter(PipeHandle);
+    pub(crate) struct PipeWriter {
+        pipe: Arc<PipeHandle>,
+        event: PipeHandle,
+    }
 
     impl Write for PipeWriter {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            let mut written = 0u32;
-            let ok = unsafe {
-                WriteFile(
-                    self.0.0,
-                    buffer.as_ptr(),
-                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
-                    &mut written,
-                    std::ptr::null(),
-                )
-            };
-            if ok == 0 {
-                return Err(last_error());
-            }
+            let count = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+            let source = buffer.as_ptr();
+            let written = complete(&self.pipe, &self.event, |overlapped| unsafe {
+                WriteFile(self.pipe.0, source, count, std::ptr::null_mut(), overlapped)
+            })?;
             Ok(written as usize)
         }
 
         fn flush(&mut self) -> io::Result<()> {
             unsafe {
-                FlushFileBuffers(self.0.0);
+                FlushFileBuffers(self.pipe.0);
             }
             Ok(())
         }
@@ -2812,7 +2849,7 @@ mod windows_pipe {
             let handle = unsafe {
                 CreateNamedPipeW(
                     wide.as_ptr(),
-                    PIPE_ACCESS_DUPLEX,
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                     PIPE_MODE_BYTE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
                     BUFFER_BYTES,
@@ -2825,15 +2862,16 @@ mod windows_pipe {
                 return Err(last_error());
             }
             let owned = PipeHandle(handle);
-            let connected = unsafe { ConnectNamedPipe(owned.0, std::ptr::null()) };
-            if connected == 0 {
-                // ERROR_PIPE_CONNECTED: the client connected between the two calls
-                if unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
-                    return Err(last_error());
-                }
+            let event = new_event()?;
+            match complete(&owned, &event, |overlapped| unsafe {
+                ConnectNamedPipe(owned.0, overlapped)
+            }) {
+                Ok(_) => {}
+                // The client connected between the two calls
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) => {}
+                Err(error) => return Err(error),
             }
-            let write = duplicate(owned.0)?;
-            Ok((PipeReader(owned), PipeWriter(write)))
+            halves(owned)
         }
     }
 
@@ -2856,13 +2894,12 @@ mod windows_pipe {
                     0,
                     std::ptr::null(),
                     OPEN_EXISTING,
-                    0,
+                    FILE_FLAG_OVERLAPPED,
                     0,
                 )
             };
             if handle != INVALID_HANDLE {
-                let write = duplicate(handle)?;
-                return Ok((PipeReader(PipeHandle(handle)), PipeWriter(write)));
+                return halves(PipeHandle(handle));
             }
             if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
                 waits += 1;
@@ -2875,6 +2912,142 @@ mod windows_pipe {
                 continue;
             }
             return Err(last_error());
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::mpsc::{Receiver, channel};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        const LIMIT: Duration = Duration::from_secs(10);
+
+        /// A pipe name no other test (or server) uses
+        fn unique_name(tag: &str) -> String {
+            format!(r"\\.\pipe\terminal-rs-test-{}-{tag}", std::process::id())
+        }
+
+        /// Connects to `name` once the accepting thread has created its instance
+        fn connect_when_listening(name: &str) -> (PipeReader, PipeWriter) {
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                match connect_client(name) {
+                    Ok(halves) => return halves,
+                    Err(error) if Instant::now() >= deadline => {
+                        panic!("the client could not connect: {error}")
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        }
+
+        /// A connected pair: the client's halves and the server's
+        fn connected_pair(tag: &str) -> ((PipeReader, PipeWriter), (PipeReader, PipeWriter)) {
+            let name = unique_name(tag);
+            let listener = PipeListener::bind(&name).expect("the name is free");
+            let server = thread::spawn(move || listener.accept().expect("a client connects"));
+            let client = connect_when_listening(&name);
+            (client, server.join().expect("the accept thread ends"))
+        }
+
+        /// Reads exactly `len` bytes on its own thread, so a deadlock fails the test instead of
+        /// hanging it
+        fn read_in_background(mut read: PipeReader, len: usize) -> Receiver<Vec<u8>> {
+            let (tx, rx) = channel();
+            thread::spawn(move || {
+                let mut bytes = vec![0u8; len];
+                if read.read_exact(&mut bytes).is_ok() {
+                    let _ = tx.send(bytes);
+                }
+            });
+            rx
+        }
+
+        #[test]
+        fn a_parked_read_does_not_hold_back_a_write_on_the_same_end() {
+            let ((client_read, mut client_write), (mut server_read, mut server_write)) =
+                connected_pair("duplex");
+            // The session's reader parks on the server end, waiting for the next request...
+            let parked = thread::spawn(move || {
+                let mut request = [0u8; 4];
+                server_read.read_exact(&mut request).map(|()| request)
+            });
+            thread::sleep(Duration::from_millis(200));
+            // ...and the server must still answer, or the client's ask would time out
+            let reply = read_in_background(client_read, 5);
+            thread::spawn(move || {
+                server_write
+                    .write_all(b"reply")
+                    .expect("the reply is written");
+                server_write.flush().expect("the reply is flushed");
+                server_write
+            });
+            assert_eq!(
+                reply.recv_timeout(LIMIT).expect("the reply arrives"),
+                b"reply"
+            );
+            // The same holds for the client's own end, which parks in its reader loop
+            client_write
+                .write_all(b"ping")
+                .expect("the request is written");
+            client_write.flush().expect("the request is flushed");
+            assert_eq!(
+                parked
+                    .join()
+                    .expect("the parked read ends")
+                    .expect("it reads the request"),
+                *b"ping"
+            );
+        }
+
+        #[test]
+        fn a_closed_peer_ends_the_pending_read_instead_of_hanging_it() {
+            let (client, (mut server_read, _server_write)) = connected_pair("closed");
+            let parked = thread::spawn(move || {
+                let mut byte = [0u8; 1];
+                server_read.read(&mut byte)
+            });
+            thread::sleep(Duration::from_millis(200));
+            drop(client);
+            assert!(
+                parked.join().expect("the parked read ends").is_err(),
+                "a broken pipe is reported as an error"
+            );
+        }
+
+        #[test]
+        fn a_second_client_connects_while_the_first_stays_attached() {
+            let name = unique_name("two");
+            let listener = PipeListener::bind(&name).expect("the name is free");
+            let (accepted_tx, accepted_rx) = channel();
+            thread::spawn(move || {
+                // Like the accept loop: an instance per connection, one after another
+                for _ in 0..2 {
+                    accepted_tx
+                        .send(listener.accept().expect("a client connects"))
+                        .expect("the test still listens");
+                }
+            });
+            let first = connect_when_listening(&name);
+            let second = connect_when_listening(&name);
+            let _first_server = accepted_rx
+                .recv_timeout(LIMIT)
+                .expect("the first is accepted");
+            let (_, mut second_server_write) = accepted_rx
+                .recv_timeout(LIMIT)
+                .expect("the second is accepted");
+            second_server_write
+                .write_all(b"hi")
+                .expect("the second client is served");
+            assert_eq!(
+                read_in_background(second.0, 2)
+                    .recv_timeout(LIMIT)
+                    .expect("the second client hears the server"),
+                b"hi"
+            );
+            drop(first);
         }
     }
 }
@@ -6171,6 +6344,61 @@ mod tests {
     // Two and three clients over one socket: the most recently attached one drives, the
     // others watch; take-over, gating and promotion are all server-side. The socket harness
     // is unix-only; Windows exercises the same policies through the transport abstraction.
+
+    /// The wire over a real named pipe: a window attaches to a fresh server and a second
+    /// connection (like the automation CLI) attaches to the same session. Every ask needs the
+    /// server to write while its session reader is parked, which a synchronous pipe handle
+    /// never allowed (the asks timed out and the window panicked).
+    #[cfg(windows)]
+    #[test]
+    fn a_window_and_a_second_client_attach_over_a_named_pipe() {
+        let endpoint = IpcEndpoint::Pipe(format!(
+            r"\\.\pipe\terminal-rs-test-{}-attach",
+            std::process::id()
+        ));
+        let (server, layout_events) = Server::start();
+        let shared = Arc::new(ProcessShared::default());
+        let router_shared = shared.clone();
+        thread::spawn(move || route_events(layout_events, router_shared));
+        let listener = IpcListener::bind(&endpoint).expect("the endpoint binds");
+        let accept_handle = server.clone();
+        thread::spawn(move || accept_sessions(listener, accept_handle, shared));
+
+        // The accepting thread creates its first instance on its own schedule
+        let connect = || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match IpcConn::connect(&endpoint) {
+                    Ok((conn, read)) => {
+                        let reader = conn.clone();
+                        thread::spawn(move || reader.read_loop(read, |_| {}));
+                        return conn;
+                    }
+                    Err(error) if Instant::now() >= deadline => {
+                        panic!("the client could not connect: {error}")
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        };
+
+        let window = connect();
+        match window
+            .attach(&waiting(), 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { .. } => {}
+            other => panic!("expected a fresh server, got {other:?}"),
+        }
+        let second = connect();
+        match second
+            .attach(&waiting(), 80, 24, 1000)
+            .expect("the second attach answers")
+        {
+            AttachAnswer::Existing { panes, .. } => assert_eq!(panes.len(), 1),
+            other => panic!("expected the existing layout, got {other:?}"),
+        }
+    }
 
     #[cfg(unix)]
     static HARNESS_SEQ: AtomicU64 = AtomicU64::new(0);
