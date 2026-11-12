@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -1456,6 +1457,12 @@ pub(crate) mod wire {
         pub(crate) fn snapshot(rid: u64, bytes: Vec<u8>) -> Self {
             Self::new(rid, WireReplyKind::Snapshot { bytes })
         }
+
+        /// The gateway's hello: who the remote client authenticated as. Sent right after the
+        /// websocket upgrade, with `rid` 0 — gateway-initiated, no ask behind it.
+        pub(crate) fn hello(login: String) -> Self {
+            Self::new(0, WireReplyKind::Hello { login })
+        }
     }
 
     /// What a reply answers with
@@ -1484,6 +1491,11 @@ pub(crate) mod wire {
         },
         Snapshot {
             bytes: Vec<u8>,
+        },
+        /// The gateway's hello: the login the remote client authenticated as (see
+        /// [`WireReply::hello`])
+        Hello {
+            login: String,
         },
     }
 
@@ -1540,6 +1552,10 @@ pub(crate) mod wire {
         DriverChanged {
             is_driver: bool,
         },
+        /// Only the gateway sends it, over the websocket: another remote client already holds
+        /// the gateway's single remote slot, and the connection closes right after. A window
+        /// never receives one.
+        Busy,
     }
 
     /// What decoding a frame can answer with
@@ -1647,6 +1663,351 @@ pub(crate) mod wire {
             Deframed::Message { bytes, consumed } => serde_json::from_slice(&bytes)
                 .map(|message| Some((message, consumed)))
                 .map_err(WireError::Json),
+        }
+    }
+}
+
+// ---- A minimal RFC 6455 WebSocket server (the tailnet gateway's transport) -------------------
+//
+// Hand-rolled on the standard library (plus `sha1_smol` and `base64` for the handshake digest)
+// to keep the dependency tree light: the protocol the gateway needs is small and the whole
+// surface is unit-tested below. Minimal-client assumptions, by design:
+//
+// - Client frames MUST be masked (RFC 6455 §5.1); an unmasked one is a protocol error.
+// - Data is binary only. A text frame is refused (the wire protocol has its own framing), and
+//   `permessage-deflate` is not negotiated, so RSV bits set are a protocol error.
+// - Fragmented binary messages are JOINED, never rejected: continuation frames accumulate into
+//   one message, capped at `wire::MAX_FRAME`.
+// - Pings are answered with matching pongs; pongs from the client are ignored.
+// - A close frame is echoed once and reported; no half-open close handshake.
+// - The upgrade request is read byte-by-byte up to the blank line, so no buffered frame bytes
+//   are ever lost (real clients wait for the 101 anyway; pipelining is not supported).
+//
+// The identity headers (`Tailscale-User-Login` / `Tailscale-User-Name`) are ONLY trusted
+// because `tailscale serve` injects them for trusted tailnet traffic. Anything hitting this
+// port directly can set them at will, which is acceptable because the gateway binds 127.0.0.1
+// only and real deployments front it with tailscale.
+pub(crate) mod ws {
+    use base64::Engine as _;
+    use std::io::{self, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+
+    /// The WebSocket GUID the accept key hashes over (RFC 6455 §1.3)
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    const OP_CONTINUATION: u8 = 0x0;
+    const OP_TEXT: u8 = 0x1;
+    const OP_BINARY: u8 = 0x2;
+    const OP_CLOSE: u8 = 0x8;
+    const OP_PING: u8 = 0x9;
+    const OP_PONG: u8 = 0xA;
+
+    fn protocol_error(why: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, why.to_string())
+    }
+
+    /// The upgrade request the client sent, as far as the gateway cares
+    pub(crate) struct Request {
+        /// `Sec-WebSocket-Key`, required to answer the upgrade
+        pub(crate) key: Option<String>,
+        /// `Tailscale-User-Login`, injected by `tailscale serve` for trusted traffic
+        pub(crate) login: Option<String>,
+        /// `Tailscale-User-Name`, the fallback identity header
+        pub(crate) name: Option<String>,
+    }
+
+    /// Reads the request head byte-by-byte up to the blank line (no buffering: whatever the
+    /// client sends after the head is never lost)
+    fn read_head(stream: &mut TcpStream) -> io::Result<String> {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() > 16 * 1024 {
+                return Err(protocol_error("the upgrade request head is too large"));
+            }
+            if stream.read(&mut byte)? == 0 {
+                return Err(protocol_error("the upgrade request ended mid-head"));
+            }
+            head.push(byte[0]);
+        }
+        Ok(String::from_utf8_lossy(&head).into_owned())
+    }
+
+    /// Parses the upgrade request. Only what the gateway needs is read; a request without a
+    /// handshake key simply carries `key: None` and is answered with a bad request.
+    pub(crate) fn read_upgrade_request(stream: &mut TcpStream) -> io::Result<Request> {
+        let head = read_head(stream)?;
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap_or_default();
+        if !request_line.starts_with("GET ") {
+            return Err(protocol_error("the request is not a websocket upgrade"));
+        }
+        let mut request = Request {
+            key: None,
+            login: None,
+            name: None,
+        };
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            match name.trim().to_ascii_lowercase().as_str() {
+                "sec-websocket-key" => request.key = Some(value.trim().to_string()),
+                "sec-websocket-version" if value.trim() != "13" => {
+                    return Err(protocol_error("only websocket version 13 is spoken"));
+                }
+                "tailscale-user-login" => request.login = Some(value.trim().to_string()),
+                "tailscale-user-name" => request.name = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+        Ok(request)
+    }
+
+    /// The `Sec-WebSocket-Accept` value for a handshake key (RFC 6455 §1.3)
+    pub(crate) fn accept_key(key: &str) -> String {
+        use sha1_smol::Sha1;
+        let mut sha = Sha1::new();
+        sha.update(key.as_bytes());
+        sha.update(GUID.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(sha.digest().bytes())
+    }
+
+    fn write_response(mut stream: &TcpStream, head: &str) -> io::Result<()> {
+        stream.write_all(head.as_bytes())
+    }
+
+    /// Answers the upgrade: 101 with the computed accept header
+    pub(crate) fn write_switching(stream: &TcpStream, key: &str) -> io::Result<()> {
+        write_response(
+            stream,
+            &format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept_key(key)
+            ),
+        )
+    }
+
+    /// Refuses the upgrade: the identity is not in `remote.allow`
+    pub(crate) fn write_forbidden(stream: &TcpStream) -> io::Result<()> {
+        write_response(
+            stream,
+            "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+    }
+
+    /// The upgrade request was not a websocket upgrade
+    pub(crate) fn write_bad_request(stream: &TcpStream) -> io::Result<()> {
+        write_response(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+    }
+
+    /// One WebSocket frame
+    struct Frame {
+        fin: bool,
+        opcode: u8,
+        payload: Vec<u8>,
+    }
+
+    /// Reads one client frame. Client frames must be masked (RFC 6455 §5.1); the payload is
+    /// unmasked in place. Control frames carry at most 125 bytes and are never fragmented.
+    fn read_frame<R: Read>(mut read: R) -> io::Result<Frame> {
+        let mut head = [0u8; 2];
+        read.read_exact(&mut head)?;
+        if head[0] & 0x70 != 0 {
+            return Err(protocol_error(
+                "extension bits set, but no extension was negotiated",
+            ));
+        }
+        let fin = head[0] & 0x80 != 0;
+        let opcode = head[0] & 0x0f;
+        if head[1] & 0x80 == 0 {
+            return Err(protocol_error("unmasked client frame (RFC 6455 §5.1)"));
+        }
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                read.read_exact(&mut extended)?;
+                u16::from_be_bytes(extended) as usize
+            }
+            127 => {
+                let mut extended = [0u8; 8];
+                read.read_exact(&mut extended)?;
+                let len = u64::from_be_bytes(extended);
+                if len > super::wire::MAX_FRAME as u64 {
+                    return Err(protocol_error(
+                        "a frame exceeded the protocol's length limit",
+                    ));
+                }
+                len as usize
+            }
+            len => len as usize,
+        };
+        if opcode >= 0x8 && (len > 125 || !fin) {
+            return Err(protocol_error("a control frame is fragmented or too large"));
+        }
+        let mut mask = [0u8; 4];
+        read.read_exact(&mut mask)?;
+        let mut payload = vec![0u8; len];
+        read.read_exact(&mut payload)?;
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+        Ok(Frame {
+            fin,
+            opcode,
+            payload,
+        })
+    }
+
+    /// Writes one server frame — never masked (RFC 6455 §5.1); messages go out whole
+    fn write_frame<W: Write>(mut write: W, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x80 | opcode);
+        match payload.len() {
+            0..=125 => frame.push(payload.len() as u8),
+            126..=0xFFFF => {
+                frame.push(126);
+                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            }
+            _ => {
+                frame.push(127);
+                frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(payload);
+        write.write_all(&frame)
+    }
+
+    /// One message off the wire: the only kinds this protocol carries
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Message {
+        Binary(Vec<u8>),
+        /// The peer closed, with its status code (if it sent one)
+        Close(Option<u16>),
+    }
+
+    /// The write half of a websocket connection: whole binary messages, one close frame
+    #[derive(Clone)]
+    pub(crate) struct WsWriter {
+        write: Arc<Mutex<TcpStream>>,
+    }
+
+    impl WsWriter {
+        /// Any frame out (binary messages, pong echoes)
+        fn write_frame_as(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+            let mut write = self.write.lock().unwrap();
+            write_frame(&mut *write, opcode, payload)
+        }
+
+        /// A whole binary message
+        pub(crate) fn write_binary(&self, bytes: &[u8]) -> io::Result<()> {
+            self.write_frame_as(OP_BINARY, bytes)
+        }
+
+        /// A close frame with a status code. Best effort: callers are closing anyway.
+        pub(crate) fn write_close(&self, code: u16) {
+            let _ = self.write_frame_as(OP_CLOSE, &code.to_be_bytes());
+        }
+
+        /// Ends the connection in both directions
+        pub(crate) fn shutdown(&self) {
+            let _ = self
+                .write
+                .lock()
+                .unwrap()
+                .shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// The read half of a websocket connection
+    pub(crate) struct WsReader {
+        read: TcpStream,
+        /// The write half, shared for pong and close echoes from the reading thread
+        write: WsWriter,
+    }
+
+    impl WsReader {
+        /// The next message. Pings are answered in place through the shared write half, pongs
+        /// are ignored, and fragmented binary messages are joined. Anything else that is not a
+        /// binary message or a close is a protocol error; the caller ends the connection.
+        pub(crate) fn read_message(&mut self) -> io::Result<Message> {
+            let mut fragments: Option<Vec<u8>> = None;
+            loop {
+                let frame = read_frame(&mut self.read)?;
+                match frame.opcode {
+                    OP_BINARY => {
+                        if fragments.is_some() {
+                            return Err(protocol_error(
+                                "a message started before its fragments ended",
+                            ));
+                        }
+                        if frame.fin {
+                            return Ok(Message::Binary(frame.payload));
+                        }
+                        fragments = Some(frame.payload);
+                    }
+                    OP_CONTINUATION => {
+                        let Some(accumulated) = fragments.as_mut() else {
+                            return Err(protocol_error("a continuation frame opened no message"));
+                        };
+                        if accumulated.len() + frame.payload.len() > super::wire::MAX_FRAME {
+                            return Err(protocol_error(
+                                "a message exceeded the protocol's length limit",
+                            ));
+                        }
+                        accumulated.extend_from_slice(&frame.payload);
+                        if frame.fin {
+                            return Ok(Message::Binary(fragments.take().unwrap_or_default()));
+                        }
+                    }
+                    OP_PING => self.write.write_frame_as(OP_PONG, &frame.payload)?,
+                    OP_PONG => {}
+                    OP_CLOSE => {
+                        let code = if frame.payload.len() >= 2 {
+                            Some(u16::from_be_bytes([frame.payload[0], frame.payload[1]]))
+                        } else {
+                            None
+                        };
+                        self.write.write_close(code.unwrap_or(1000));
+                        return Ok(Message::Close(code));
+                    }
+                    OP_TEXT => {
+                        return Err(protocol_error(
+                            "text frames are not part of this protocol (binary only)",
+                        ));
+                    }
+                    other => {
+                        return Err(protocol_error(&format!(
+                            "unknown websocket opcode: {other}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A freshly upgraded websocket: its reader and writer halves (the writer is shared so
+    /// the reader thread can answer pings and closes while data streams out)
+    pub(crate) struct Ws;
+
+    impl Ws {
+        pub(crate) fn from_stream(stream: TcpStream) -> io::Result<(WsReader, WsWriter)> {
+            let write = stream.try_clone()?;
+            let writer = WsWriter {
+                write: Arc::new(Mutex::new(write)),
+            };
+            let reader = WsReader {
+                read: stream,
+                write: writer.clone(),
+            };
+            Ok((reader, writer))
         }
     }
 }
@@ -3574,6 +3935,266 @@ impl PaneIo for ServerBlock {
 // There is no close-on-drop: sessions hand their block views back to the server process when
 // they end (the shells must outlive the window), so dropping a view is never a close. In-process
 // closing goes through `Request::Close` / `LayoutClose` explicitly.
+
+// ---- The WebSocket gateway for remote clients (stage 5a) ------------------------------------
+//
+// `terminal gateway` fronts the local server for ONE remote client at a time over a loopback
+// HTTP port, which real deployments expose with `tailscale serve` (TLS and the identity
+// headers come from tailscale). The remote protocol is the existing wire over WebSocket:
+// binary messages with the 1-byte type prefix (0 control JSON, 1 data, 2 data-snapshot) and
+// identical payloads. The gateway itself is a transport bridge, not a window: its connection
+// to the local server is a regular S4 session, so the registry, driver policy and event fan-out
+// serve a remote client unchanged (attach → the remote client drives, like any window).
+
+/// The default loopback port `terminal gateway` serves on. Real deployments front it with
+/// `tailscale serve`, which proxies a tailnet HTTPS endpoint onto this port.
+pub const DEFAULT_GATEWAY_PORT: u16 = 42061;
+
+/// Both halves of the gateway's own session at the local server
+fn connect_server_halves(endpoint: &IpcEndpoint) -> io::Result<(Box<dyn Read + Send>, ConnWrite)> {
+    #[cfg(unix)]
+    match endpoint {
+        IpcEndpoint::Socket(path) => {
+            let stream = UnixStream::connect(path)?;
+            let read = stream
+                .try_clone()
+                .expect("could not clone the socket for its reader half");
+            Ok((Box::new(read), ConnWrite::Socket(stream)))
+        }
+    }
+    #[cfg(windows)]
+    match endpoint {
+        IpcEndpoint::Pipe(name) => {
+            let (read, write) = windows_pipe::connect_client(name)?;
+            Ok((Box::new(read), ConnWrite::Pipe(Box::new(write))))
+        }
+    }
+}
+
+/// A control message as a WebSocket binary message: the 1-byte type prefix, then the JSON
+fn ws_control_frame<T: serde::Serialize>(message: &T) -> Vec<u8> {
+    let mut frame = vec![FRAME_CONTROL];
+    if let Ok(json) = serde_json::to_vec(message) {
+        frame.extend_from_slice(&json);
+    }
+    frame
+}
+
+/// Block data (or a snapshot) as a WebSocket binary message: the 1-byte type prefix, the
+/// block token, then the bytes
+fn ws_data_frame(kind: u8, token: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + bytes.len());
+    frame.push(kind);
+    frame.extend_from_slice(&token.to_le_bytes());
+    frame.extend_from_slice(bytes);
+    frame
+}
+
+/// A remote control message as a local control frame for the server session
+fn server_control_frame(json: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(json.len() + 5);
+    frame.push(FRAME_CONTROL);
+    frame.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    frame.extend_from_slice(json);
+    frame
+}
+
+/// Releases the gateway's one-remote-client slot when the bridge ends
+struct BusySlotGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusySlotGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Serves one remote client over `stream`: upgrades it (or refuses it), then bridges the
+/// websocket to the local server as a regular session. `slot` gates exactly one remote
+/// client; it is claimed for the duration and released when the bridge ends.
+fn serve_gateway_conn(
+    mut stream: TcpStream,
+    endpoint: &IpcEndpoint,
+    allow: &[String],
+    slot: &AtomicBool,
+) {
+    let request = match ws::read_upgrade_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("[gateway] a websocket upgrade failed: {error}");
+            let _ = ws::write_bad_request(&stream);
+            return;
+        }
+    };
+    let Some(key) = request.key else {
+        let _ = ws::write_bad_request(&stream);
+        return;
+    };
+    // Identity: `Tailscale-User-Login`, falling back to `Tailscale-User-Name`. The headers are
+    // trusted ONLY because `tailscale serve` injects them for trusted tailnet traffic — a
+    // direct loopback hit can spoof them trivially, which is why the port binds 127.0.0.1
+    // and real deployments front it with tailscale. An empty allow-list denies everyone.
+    let login = request.login.clone().or_else(|| request.name.clone());
+    let Some(login) = login.filter(|login| allow.iter().any(|allowed| allowed == login)) else {
+        eprintln!(
+            "[gateway] refused a remote client (login {:?} is not in remote.allow)",
+            request.login.or(request.name)
+        );
+        let _ = ws::write_forbidden(&stream);
+        return;
+    };
+    eprintln!("[gateway] {login} is attaching remotely");
+
+    // Exactly one remote client at a time: a second one upgrades, gets a Busy event, and
+    // closes right away (the local windows are unaffected)
+    if slot.swap(true, Ordering::AcqRel) {
+        eprintln!("[gateway] another remote client is already attached; refusing {login}");
+        if ws::write_switching(&stream, &key).is_ok()
+            && let Ok((reader, writer)) = ws::Ws::from_stream(stream)
+        {
+            let _ = writer.write_binary(&ws_control_frame(&WireEvent {
+                v: WIRE_VERSION,
+                event: WireEventKind::Busy,
+            }));
+            writer.write_close(1013);
+            drop(reader);
+        }
+        return;
+    }
+    let _slot = BusySlotGuard(slot);
+
+    // The upgrade is answered: the remote protocol starts here
+    if let Err(error) = ws::write_switching(&stream, &key) {
+        eprintln!("[gateway] the 101 could not go out: {error}");
+        return;
+    }
+    let Ok((mut reader, writer)) = ws::Ws::from_stream(stream) else {
+        eprintln!("[gateway] the upgraded socket could not split into halves");
+        return;
+    };
+    // Hello: who the remote client authenticated as
+    let _ = writer.write_binary(&ws_control_frame(&WireReply::hello(login.clone())));
+
+    // The gateway's own session at the local server: a regular client of it
+    let (mut server_read, mut server_write) = match connect_server_halves(endpoint) {
+        Ok(halves) => halves,
+        Err(error) => {
+            eprintln!("[gateway] could not reach the terminal server: {error}");
+            writer.write_close(1011);
+            return;
+        }
+    };
+
+    // Uplink: remote control frames become server control frames. A remote client never sends
+    // data frames; anything else — or the close of the websocket — ends the session.
+    let uplink = thread::Builder::new()
+        .name("terminal-gateway-uplink".to_string())
+        .spawn(move || {
+            loop {
+                match reader.read_message() {
+                    Ok(ws::Message::Binary(bytes)) => match bytes.first() {
+                        Some(&FRAME_CONTROL) => {
+                            if server_write
+                                .send_frame(&server_control_frame(&bytes[1..]))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(&kind) => {
+                            eprintln!(
+                                "[gateway] the remote client sent a {kind} frame; only control frames travel up"
+                            );
+                            break;
+                        }
+                        None => break,
+                    },
+                    Ok(ws::Message::Close(code)) => {
+                        if let Some(code) = code {
+                            eprintln!("[gateway] the remote client closed with {code}");
+                        }
+                        break;
+                    }
+                    Err(_) => break, // the websocket is gone
+                }
+            }
+            // The session at the server ends with the websocket: its reader gets an
+            // end-of-file and frees the slot
+            server_write.shutdown();
+        })
+        .expect("could not start the gateway uplink thread");
+
+    // Downlink: replies, events and block data stream through to the remote client
+    let downlink_writer = writer.clone();
+    let downlink = thread::Builder::new()
+        .name("terminal-gateway-downlink".to_string())
+        .spawn(move || {
+            while let Ok(frame) = read_typed_frame(&mut *server_read) {
+                let message = match frame {
+                    WireFrame::Control(json) => {
+                        let mut message = vec![FRAME_CONTROL];
+                        message.extend_from_slice(&json);
+                        message
+                    }
+                    WireFrame::Data(token, bytes) => ws_data_frame(FRAME_DATA, token, &bytes),
+                    WireFrame::Snapshot(token, bytes) => {
+                        ws_data_frame(FRAME_SNAPSHOT, token, &bytes)
+                    }
+                };
+                if downlink_writer.write_binary(&message).is_err() {
+                    break; // the remote client is gone
+                }
+            }
+            // The remote client lost its server: end the websocket in both directions
+            downlink_writer.write_close(1011);
+            downlink_writer.shutdown();
+        })
+        .expect("could not start the gateway downlink thread");
+
+    let _ = uplink.join();
+    let _ = downlink.join();
+}
+
+/// Accepts remote clients one after another; `allow` is the configured `remote.allow` list.
+/// Also the entry point the tests drive against their own listener and server.
+fn accept_gateway(listener: TcpListener, endpoint: IpcEndpoint, allow: Vec<String>) {
+    let slot = Arc::new(AtomicBool::new(false));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let endpoint = endpoint.clone();
+                let allow = allow.clone();
+                let slot = slot.clone();
+                thread::Builder::new()
+                    .name("terminal-gateway".to_string())
+                    .spawn(move || serve_gateway_conn(stream, &endpoint, &allow, &slot))
+                    .expect("could not start the gateway thread");
+            }
+            Err(error) => {
+                eprintln!("[gateway] accept failed: {error}");
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// The entry point of `terminal gateway`: serves remote clients over a loopback WebSocket
+/// until killed. `allow` is the configured `remote.allow` list — empty denies everyone.
+/// Real deployments front the port with `tailscale serve`, which supplies the identity
+/// headers the gateway trusts.
+pub fn run_gateway_process(allow: Vec<String>, port: u16) {
+    let listener = match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("[gateway] could not listen on 127.0.0.1:{port}: {error}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[gateway] serving remote clients on ws://127.0.0.1:{port} (front it with `tailscale serve`)"
+    );
+    let endpoint = IpcEndpoint::resolve();
+    accept_gateway(listener, endpoint, allow);
+}
 
 #[cfg(test)]
 mod tests {
@@ -5622,5 +6243,486 @@ mod tests {
         let (third, _third_events) = harness.client();
         let (_, exited) = attach_existing(&third);
         assert!(exited.is_empty(), "the list is cleared once delivered");
+    }
+
+    // ---- WebSocket gateway (stage 5a) ------------------------------------------------------
+
+    /// A loopback TCP pair: the server end wrapped in a `Ws`, the client end raw (tests write
+    /// masked frames on it, exactly what a WebSocket client must send)
+    fn ws_pair() -> (ws::WsReader, ws::WsWriter, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let addr = listener.local_addr().expect("the address is known");
+        let client = TcpStream::connect(addr).expect("the loopback client connects");
+        let (server, _) = listener.accept().expect("the loopback server accepts");
+        let (reader, writer) = ws::Ws::from_stream(server).expect("the websocket opens");
+        (reader, writer, client)
+    }
+
+    /// A masked client frame (opcode, fin, payload): what a WebSocket client must send
+    fn masked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        let mut frame = vec![(if fin { 0x80 } else { 0x00 }) | opcode];
+        match payload.len() {
+            0..=125 => frame.push(0x80 | payload.len() as u8),
+            126..=0xFFFF => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            }
+            _ => {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[index % 4]);
+        }
+        frame
+    }
+
+    /// Reads one unmasked server frame off the client end: its opcode and payload
+    fn read_server_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut head = [0u8; 2];
+        stream
+            .read_exact(&mut head)
+            .expect("the frame head arrives");
+        let opcode = head[0] & 0x0f;
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                stream
+                    .read_exact(&mut extended)
+                    .expect("the length arrives");
+                u16::from_be_bytes(extended) as usize
+            }
+            127 => {
+                let mut extended = [0u8; 8];
+                stream
+                    .read_exact(&mut extended)
+                    .expect("the length arrives");
+                u64::from_be_bytes(extended) as usize
+            }
+            len => len as usize,
+        };
+        let mut payload = vec![0u8; len];
+        stream
+            .read_exact(&mut payload)
+            .expect("the payload arrives");
+        (opcode, payload)
+    }
+
+    /// Sends a WebSocket binary message from the test client: a masked frame over `bytes`
+    fn ws_send(stream: &mut TcpStream, bytes: &[u8]) {
+        stream
+            .write_all(&masked_frame(0x2, true, bytes))
+            .expect("the frame goes out");
+    }
+
+    /// Sends a control message from the test client: the 1-byte type prefix, then the JSON
+    #[cfg(unix)]
+    fn ws_send_control(stream: &mut TcpStream, message: &impl serde::Serialize) {
+        let json = serde_json::to_vec(message).expect("serializes");
+        let mut message = vec![FRAME_CONTROL];
+        message.extend_from_slice(&json);
+        ws_send(stream, &message);
+    }
+
+    /// Reads one WebSocket binary message off the test client (the server never fragments out);
+    /// `None` when nothing arrived within the read timeout
+    #[cfg(unix)]
+    fn ws_recv_maybe(stream: &mut TcpStream) -> Option<Vec<u8>> {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("the read timeout is set");
+        let mut head = [0u8; 2];
+        match stream.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return None;
+            }
+            Err(error) => panic!("the server frame failed: {error}"),
+        }
+        let opcode = head[0] & 0x0f;
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                stream
+                    .read_exact(&mut extended)
+                    .expect("the length arrives");
+                u16::from_be_bytes(extended) as usize
+            }
+            127 => {
+                let mut extended = [0u8; 8];
+                stream
+                    .read_exact(&mut extended)
+                    .expect("the length arrives");
+                u64::from_be_bytes(extended) as usize
+            }
+            len => len as usize,
+        };
+        // Once the head arrived the payload follows whole: clear the timeout so a slow chunk
+        // cannot lose the frame's tail
+        stream
+            .set_read_timeout(None)
+            .expect("the read timeout is cleared");
+        let mut payload = vec![0u8; len];
+        stream
+            .read_exact(&mut payload)
+            .expect("the payload arrives");
+        assert_eq!(opcode, 0x2, "the server sends binary frames");
+        Some(payload)
+    }
+
+    /// Reads WebSocket messages until one satisfies `wanted`, with a deadline
+    #[cfg(unix)]
+    fn ws_recv_until(stream: &mut TcpStream, mut wanted: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(payload) = ws_recv_maybe(stream)
+                && wanted(&payload)
+            {
+                return payload;
+            }
+        }
+        panic!("the websocket message never arrived");
+    }
+
+    /// Reads the reply with correlation id `rid`, skipping anything else
+    #[cfg(unix)]
+    fn control_reply(stream: &mut TcpStream, rid: u64) -> wire::WireReply {
+        let payload = ws_recv_until(stream, |payload| {
+            payload.first() == Some(&FRAME_CONTROL)
+                && serde_json::from_slice::<wire::WireReply>(&payload[1..])
+                    .map(|reply| reply.rid == rid)
+                    .unwrap_or(false)
+        });
+        serde_json::from_slice(&payload[1..]).expect("the reply decodes")
+    }
+
+    /// Sends the upgrade request (with an identity header when `login` is set) and returns
+    /// the client stream plus the response head
+    fn ws_upgrade(addr: std::net::SocketAddr, login: Option<&str>) -> (TcpStream, String) {
+        let mut stream = TcpStream::connect(addr).expect("the remote client connects");
+        let mut request = String::from(
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n",
+        );
+        if let Some(login) = login {
+            request.push_str(&format!("Tailscale-User-Login: {login}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .expect("the request goes out");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("the response arrives");
+            head.push(byte[0]);
+        }
+        (stream, String::from_utf8_lossy(&head).into_owned())
+    }
+
+    /// A gateway accept loop in front of the harness server: loopback port and allow list
+    #[cfg(unix)]
+    fn start_gateway(harness: &Harness, allow: &[&str]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("the gateway listener binds");
+        let addr = listener.local_addr().expect("the gateway address is known");
+        let allow: Vec<String> = allow.iter().map(|login| login.to_string()).collect();
+        let endpoint = IpcEndpoint::Socket(harness.path.clone());
+        thread::spawn(move || accept_gateway(listener, endpoint, allow));
+        addr
+    }
+
+    #[test]
+    fn the_websocket_accept_matches_the_rfc_example() {
+        assert_eq!(
+            ws::accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn ws_frames_round_trip_masked_in_and_unmasked_out() {
+        let (mut reader, writer, mut client) = ws_pair();
+        writer.write_binary(b"out").expect("the write goes out");
+        let (opcode, payload) = read_server_frame(&mut client);
+        assert_eq!((opcode, payload.as_slice()), (0x2, b"out".as_slice()));
+
+        ws_send(&mut client, b"in");
+        assert_eq!(
+            reader.read_message().expect("the message arrives"),
+            ws::Message::Binary(b"in".to_vec())
+        );
+
+        // A client frame that is not masked is a protocol error (RFC 6455 5.1)
+        client
+            .write_all(&[0x82, 0x01, b'x'])
+            .expect("the raw frame goes out");
+        assert!(
+            reader.read_message().is_err(),
+            "unmasked frames are refused"
+        );
+    }
+
+    #[test]
+    fn ws_joins_fragmented_binary_messages_and_refuses_strays() {
+        let (mut reader, _writer, mut client) = ws_pair();
+        client
+            .write_all(&masked_frame(0x2, false, b"frag"))
+            .expect("the first fragment goes out");
+        client
+            .write_all(&masked_frame(0x0, false, b"ment"))
+            .expect("the continuation goes out");
+        client
+            .write_all(&masked_frame(0x0, true, b"ed"))
+            .expect("the last fragment goes out");
+        assert_eq!(
+            reader.read_message().expect("the joined message arrives"),
+            ws::Message::Binary(b"fragmented".to_vec())
+        );
+
+        // A continuation with no message in progress is a protocol error
+        client
+            .write_all(&masked_frame(0x0, true, b"stray"))
+            .expect("the stray goes out");
+        assert!(
+            reader.read_message().is_err(),
+            "a stray continuation is refused"
+        );
+    }
+
+    #[test]
+    fn ws_answers_pings_and_echoes_closes() {
+        let (mut reader, _writer, mut client) = ws_pair();
+        client
+            .write_all(&masked_frame(0x9, true, b"xy"))
+            .expect("the ping goes out");
+        ws_send(&mut client, b"data");
+        // Reading the next message answers the ping in place (before it returns the binary)
+        assert_eq!(
+            reader.read_message().expect("the message arrives"),
+            ws::Message::Binary(b"data".to_vec())
+        );
+        let (opcode, payload) = read_server_frame(&mut client);
+        assert_eq!((opcode, payload.as_slice()), (0xA, b"xy".as_slice()));
+
+        // A close is echoed once and reported
+        client
+            .write_all(&masked_frame(0x8, true, &1000u16.to_be_bytes()))
+            .expect("the close goes out");
+        assert_eq!(
+            reader.read_message().expect("the close arrives"),
+            ws::Message::Close(Some(1000))
+        );
+        let (opcode, payload) = read_server_frame(&mut client);
+        assert_eq!(
+            (opcode, payload.as_slice()),
+            (0x8, 1000u16.to_be_bytes().as_slice())
+        );
+    }
+
+    #[test]
+    fn ws_refuses_text_frames() {
+        let (mut reader, _writer, mut client) = ws_pair();
+        client
+            .write_all(&masked_frame(0x1, true, b"text"))
+            .expect("the text frame goes out");
+        let error = reader
+            .read_message()
+            .expect_err("text frames are refused (binary only)");
+        assert!(error.to_string().contains("text"), "{error}");
+    }
+
+    #[test]
+    fn the_ws_handshake_computes_the_accept_and_reads_the_identity_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let addr = listener.local_addr().expect("the address is known");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the handshake connects");
+            let request = ws::read_upgrade_request(&mut stream).expect("the request parses");
+            assert_eq!(request.login.as_deref(), Some("dev@example.com"));
+            let key = request.key.expect("the key travels");
+            ws::write_switching(&stream, &key).expect("the switch goes out");
+        });
+        let (client, head) = ws_upgrade(addr, Some("dev@example.com"));
+        assert!(head.contains("101 Switching Protocols"), "{head}");
+        assert!(
+            head.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "{head}"
+        );
+        let _ = client.shutdown(std::net::Shutdown::Both);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_remote_client_over_websocket_attaches_writes_and_reads_back() {
+        let harness = Harness::start();
+        let addr = start_gateway(&harness, &["dev@example.com"]);
+
+        let (mut stream, head) = ws_upgrade(addr, Some("dev@example.com"));
+        assert!(head.contains("101 Switching Protocols"), "{head}");
+        // The gateway names who authenticated (rid 0: gateway-initiated, no ask)
+        let hello = control_reply(&mut stream, 0);
+        assert_eq!(
+            hello.reply,
+            WireReplyKind::Hello {
+                login: "dev@example.com".to_string()
+            }
+        );
+
+        // Attach exactly as a local window does
+        ws_send_control(
+            &mut stream,
+            &WireRequest {
+                v: WIRE_VERSION,
+                rid: Some(1),
+                op: WireOp::Attach {
+                    shell: WireShell::from_config(&running("cat", "more")),
+                    cols: 80,
+                    rows: 24,
+                    scrollback: 1000,
+                },
+            },
+        );
+        let reply = control_reply(&mut stream, 1);
+        let WireReplyKind::Init { state, created } = reply.reply else {
+            panic!("a fresh server attaches like init: {:?}", reply.reply);
+        };
+        let pane = created.expect("the first pane travels");
+        assert_eq!(state.focus, pane.pane);
+
+        // The write reaches the pane, and the echo streams back as a data frame
+        ws_send_control(
+            &mut stream,
+            &WireRequest {
+                v: WIRE_VERSION,
+                rid: None,
+                op: WireOp::Write {
+                    block: pane.block,
+                    bytes: b"echo-over-ws\n".to_vec(),
+                },
+            },
+        );
+        let echo = ws_recv_until(&mut stream, |payload| {
+            payload.first() == Some(&FRAME_DATA)
+                && payload.get(1..5) == Some(&(pane.block.0 as u32).to_le_bytes())
+                && String::from_utf8_lossy(&payload[5..]).contains("echo-over-ws")
+        });
+        assert!(
+            String::from_utf8_lossy(&echo[5..]).contains("echo-over-ws"),
+            "{echo:?}"
+        );
+
+        // Events fan out too: a split answers with a state event over the websocket
+        ws_send_control(
+            &mut stream,
+            &WireRequest {
+                v: WIRE_VERSION,
+                rid: Some(2),
+                op: WireOp::Split {
+                    pane: pane.pane,
+                    dir: crate::layout::Dir::Right,
+                    shell: WireShell::from_config(&waiting()),
+                    explicit: false,
+                    cols: 40,
+                    rows: 20,
+                    scrollback: 1000,
+                    area: Rect::new(0, 0, 800, 600),
+                    limits: Limits {
+                        min_w: 80,
+                        min_h: 60,
+                    },
+                },
+            },
+        );
+        let event = ws_recv_until(&mut stream, |payload| {
+            payload.first() == Some(&FRAME_CONTROL)
+                && serde_json::from_slice::<wire::WireEvent>(&payload[1..])
+                    .map(|event| matches!(event.event, WireEventKind::State { .. }))
+                    .unwrap_or(false)
+        });
+        let event: wire::WireEvent = serde_json::from_slice(&event[1..]).expect("decodes");
+        assert!(matches!(event.event, WireEventKind::State { .. }));
+
+        // The bridge ends with the websocket: the close handshake ends the server session
+        stream
+            .write_all(&masked_frame(0x8, true, &1000u16.to_be_bytes()))
+            .expect("the close goes out");
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_gateway_refuses_logins_that_remote_allow_does_not_name() {
+        let harness = Harness::start();
+        let addr = start_gateway(&harness, &["dev@example.com"]);
+
+        for login in [Some("stranger@example.com"), None] {
+            let (_stream, head) = ws_upgrade(addr, login);
+            assert!(head.contains("403 Forbidden"), "{login:?}: {head}");
+            assert!(!head.contains("101"), "{login:?}: {head}");
+        }
+        harness.wait_no_sessions();
+
+        // An empty allow list denies everyone
+        let addr = start_gateway(&harness, &[]);
+        let (_stream, head) = ws_upgrade(addr, Some("dev@example.com"));
+        assert!(head.contains("403 Forbidden"), "{head}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_second_remote_client_is_refused_while_one_is_active() {
+        let harness = Harness::start();
+        let addr = start_gateway(&harness, &["dev@example.com"]);
+
+        let (mut first, first_head) = ws_upgrade(addr, Some("dev@example.com"));
+        assert!(first_head.contains("101"), "{first_head}");
+        let _hello = control_reply(&mut first, 0);
+
+        // The second connection upgrades, gets the Busy event, and closes right after
+        let (mut second, second_head) = ws_upgrade(addr, Some("dev@example.com"));
+        assert!(second_head.contains("101"), "{second_head}");
+        let busy = ws_recv_until(&mut second, |payload| {
+            payload.first() == Some(&FRAME_CONTROL)
+        });
+        let busy: WireEvent = serde_json::from_slice(&busy[1..]).expect("the busy event decodes");
+        assert!(matches!(busy.event, WireEventKind::Busy));
+        let (opcode, _payload) = read_server_frame(&mut second);
+        assert_eq!(opcode, 0x8, "the busy client is closed right after");
+        assert_eq!(
+            second.read(&mut [0u8; 1]).expect("the socket closes"),
+            0,
+            "nothing follows the close"
+        );
+
+        // The first remote client is unaffected
+        ws_send_control(
+            &mut first,
+            &WireRequest {
+                v: WIRE_VERSION,
+                rid: Some(1),
+                op: WireOp::Attach {
+                    shell: WireShell::from_config(&waiting()),
+                    cols: 80,
+                    rows: 24,
+                    scrollback: 1000,
+                },
+            },
+        );
+        let reply = control_reply(&mut first, 1);
+        assert!(matches!(reply.reply, WireReplyKind::Init { .. }));
+        // The gateway slot frees up when the websocket closes
+        first
+            .write_all(&masked_frame(0x8, true, &1000u16.to_be_bytes()))
+            .expect("the close goes out");
+        harness.wait_no_sessions();
     }
 }
