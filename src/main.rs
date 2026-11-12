@@ -26,7 +26,7 @@ use pane_io::{IoEvent, Notify};
 use renderer::{PaneView, Renderer};
 use server::{
     AttachAnswer, ControlDown, IpcConn, IpcEndpoint, OpSender, wire,
-    wire::{WireEventKind, WireReplyKind, WireShell},
+    wire::{WireEventKind, WireShell},
 };
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -174,6 +174,9 @@ struct App {
     server: OpSender,
     /// Wakes the UI loop from the reader thread when a pane's output arrives
     proxy: EventLoopProxy<UserEvent>,
+    /// Panes the attach reply reported as exited while this window was detached; processed
+    /// once the event loop runs (drain, hook, close-or-hold)
+    attach_exited: Vec<PaneId>,
 }
 
 /// How often a starting window retries the server connection after spawning (and spawning) it
@@ -1078,6 +1081,13 @@ impl ApplicationHandler<UserEvent> for App {
             self.window = Some(window);
             // Fit the PTY and the grid to the real window size
             self.resize(size.width, size.height);
+
+            // Panes whose program exited while this window was detached (the attach reply
+            // carried them): mark them dead now that the event loop can act on it
+            let exited = std::mem::take(&mut self.attach_exited);
+            for id in exited {
+                self.shell_exited(event_loop, id);
+            }
         }
     }
 
@@ -1138,6 +1148,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Layout(WireEventKind::PaneExited { pane: id }) => {
                 self.shell_exited(event_loop, id)
             }
+            // Gating is server-side: a viewer's mutating ops are dropped there, so there is
+            // nothing to change locally (it keeps rendering and sending ops)
+            UserEvent::Layout(WireEventKind::DriverChanged { .. }) => {}
             UserEvent::ConfigChanged => self.reload_config(event_loop),
         }
     }
@@ -1303,12 +1316,9 @@ fn main() {
                     let _ = reader_proxy.send_event(UserEvent::Layout(event));
                 }
                 ControlDown::Reply(reply) => {
-                    // The attach and the directory asks are correlated by rid; the only
-                    // uncorrelated reply is the busy gate put up before this session existed
-                    if matches!(reply.reply, WireReplyKind::Busy) {
-                        eprintln!("[window] another window is driving this terminal server");
-                        std::process::exit(1);
-                    }
+                    // The attach and the directory asks are correlated by rid; nothing
+                    // uncorrelated is expected anymore (the busy gate is gone: several
+                    // windows attach at once)
                     if reply.v != wire::WIRE_VERSION {
                         eprintln!(
                             "[client] the server speaks protocol version {}; dropping it",
@@ -1324,7 +1334,7 @@ fn main() {
     let answer = conn
         .attach(&shell, cols, rows, config.scrollback)
         .unwrap_or_else(|error| panic!("{error}"));
-    let (state, panes) = match answer {
+    let (state, panes, attach_exited) = match answer {
         AttachAnswer::Fresh { state, pane } => {
             let notify = output_notify(proxy.clone(), pane.pane);
             let seed = PaneSeed {
@@ -1341,9 +1351,13 @@ fn main() {
                 lua_tx.clone(),
             )
             .unwrap_or_else(|error| panic!("{error}"));
-            (state, vec![pane])
+            (state, vec![pane], Vec::new())
         }
-        AttachAnswer::Existing { state, panes: list } => {
+        AttachAnswer::Existing {
+            state,
+            panes: list,
+            exited,
+        } => {
             // Every live pane of the session rebuilds from the answer (its snapshot arrives on
             // the data channel, before any of the block's live chunks)
             let mut built = Vec::new();
@@ -1364,7 +1378,9 @@ fn main() {
                     }
                 }
             }
-            (state, built)
+            // Panes whose program exited while this window was detached: the event loop marks
+            // them dead once it can act on it (drain, hook, close-or-hold)
+            (state, built, exited)
         }
     };
 
@@ -1400,6 +1416,7 @@ fn main() {
         conn: conn.clone(),
         server: OpSender::new(conn),
         proxy,
+        attach_exited,
     };
 
     // 5. Main event loop
