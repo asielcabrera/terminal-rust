@@ -1887,7 +1887,7 @@ impl Drop for RawGuard {
 }
 
 #[cfg(windows)]
-extern "system" {
+unsafe extern "system" {
     fn GetStdHandle(handle: i32) -> isize;
     fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
     fn SetConsoleMode(handle: isize, mode: u32) -> i32;
