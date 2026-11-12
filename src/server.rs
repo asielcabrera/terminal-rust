@@ -8,9 +8,10 @@
 //! its read-only projection.
 //!
 //! The server can also be its own process (`terminal server`), reached over local IPC: the wire
-//! section carries the same ops and events as JSON then, over a socket the window and the server
-//! process share, and a session thread plays the window's role server-side (see the
-//! "server process" section at the bottom of this file). The in-process link stays for tests.
+//! section carries the same ops and events as JSON then, over a socket several windows share —
+//! the most recently attached one drives, the others watch — and a session thread plays the
+//! window's role server-side (see the "server process" section at the bottom of this file). The
+//! in-process link stays for tests.
 //!
 //! The server-side terminal never answers the program's queries: the client's terminal does,
 //! through [`PaneIo::write`], exactly as with a local PTY.
@@ -612,7 +613,8 @@ impl Server {
             }
             Err(error) => {
                 self.layout = None;
-                self.next_pane_id -= 1;
+                // The id is burned, like every rolled-back spawn: the field doc promises ids
+                // are never reused (advisory A-T2b-2)
                 Err(error)
             }
         }
@@ -1468,13 +1470,15 @@ pub(crate) mod wire {
             error: String,
         },
         /// The answer to `Attach` on a server that already had a layout: its state and its live
-        /// panes (their snapshots go over the data channel right before the reply)
+        /// panes (their snapshots go over the data channel right before the reply), plus the
+        /// panes whose program exited while no session was watching — the client marks them
+        /// dead on attach, and the list is cleared once delivered
         Attached {
             state: LayoutState,
             panes: Vec<IpcCreatedPane>,
+            #[serde(default)]
+            exited: Vec<PaneId>,
         },
-        /// A second window tried to attach: the first session is unaffected
-        Busy,
         ForegroundDir {
             dir: Option<PathBuf>,
         },
@@ -1530,6 +1534,11 @@ pub(crate) mod wire {
         },
         PaneExited {
             pane: PaneId,
+        },
+        /// The driver changed: the receiving session drives when it does (`is_driver`), and is
+        /// a viewer otherwise — the server drops its mutating ops from then on
+        DriverChanged {
+            is_driver: bool,
         },
     }
 
@@ -1832,11 +1841,12 @@ impl ServerHandle {
 //
 // The client sends only control frames; the server answers with all three.
 //
-// One window drives the server at a time: a second connection is answered with a `Busy` reply and
-// closed, and the first session is untouched. A session (below) plays the window's role on the
-// server side: it takes the events the window would have received, drains the blocks' output onto
-// the socket, and hands the block views back when it ends — the blocks and the layout outlive the
-// window, so a window that closed can re-attach to the same shells.
+// Several windows share the server at once: every connection becomes a session, and the most
+// recently attached one is the *driver* (input writer + layout mutator + resize authority). A
+// session (below) plays the window's role on the server side: it receives the events the window
+// would have received, and its block data is fanned out by the event router, which owns the
+// block views for the whole process — the blocks and the layout outlive every window, so a
+// window that closed can re-attach to the same shells.
 
 /// The control frame's type byte
 pub(crate) const FRAME_CONTROL: u8 = 0;
@@ -2324,34 +2334,79 @@ mod windows_pipe {
     }
 }
 
-/// What a session's coordinator is told. It owns the socket writer and every block view of its
-/// session, and it must return the views when it ends: the shells outlive the window.
+/// What a session's coordinator is told. The session no longer holds block views (the router
+/// owns them for the whole process and fans the output out to every session); it translates
+/// requests and forwards events.
 enum SessionMsg {
     /// A request read off the socket
     Wire(WireRequest),
-    /// A wire event the window would have received (the router precomputes it, so the block
-    /// views stay owned by the process' map and the session pulls them at event time)
+    /// A wire event the window would have received (the router precomputes it), including
+    /// driver changes sent directly by another session's attach or teardown
     Event(WireEvent),
-    /// The writer flushed the data queue: stalled panes may go on
+    /// The writer flushed the data queue below the high-water mark: panes the router stopped
+    /// draining for this session may go on
     Resume,
     /// The client closed the connection (or sent something unusable)
     Stop,
 }
 
-/// State one server process shares across sessions, for the handoff between a session that
-/// ended and the one that attaches next
+/// One registered session: how its events and data reach it, and whether it drives
+struct SessionEntry {
+    msgs: Sender<SessionMsg>,
+    writer: SessionWriter,
+    /// The driver mutates; viewers only read (their mutating ops are dropped server-side)
+    driver: bool,
+    /// Set once the session attached. Before that, its attach snapshots must not interleave
+    /// with live data, so the router holds the session's data back
+    receiving: bool,
+}
+
+/// State one server process shares across sessions: the registry the router fans events and
+/// block output out through, the block views it owns (they outlive every session), the pane
+/// exits pending in the next attach's reply, and the driver's window area.
 pub(crate) struct ProcessShared {
-    slot: Mutex<Option<Sender<SessionMsg>>>,
-    /// Block views held between sessions (the pane keeps running headless, and its output channel
-    /// must stay connected for the session that re-attaches to read it)
+    /// Live sessions, by connection id
+    sessions: Mutex<HashMap<u64, SessionEntry>>,
+    /// The next connection id; it is also the attach order (promotion picks the smallest)
+    next_conn: AtomicU64,
+    /// Block views owned by the event router for the whole process: blocks and views outlive
+    /// every session (a pane keeps running headless with its output channel connected), so a
+    /// session teardown only unregisters
     views: Mutex<HashMap<PaneId, ServerBlock>>,
+    /// Panes whose block exited since the last attach delivered the list. Every exit lands
+    /// here until an attach carries it (cleared once delivered, and on a fresh server), so a
+    /// pane that died while detached — or whose exit another session observed — is never
+    /// silently frozen in the next client
+    exited: Mutex<Vec<PaneId>>,
+    /// The driver's window area, from its layout ops. Dropped when the driver changes, until
+    /// the new driver sends its own. Written when the driver's layout ops arrive and on every
+    /// driver change; stage 5 reads it for the server-side resize authority.
+    driver_area: Mutex<Option<Rect>>,
+}
+
+impl ProcessShared {
+    /// Registers a session at connection time: it receives nothing until it attaches
+    fn register(&self, conn: u64, msgs: Sender<SessionMsg>, writer: SessionWriter) {
+        self.sessions.lock().unwrap().insert(
+            conn,
+            SessionEntry {
+                msgs,
+                writer,
+                driver: false,
+                receiving: false,
+            },
+        );
+    }
 }
 
 impl Default for ProcessShared {
     fn default() -> Self {
         Self {
-            slot: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            next_conn: AtomicU64::new(0),
             views: Mutex::new(HashMap::new()),
+            exited: Mutex::new(Vec::new()),
+            driver_area: Mutex::new(None),
         }
     }
 }
@@ -2361,8 +2416,9 @@ impl Default for ProcessShared {
 const HIGH_WATER_FRAMES: usize = 256;
 
 /// The one writer of a session's socket. Control frames jump ahead of queued data; the writer
-/// flushes what is queued, and when the coordinator stalled it asks it
-/// (once per stall) to resume the panes' output.
+/// flushes what is queued, and when the router stalled on this session's high-water mark it
+/// asks (once per stall) to resume the panes' output.
+#[derive(Clone)]
 struct SessionWriter {
     shared: Arc<SessionWriterShared>,
 }
@@ -2443,6 +2499,13 @@ impl SessionWriter {
         self.shared.available.notify_one();
     }
 
+    /// Whether the data queue reached the high-water mark: the router stops draining the
+    /// blocks until this session's writer caught up (it asks for a drain with `Resume`)
+    fn saturated(&self) -> bool {
+        let queues = self.shared.queues.lock().unwrap();
+        queues.data.len() >= HIGH_WATER_FRAMES
+    }
+
     /// Whether the frame went out, or the high-water mark stopped the drain
     fn push_data(&self, frame: Vec<u8>) -> bool {
         let mut queues = self.shared.queues.lock().unwrap();
@@ -2468,23 +2531,26 @@ impl SessionWriter {
     }
 }
 
-/// The window's counterpart on the server side of one session: requests in, events and pane
-/// output out. It holds every block view of its session.
+/// The window's counterpart on the server side of one session: requests in (gated by the
+/// driver role), events and pane output out. It holds no block views: the router owns them
+/// for the whole process and fans the output out to every session.
 struct Session {
     handle: ServerHandle,
     shared: Arc<ProcessShared>,
-    views: HashMap<PaneId, ServerBlock>,
+    /// This session's registry id (also its attach order)
+    conn: u64,
     writer: SessionWriter,
-    stalled: bool,
+    /// Whether this session drives: mirrored from the registry, updated by its own attach and
+    /// by the `DriverChanged` events an attach or a teardown sends
+    driver: bool,
 }
 
 /// How long a request-with-reply may take. An attach can spawn a shell; the rest are quick
 const SESSION_ASK_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Session {
-    /// Runs until the client disconnects. A panic here must not strand the panes' views (their
-    /// output channels would disconnect and the next session could not read those blocks): the
-    /// caller hands every block view back once this returns, panic or not.
+    /// Runs until the client disconnects. Nothing here can strand the blocks: the views are
+    /// the router's, so a panicking session only loses its own connection.
     fn pump(&mut self, inbox: Receiver<SessionMsg>) {
         while let Ok(msg) = inbox.recv() {
             match msg {
@@ -2500,13 +2566,32 @@ impl Session {
         }
     }
 
-    /// The session ended: the views go back to the process so the next session can read the
-    /// same blocks, and the session slot opens for the next window
+    /// The session ended: it unregisters, and if it was the driver, the oldest remaining
+    /// session is promoted (told with a `DriverChanged` event); the demoted driver's window
+    /// area is dropped with it. The views are the router's and outlive every session, so
+    /// there is nothing to hand back.
     fn teardown(self) {
         self.writer.stop();
-        *self.shared.slot.lock().unwrap() = None;
-        let Self { shared, views, .. } = self;
-        shared.views.lock().unwrap().extend(views);
+        let Self {
+            shared,
+            conn,
+            driver,
+            ..
+        } = self;
+        let mut sessions = shared.sessions.lock().unwrap();
+        sessions.remove(&conn);
+        if driver {
+            *shared.driver_area.lock().unwrap() = None;
+            if let Some(&oldest) = sessions.keys().min()
+                && let Some(entry) = sessions.get_mut(&oldest)
+            {
+                entry.driver = true;
+                let _ = entry.msgs.send(SessionMsg::Event(WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::DriverChanged { is_driver: true },
+                }));
+            }
+        }
     }
 
     fn on_wire(&mut self, request: WireRequest) -> bool {
@@ -2567,6 +2652,25 @@ impl Session {
                 true
             }
             op => {
+                // Everything else mutates: writes, PTY sizing and the layout. Only the driver's
+                // ops reach the server; a viewer's are dropped without an error — it keeps
+                // receiving the driver's changes as events and renders its own scaled
+                // projection from them.
+                if !self.driver {
+                    return true;
+                }
+                match op {
+                    WireOp::Split { area, .. }
+                    | WireOp::Resize { area, .. }
+                    | WireOp::FocusDir { area, .. }
+                    | WireOp::SetDivider { area, .. } => {
+                        *self.shared.driver_area.lock().unwrap() = Some(area);
+                    }
+                    WireOp::MoveFloat { window, .. } | WireOp::ResizeFloatEdge { window, .. } => {
+                        *self.shared.driver_area.lock().unwrap() = Some(window);
+                    }
+                    _ => {}
+                }
                 if let Some(request) = op.into_request() {
                     self.handle.send(request);
                 }
@@ -2578,6 +2682,10 @@ impl Session {
     /// The attach flow: a fresh server runs init ("fresh behaves like init"); an existing layout
     /// hands its state and live panes over whole. Snapshots for the live panes are queued on the
     /// data channel before the reply, so the client replays their screens before any live chunk.
+    /// The most recently attached session becomes the driver: any previous one is demoted with a
+    /// `DriverChanged` event and keeps working as a viewer. The reply also names the panes whose
+    /// program exited while unobserved; the client marks them dead, and the list is cleared once
+    /// delivered.
     fn attach(
         &mut self,
         rid: u64,
@@ -2600,8 +2708,18 @@ impl Session {
         };
         let outcome = match outcome {
             AttachOutcome::Fresh(Ok((state, created))) => {
+                // The new block joins the router's views, and this session starts receiving
+                // data at once: a fresh pane has no snapshot, so even its earliest output must
+                // reach the client (which shelves it until the pane is built)
                 let pane = wire::IpcCreatedPane::from_created(&created);
-                self.views.insert(created.pane, created.block);
+                self.shared
+                    .views
+                    .lock()
+                    .unwrap()
+                    .insert(created.pane, created.block);
+                self.start_receiving();
+                self.take_over_driver();
+                pump_pane(&self.shared, created.pane);
                 WireReply::new(
                     rid,
                     WireReplyKind::Init {
@@ -2614,19 +2732,12 @@ impl Session {
                 WireReply::new(rid, WireReplyKind::InitFailed { error })
             }
             AttachOutcome::Existing(state, panes) => {
-                // Keep only the live panes' views: views of blocks that died while headless go
-                // back to nothing
-                let live: Vec<PaneId> = panes.iter().map(|pane| pane.pane).collect();
-                self.views.retain(|pane, _| live.contains(pane));
-                // The pending chunks predate the snapshots (their effect is already on the
-                // server-side screens the snapshots export), so they are dropped instead of
-                // replayed. This never asks for a drain: a block paused while headless stays
-                // paused until below.
-                for info in &panes {
-                    if let Some(view) = self.views.get(&info.pane) {
-                        view.discard_pending();
-                    }
-                }
+                // The panes whose program exited while unobserved (or while another session
+                // held them) travel once with this reply
+                let exited = std::mem::take(&mut *self.shared.exited.lock().unwrap());
+                // The snapshots are queued while this session still receives no live data, so
+                // they cannot interleave with the chunks that follow them (the chunks that
+                // predate the snapshots are dropped, exactly as a one-session attach did)
                 for info in &panes {
                     let (reply, answer) = channel();
                     self.handle.send(Request::Snapshot(info.block, reply));
@@ -2634,13 +2745,8 @@ impl Session {
                     self.writer
                         .push_data(data_frame(FRAME_SNAPSHOT, info.block, bytes));
                 }
-                // Resume the blocks the session may have paused (and learn about pending exits):
-                // the wake reaches this session's event stream and a drain follows
-                for info in &panes {
-                    if let Some(view) = self.views.get(&info.pane) {
-                        view.notify_again();
-                    }
-                }
+                self.start_receiving();
+                self.take_over_driver();
                 WireReply::new(
                     rid,
                     WireReplyKind::Attached {
@@ -2649,6 +2755,7 @@ impl Session {
                             .into_iter()
                             .map(wire::IpcCreatedPane::from_attached)
                             .collect(),
+                        exited,
                     },
                 )
             }
@@ -2657,116 +2764,165 @@ impl Session {
         true
     }
 
-    fn on_event(&mut self, event: WireEvent) {
-        match event.event {
-            WireEventKind::State { state, created } => {
-                // Panes that left lose their views (the server closed their blocks); the view
-                // of a just-created pane moves from the process' map into this session's
-                let live = state.pane_ids();
-                self.views.retain(|pane, _| live.contains(pane));
-                if let Some(ref created) = created {
-                    match self.shared.views.lock().unwrap().remove(&created.pane) {
-                        Some(view) => {
-                            self.views.insert(created.pane, view);
-                        }
-                        None => eprintln!("[server] no block view arrived for pane {created:?}"),
-                    }
-                }
-                self.writer.push_control(control_frame(&WireEvent {
-                    v: WIRE_VERSION,
-                    event: WireEventKind::State { state, created },
-                }));
-            }
-            WireEventKind::LastPaneClosed => {
-                self.writer.push_control(control_frame(&WireEvent {
-                    v: WIRE_VERSION,
-                    event: WireEventKind::LastPaneClosed,
-                }));
-            }
-            WireEventKind::Error { message } => {
-                self.writer.push_control(control_frame(&WireEvent {
-                    v: WIRE_VERSION,
-                    event: WireEventKind::Error { message },
-                }));
-            }
-            // The wire event goes out too: the client's data feed wakes the UI loop itself, but
-            // the events stay symmetric with the in-process link
-            WireEventKind::PaneOutput { pane } => {
-                self.writer.push_control(control_frame(&WireEvent {
-                    v: WIRE_VERSION,
-                    event: WireEventKind::PaneOutput { pane },
-                }));
-                self.forward_output(pane);
-            }
-            WireEventKind::PaneExited { pane } => {
-                self.writer.push_control(control_frame(&WireEvent {
-                    v: WIRE_VERSION,
-                    event: WireEventKind::PaneExited { pane },
-                }));
-            }
+    /// This session's data feed opens: whatever the router fans out from here on is queued for
+    /// its socket
+    fn start_receiving(&self) {
+        if let Some(entry) = self.shared.sessions.lock().unwrap().get_mut(&self.conn) {
+            entry.receiving = true;
         }
     }
 
-    /// Drains a block onto the socket, playing the client of the in-process link: re-arms the
-    /// wake first, reads while there is something, and stops at the high-water mark (staying
-    /// stalled; the writer un-stalls it). The server-side pause handshake stays exactly as it
-    /// was, so the PTY backpressure does too.
-    fn forward_output(&mut self, pane: PaneId) {
-        let Some(view) = self.views.get_mut(&pane) else {
-            return;
+    /// The most recently attached session takes the driver role: any previous driver is
+    /// demoted (told with a `DriverChanged` event), and the window area it had stored is
+    /// dropped until this driver sends its own
+    fn take_over_driver(&mut self) {
+        let demoted = WireEvent {
+            v: WIRE_VERSION,
+            event: WireEventKind::DriverChanged { is_driver: false },
         };
-        view.rearm();
-        loop {
-            match view.try_read() {
-                Some(chunk) => {
-                    if !self
-                        .writer
-                        .push_data(data_frame(FRAME_DATA, view.block_id(), chunk))
-                    {
-                        self.stalled = true;
-                        return;
-                    }
-                }
-                None => return,
+        let mut sessions = self.shared.sessions.lock().unwrap();
+        for entry in sessions.values_mut() {
+            if entry.driver {
+                entry.driver = false;
+                let _ = entry.msgs.send(SessionMsg::Event(demoted.clone()));
             }
         }
+        if let Some(entry) = sessions.get_mut(&self.conn) {
+            entry.driver = true;
+        }
+        drop(sessions);
+        *self.shared.driver_area.lock().unwrap() = None;
+        self.driver = true;
     }
 
-    /// The writer emptied the data queue: the panes stalled at the high-water mark may drain on
+    /// Forwards the event to the client, following the driver flag when the event reports a
+    /// driver change
+    fn on_event(&mut self, event: WireEvent) {
+        if let WireEventKind::DriverChanged { is_driver } = &event.event {
+            self.driver = *is_driver;
+        }
+        // The data fan-out is the router's job now: even a PaneOutput event is only the wake
+        // the client's UI loop needs (its block feed wakes it directly on data too)
+        self.writer.push_control(control_frame(&event));
+    }
+
+    /// This session's writer emptied its queue below the high-water mark: the panes the router
+    /// stopped draining for everyone may go on. Waking them routes new PaneOutput events
+    /// through the router, which drains for every session at once.
     fn resume(&mut self) {
         self.writer.clear_resume();
-        if !self.stalled {
-            return;
-        }
-        self.stalled = false;
-        for pane in self.views.keys().copied().collect::<Vec<_>>() {
-            if let Some(view) = self.views.get_mut(&pane) {
-                view.notify_again();
-            }
+        let mut views = self.shared.views.lock().unwrap();
+        for view in views.values_mut() {
+            view.notify_again();
         }
     }
 }
 
-/// Reads the server's layout events for the whole process, session or not: every event becomes
-/// its wire form (which only borrows), and a block view that a creation carried waits in the
-/// process' map for whichever session claims it at event time. Nothing here ever drops a view:
-/// that would disconnect the block's output channel for good.
+/// Reads the server's layout events for the whole process. It fans every event out to the
+/// registry's sessions, owns the block views for the whole process — a creation parks its
+/// block there, and this router is the one reader of every block's output channel, so the
+/// fan-out to all sessions happens here, at event time — and records pane exits for the next
+/// attach's `exited` list.
 fn route_events(events: Receiver<LayoutEvent>, shared: Arc<ProcessShared>) {
     while let Ok(event) = events.recv() {
         let wire_event =
             wire::WireEvent::from_layout_event(&event).expect("every layout event travels");
-        if let LayoutEvent::State(_, Some(created)) = event {
-            shared
-                .views
-                .lock()
-                .unwrap()
-                .insert(created.pane, created.block);
+        match event {
+            LayoutEvent::State(state, created) => {
+                // A creation parks its block with the router: the block's output channel has
+                // one reader, and this thread is it for the whole process
+                let mut new_pane = None;
+                if let Some(created) = created {
+                    shared
+                        .views
+                        .lock()
+                        .unwrap()
+                        .insert(created.pane, created.block);
+                    new_pane = Some(created.pane);
+                }
+                // Panes that left lose their views (the server closed their blocks)
+                let live = state.pane_ids();
+                shared
+                    .views
+                    .lock()
+                    .unwrap()
+                    .retain(|pane, _| live.contains(pane));
+                // A creation's block may already hold output: its PaneOutput event can precede
+                // the state event that announced it
+                if let Some(pane) = new_pane {
+                    pump_pane(&shared, pane);
+                }
+            }
+            LayoutEvent::LastPaneClosed => {
+                shared.views.lock().unwrap().clear();
+                // A fresh server comes next: no old pane's exit is pending
+                shared.exited.lock().unwrap().clear();
+            }
+            LayoutEvent::PaneOutput(pane) => pump_pane(&shared, pane),
+            LayoutEvent::PaneExited(pane) => {
+                // Recorded until an attach delivers the list: sessions that were live got the
+                // event too, and a later one marks the pane dead on attach
+                shared.exited.lock().unwrap().push(pane);
+            }
+            LayoutEvent::Error(_) => {}
         }
-        let slot = shared.slot.lock().unwrap();
-        if let Some(session) = slot.as_ref()
-            && session.send(SessionMsg::Event(wire_event)).is_err()
+        let sessions = shared.sessions.lock().unwrap();
+        for entry in sessions.values() {
+            let _ = entry.msgs.send(SessionMsg::Event(wire_event.clone()));
+        }
+    }
+}
+
+/// Drains one block's output into every receiving session. The router is the single reader of
+/// a block's output channel, so the fan-out to all of them happens here: a chunk is read only
+/// when every receiving session can take it (none at the high-water mark), which keeps the
+/// slowest session's backpressure on the block — the same pause handshake one session applied
+/// in stage 3, now serving them all without ever losing a chunk. Sessions that have not
+/// attached yet receive nothing: their attach snapshots must not interleave with live data.
+fn pump_pane(shared: &ProcessShared, pane: PaneId) {
+    // Re-armed BEFORE reading, as every reader of a block does: output arriving during the
+    // drain queues another PaneOutput event
+    let block = {
+        let mut views = shared.views.lock().unwrap();
+        let Some(view) = views.get_mut(&pane) else {
+            return;
+        };
+        view.rearm();
+        view.block_id()
+    };
+    loop {
+        // A session at the high-water mark stops the drain: the rest stays in the block's
+        // channel (the block pauses server-side) until the session's writer asks to resume
         {
-            eprintln!("[server] the session went away mid-event");
+            let sessions = shared.sessions.lock().unwrap();
+            if sessions
+                .values()
+                .filter(|entry| entry.receiving)
+                .any(|entry| entry.writer.saturated())
+            {
+                return;
+            }
+        }
+        let chunk = {
+            let mut views = shared.views.lock().unwrap();
+            let Some(view) = views.get_mut(&pane) else {
+                return;
+            };
+            view.try_read()
+        };
+        let Some(chunk) = chunk else {
+            return;
+        };
+        let frame = data_frame(FRAME_DATA, block, chunk);
+        let sessions = shared.sessions.lock().unwrap();
+        for entry in sessions.values() {
+            if entry.receiving && !entry.writer.push_data(frame.clone()) {
+                // Unreachable: the saturation check above runs in this very thread, and no
+                // one else queues data frames. If it ever happens, stop draining rather than
+                // keep reading into a queue that cannot take the chunk
+                eprintln!("[server] a session's data queue overflowed mid-drain");
+                return;
+            }
         }
     }
 }
@@ -2804,37 +2960,24 @@ fn socket_reader(mut read: Box<dyn Read + Send>, msgs: Sender<SessionMsg>) {
     }
 }
 
-/// Accepts windows one after another and serves exactly one of them: the second connection gets
-/// a `Busy` reply and is closed, and the first session is unaffected
+/// Accepts one more window: every connection becomes a session of its own. The most recently
+/// attached one drives (see `Session::attach`); sessions come and go, and the blocks outlive
+/// every one of them.
 fn start_session(stream: IpcStream, handle: &ServerHandle, shared: &Arc<ProcessShared>) {
-    let mut slot = shared.slot.lock().unwrap();
-    if slot.is_some() {
-        drop(slot);
-        let (read, mut write) = stream.into_halves();
-        std::mem::drop(read);
-        let _ = write.write_all(&control_frame(&WireReply {
-            v: WIRE_VERSION,
-            rid: 0,
-            reply: WireReplyKind::Busy,
-        }));
-        let _ = write.flush();
-        eprintln!("[server] refused a second session: one is already attached");
-        return;
-    }
+    let conn = shared.next_conn.fetch_add(1, Ordering::Relaxed);
     let (msgs, inbox) = channel::<SessionMsg>();
     let (read_half, write_half) = stream.into_halves();
     let writer = SessionWriter::spawn(write_half, msgs.clone());
-    // The session takes the block views over whole: while it runs, no other session exists
-    let views = std::mem::take(&mut *shared.views.lock().unwrap());
+    // Registered at once: events and data fan out through the registry, and a disconnect only
+    // unregisters (the views are the router's, and they outlive the session)
+    shared.register(conn, msgs.clone(), writer.clone());
     let session = Session {
         handle: handle.clone(),
         shared: shared.clone(),
-        views,
+        conn,
         writer,
-        stalled: false,
+        driver: false,
     };
-    *slot = Some(msgs.clone());
-    drop(slot);
     thread::Builder::new()
         .name("terminal-session".to_string())
         .spawn(move || run_session(session, inbox))
@@ -2869,8 +3012,9 @@ fn accept_sessions(listener: IpcListener, handle: ServerHandle, shared: Arc<Proc
 }
 
 /// The entry point of `terminal server`: binds the endpoint (refusing when a server already
-/// runs), keeps the server thread alive, and serves one session at a time until killed. The
-/// shells inside its blocks outlive every window; closing a window only ends its session.
+/// runs), keeps the server thread alive, and serves sessions until killed — the most recently
+/// attached window drives, the others watch. The shells inside its blocks outlive every
+/// window; closing a window only ends its session.
 pub fn run_server_process() {
     let endpoint = IpcEndpoint::resolve();
     let listener = match IpcListener::bind(&endpoint) {
@@ -2901,8 +3045,7 @@ pub fn run_server_process() {
 // [`IpcBlock`], whose queue the connection's reader thread feeds with that block's frames.
 
 /// What the reader thread (the window's end of the connection) forwards out of the control
-/// channel: replies correlated by rid, and uncorrelated ones (like the `Busy` a second window
-/// gets) and events
+/// channel: replies correlated by rid, and uncorrelated ones (events)
 #[derive(Debug)]
 pub(crate) enum ControlDown {
     Reply(WireReply),
@@ -2990,10 +3133,14 @@ pub enum AttachAnswer {
         state: LayoutState,
         pane: wire::IpcCreatedPane,
     },
-    /// The server already had a layout; the client rebuilds every pane from the answer
+    /// The server already had a layout; the client rebuilds every pane from the answer.
+    /// `exited` names the panes whose program exited while this window was detached (or whose
+    /// exit another session observed): the client marks them dead, and the server clears the
+    /// list once it is delivered
     Existing {
         state: LayoutState,
         panes: Vec<wire::IpcCreatedPane>,
+        exited: Vec<PaneId>,
     },
 }
 
@@ -3048,8 +3195,8 @@ impl IpcConn {
     /// thread::spawn(move || conn.read_loop(read, |down| { ... }));
     /// ```
     /// Frames arrive in order on one socket: a control frame is a reply (delivered to the ask
-    /// that waits for it, or forwarded uncorrelated — the `Busy` gate a second window gets) or
-    /// an event; a data or snapshot frame is queued for its block and wakes the pane.
+    /// that waits for it, or forwarded uncorrelated) or an event; a data or snapshot frame is
+    /// queued for its block and wakes the pane.
     pub fn read_loop(
         &self,
         mut read: Box<dyn Read + Send>,
@@ -3175,11 +3322,16 @@ impl IpcConn {
             WireReplyKind::Init { created: None, .. } => {
                 Err("the server attached without its first pane".to_string())
             }
-            WireReplyKind::Attached { state, panes } => Ok(AttachAnswer::Existing { state, panes }),
+            WireReplyKind::Attached {
+                state,
+                panes,
+                exited,
+            } => Ok(AttachAnswer::Existing {
+                state,
+                panes,
+                exited,
+            }),
             WireReplyKind::InitFailed { error } => Err(error),
-            WireReplyKind::Busy => {
-                Err("another window is driving this terminal server".to_string())
-            }
             other => Err(format!("the attach got an unexpected reply: {other:?}")),
         }
     }
@@ -3379,14 +3531,6 @@ impl ServerBlock {
     /// The wire token of the block: how sessions and data frames name it
     pub(crate) fn block_id(&self) -> BlockId {
         self.id
-    }
-
-    /// Drops everything pending without the pause handshake: an attach discards the chunks that
-    /// predate its snapshot (their effect is already on the server-side screen it exports) and
-    /// never asks for a drain, so a block paused headless stays paused until the session resumes
-    /// it properly
-    pub(crate) fn discard_pending(&self) {
-        while self.output.try_recv().is_ok() {}
     }
 }
 
@@ -3656,6 +3800,25 @@ mod tests {
             LayoutEvent::LastPaneClosed => {}
             other => panic!("expected LastPaneClosed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_rolled_back_init_burns_the_pane_id() {
+        let (server, _events) = Server::start();
+        // A 0×0 grid cannot start a block: the init rolls back
+        assert!(
+            server.init(&waiting(), 0, 0, 1000).is_err(),
+            "a 0×0 grid does not start a block"
+        );
+        // The rolled-back id is burned, never handed out again (advisory A-T2b-2)
+        let (state, created) = init(&server);
+        assert_ne!(
+            created.pane,
+            PaneId(0),
+            "the id was reused after the rollback"
+        );
+        assert_eq!(state.focus, created.pane);
+        assert_eq!(Layout::from_state(state).tiled_ids(), vec![created.pane]);
     }
 
     #[test]
@@ -4826,17 +4989,102 @@ mod tests {
         }
         assert!(saw_state, "a state event traveled over the wire");
 
-        // A second connection gets the busy gate, and the first session is unaffected
+        // A second connection attaches now: the most recent attach takes over as driver and
+        // the first session is demoted (and promoted again when the new driver leaves)
+        let (second, read) = IpcConn::connect(&IpcEndpoint::Socket(path.clone()))
+            .expect("the second client connects");
+        let (second_tx, _second_rx) = channel::<WireEventKind>();
         {
-            let mut second =
-                std::os::unix::net::UnixStream::connect(&path).expect("the gate opens");
-            let WireFrame::Control(json) = read_typed_frame(&mut second).expect("the gate answers")
-            else {
-                panic!("the gate answers in the control channel");
-            };
-            let reply: WireReply = serde_json::from_slice(&json).expect("a wire reply");
-            assert!(matches!(reply.reply, WireReplyKind::Busy), "{reply:?}");
+            let second = second.clone();
+            thread::spawn(move || {
+                second.read_loop(read, move |down| match down {
+                    ControlDown::Event(event) => {
+                        let _ = second_tx.send(event);
+                    }
+                    ControlDown::Reply(reply) => {
+                        panic!("an unexpected reply arrived over the wire: {reply:?}")
+                    }
+                });
+            });
         }
+        let answer = second
+            .attach(&waiting(), 80, 24, 1000)
+            .expect("the second attach answers");
+        let AttachAnswer::Existing {
+            panes: second_panes,
+            exited: second_exited,
+            ..
+        } = answer
+        else {
+            panic!("an existing layout hands itself over");
+        };
+        assert_eq!(second_panes.len(), 2, "both live panes travel");
+        assert!(second_exited.is_empty(), "nothing exited while attached");
+        // The first session was demoted: it receives the DriverChanged event
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut demoted = false;
+        while Instant::now() < deadline {
+            match layout_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(WireEventKind::DriverChanged { is_driver: false }) => {
+                    demoted = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            demoted,
+            "the first session was told it lost the driver role"
+        );
+
+        // The new driver drives: its write reaches the pane
+        let (event_tx, _event_rx) = channel::<IoEvent>();
+        let event_tx = std::sync::Mutex::new(event_tx);
+        let notify: Notify = Arc::new(move |event| {
+            let _ = event_tx.lock().unwrap().send(event);
+        });
+        let mut driver_block = second.open_block(second_panes[0].block, notify);
+        driver_block.write(b"echo-from-the-new-driver\n");
+        read_until_marker(&mut driver_block, "echo-from-the-new-driver");
+
+        // The demoted session's writes are dropped server-side now
+        block.write(b"echo-from-demoted\n");
+        {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut seen = String::new();
+            while Instant::now() < deadline {
+                block.rearm();
+                if let Some(chunk) = block.try_read() {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                assert!(
+                    !seen.contains("echo-from-demoted"),
+                    "a viewer's write reached the pane: {seen:?}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // The new driver leaves: the oldest remaining session is promoted again
+        drop(driver_block);
+        second.close();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut promoted = false;
+        while Instant::now() < deadline {
+            match layout_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(WireEventKind::DriverChanged { is_driver: true }) => {
+                    promoted = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            promoted,
+            "the remaining session was promoted when the driver left"
+        );
         block.write(b"echo-after-busy\n");
         read_until_marker(&mut block, "echo-after-busy");
 
@@ -4848,11 +5096,11 @@ mod tests {
         drop(block);
         client.close();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && shared.slot.lock().unwrap().is_some() {
+        while Instant::now() < deadline && !shared.sessions.lock().unwrap().is_empty() {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            shared.slot.lock().unwrap().is_none(),
+            shared.sessions.lock().unwrap().is_empty(),
             "the session ended when the client went away"
         );
 
@@ -4872,9 +5120,15 @@ mod tests {
         let answer = client
             .attach(&waiting(), 80, 24, 1000)
             .expect("the re-attach answers");
-        let AttachAnswer::Existing { state, panes } = answer else {
+        let AttachAnswer::Existing {
+            state,
+            panes,
+            exited,
+        } = answer
+        else {
             panic!("an existing layout hands itself over");
         };
+        assert!(exited.is_empty(), "no pane exited while the sessions ran");
         // Both panes of the split layout are live, in pane order
         assert_eq!(
             Layout::from_state(state).tiled_ids(),
@@ -4924,5 +5178,449 @@ mod tests {
         drop(second_block);
         drop(client);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Several sessions (stage 4) -------------------------------------------------------
+    // Two and three clients over one socket: the most recently attached one drives, the
+    // others watch; take-over, gating and promotion are all server-side. The socket harness
+    // is unix-only; Windows exercises the same policies through the transport abstraction.
+
+    #[cfg(unix)]
+    static HARNESS_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A server process for the multi-session tests: its socket endpoint and shared state.
+    /// The scratch directory is removed on drop.
+    #[cfg(unix)]
+    struct Harness {
+        path: PathBuf,
+        dir: PathBuf,
+        shared: Arc<ProcessShared>,
+        _server: ServerHandle,
+    }
+
+    #[cfg(unix)]
+    impl Harness {
+        fn start() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "t4-{}-{}",
+                HARNESS_SEQ.fetch_add(1, Ordering::Relaxed),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("the test directory is created");
+            let path = dir.join("server.sock");
+            let (server, layout_events) = Server::start();
+            let shared = Arc::new(ProcessShared::default());
+            let router_shared = shared.clone();
+            thread::spawn(move || route_events(layout_events, router_shared));
+            let listener =
+                IpcListener::bind(&IpcEndpoint::Socket(path.clone())).expect("the endpoint binds");
+            let accept_shared = shared.clone();
+            let accept_handle = server.clone();
+            thread::spawn(move || accept_sessions(listener, accept_handle, accept_shared));
+            Self {
+                path,
+                dir,
+                shared,
+                _server: server,
+            }
+        }
+
+        /// Connects a client and spawns its reader thread: the events land on the channel
+        fn client(&self) -> (IpcConn, Receiver<WireEventKind>) {
+            let (conn, read) = IpcConn::connect(&IpcEndpoint::Socket(self.path.clone()))
+                .expect("the client connects");
+            let (tx, rx) = channel();
+            {
+                let conn = conn.clone();
+                thread::spawn(move || {
+                    conn.read_loop(read, move |down| match down {
+                        ControlDown::Event(event) => {
+                            let _ = tx.send(event);
+                        }
+                        ControlDown::Reply(reply) => {
+                            panic!("an unexpected reply arrived over the wire: {reply:?}")
+                        }
+                    });
+                });
+            }
+            (conn, rx)
+        }
+
+        /// Waits until every session ended
+        fn wait_no_sessions(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && !self.shared.sessions.lock().unwrap().is_empty() {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                self.shared.sessions.lock().unwrap().is_empty(),
+                "the sessions ended"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Attaches to a fresh server and returns the created pane
+    #[cfg(unix)]
+    fn attach_fresh(conn: &IpcConn) -> wire::IpcCreatedPane {
+        match conn
+            .attach(&waiting(), 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { pane, .. } => pane,
+            other => panic!("expected a fresh server, got {other:?}"),
+        }
+    }
+
+    /// Attaches to an existing layout and returns the live panes and the exited list
+    #[cfg(unix)]
+    fn attach_existing(conn: &IpcConn) -> (Vec<wire::IpcCreatedPane>, Vec<PaneId>) {
+        match conn
+            .attach(&waiting(), 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Existing { panes, exited, .. } => (panes, exited),
+            other => panic!("expected an existing layout, got {other:?}"),
+        }
+    }
+
+    /// Builds a pane's block feed over the connection, as the window would
+    #[cfg(unix)]
+    fn open_feed(conn: &IpcConn, token: BlockId) -> IpcBlock {
+        let (tx, _rx) = channel::<IoEvent>();
+        let tx = std::sync::Mutex::new(tx);
+        let notify: Notify = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        conn.open_block(token, notify)
+    }
+
+    /// Polls a block's output, failing if `marker` ever shows up (a write the server must
+    /// have dropped)
+    #[cfg(unix)]
+    fn assert_output_never(block: &mut dyn PaneIo, marker: &str) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            block.rearm();
+            if let Some(chunk) = block.try_read() {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                assert!(!seen.contains(marker), "dropped output came back: {seen:?}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits for a `DriverChanged` event with the wanted role, skipping the other events and
+    /// the opposite role (a session that was demoted earlier still has that event buffered)
+    #[cfg(unix)]
+    fn wait_driver_changed(events: &Receiver<WireEventKind>, is_driver: bool) -> bool {
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match events.recv_timeout(left) {
+                Ok(WireEventKind::DriverChanged { is_driver: got }) if got == is_driver => {
+                    return true;
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        false
+    }
+
+    /// Fails if a promotion (`is_driver: true`) arrives within the window; an already-buffered
+    /// demotion is skipped
+    #[cfg(unix)]
+    fn assert_no_promotion(events: &Receiver<WireEventKind>, window: Duration) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(left) {
+                Ok(WireEventKind::DriverChanged { is_driver: true }) => {
+                    panic!("an unexpected promotion arrived")
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Waits for the next state event, skipping the other kinds
+    #[cfg(unix)]
+    fn wait_wire_state(events: &Receiver<WireEventKind>) -> LayoutState {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match events.recv_timeout(left) {
+                Ok(WireEventKind::State { state, .. }) => return state,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("no state event arrived");
+    }
+
+    /// Fails if a state event arrives within the window (a mutation the server must have
+    /// dropped); the other kinds are skipped
+    #[cfg(unix)]
+    fn assert_no_state_event(events: &Receiver<WireEventKind>, window: Duration) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(left.min(Duration::from_millis(100))) {
+                Ok(WireEventKind::State { .. }) => {
+                    panic!("a mutation the server should have dropped was applied")
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// A layout resize carrying `area`, the op that stores the driver's window area
+    #[cfg(unix)]
+    fn resize_op(pane: PaneId, area: Rect) -> WireOp {
+        WireOp::Resize {
+            pane,
+            dir: Dir::Right,
+            delta: 10,
+            area,
+            limits: Limits {
+                min_w: 80,
+                min_h: 60,
+            },
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_second_client_takes_over_as_driver_and_the_first_watches() {
+        let harness = Harness::start();
+        let (first, first_events) = harness.client();
+        let _pane = attach_fresh(&first);
+
+        // The most recent attach takes over: the second client drives, the first is demoted
+        let (second, _second_events) = harness.client();
+        let (panes, exited) = attach_existing(&second);
+        assert_eq!(panes.len(), 1);
+        assert!(
+            exited.is_empty(),
+            "nothing exited while the first was attached"
+        );
+        assert!(
+            wait_driver_changed(&first_events, false),
+            "the first session was told it lost the driver role"
+        );
+
+        // The driver's write reaches the pane
+        let mut driver_block = open_feed(&second, panes[0].block);
+        driver_block.write(b"echo-from-the-driver\n");
+        read_until_marker(&mut driver_block, "echo-from-the-driver");
+
+        // The viewer's write is dropped: nothing echoes back
+        let mut viewer_block = open_feed(&first, panes[0].block);
+        viewer_block.write(b"echo-from-the-viewer\n");
+        assert_output_never(&mut viewer_block, "echo-from-the-viewer");
+
+        // And the driver still gets its echo afterwards
+        driver_block.write(b"echo-from-the-driver-2\n");
+        read_until_marker(&mut driver_block, "echo-from-the-driver-2");
+        drop(viewer_block);
+        drop(driver_block);
+        // An explicit close: dropping the connection cannot end the session, the client's own
+        // reader thread still holds a clone of it
+        first.close();
+        second.close();
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn taking_over_drops_the_previous_driver_window_area() {
+        let harness = Harness::start();
+        let (first, _first_events) = harness.client();
+        attach_fresh(&first);
+
+        // The driver's layout op stores its window area
+        let area_a = Rect::new(1, 2, 300, 400);
+        first.send_op(resize_op(PaneId(0), area_a));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && *harness.shared.driver_area.lock().unwrap() != Some(area_a)
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            *harness.shared.driver_area.lock().unwrap(),
+            Some(area_a),
+            "the driver's layout op stored its window area"
+        );
+
+        // The take-over drops it, until the new driver sends its own
+        let (second, _second_events) = harness.client();
+        attach_existing(&second);
+        assert_eq!(
+            *harness.shared.driver_area.lock().unwrap(),
+            None,
+            "the demoted driver's area was dropped"
+        );
+
+        // The new driver stores its own; the viewer's op changes nothing
+        let area_b = Rect::new(0, 0, 500, 500);
+        second.send_op(resize_op(PaneId(0), area_b));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && *harness.shared.driver_area.lock().unwrap() != Some(area_b)
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(*harness.shared.driver_area.lock().unwrap(), Some(area_b));
+        first.send_op(resize_op(PaneId(0), Rect::new(9, 9, 999, 999)));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            *harness.shared.driver_area.lock().unwrap(),
+            Some(area_b),
+            "a viewer's layout op was dropped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn layout_changes_reach_every_session_and_viewer_mutations_are_dropped() {
+        let harness = Harness::start();
+        let (first, first_events) = harness.client();
+        attach_fresh(&first);
+        let (second, second_events) = harness.client();
+        attach_existing(&second);
+
+        // The driver splits: both sessions rebuild from the same state event
+        second.send_op(WireOp::Split {
+            pane: PaneId(0),
+            dir: Dir::Right,
+            shell: WireShell::from_config(&waiting()),
+            explicit: false,
+            cols: 40,
+            rows: 20,
+            scrollback: 1000,
+            area: Rect::new(0, 0, 800, 600),
+            limits: Limits {
+                min_w: 80,
+                min_h: 60,
+            },
+        });
+        let first_state = wait_wire_state(&first_events);
+        assert_eq!(
+            Layout::from_state(first_state.clone()).tiled_ids(),
+            vec![PaneId(0), PaneId(1)]
+        );
+        let second_state = wait_wire_state(&second_events);
+        assert_eq!(
+            second_state, first_state,
+            "both sessions saw the same change"
+        );
+
+        // The viewer's split is dropped: no session sees another state event
+        first.send_op(WireOp::Split {
+            pane: PaneId(0),
+            dir: Dir::Right,
+            shell: WireShell::from_config(&waiting()),
+            explicit: false,
+            cols: 40,
+            rows: 20,
+            scrollback: 1000,
+            area: Rect::new(0, 0, 800, 600),
+            limits: Limits {
+                min_w: 80,
+                min_h: 60,
+            },
+        });
+        assert_no_state_event(&first_events, Duration::from_millis(600));
+        assert_no_state_event(&second_events, Duration::from_millis(600));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_driver_disconnect_promotes_the_oldest_remaining_session() {
+        let harness = Harness::start();
+        let (first, first_events) = harness.client();
+        let pane = attach_fresh(&first);
+        let (second, second_events) = harness.client();
+        attach_existing(&second);
+        let (third, _third_events) = harness.client();
+        attach_existing(&third);
+
+        // The driver leaves: the OLDEST remaining session (the first) is promoted, not the
+        // second, and nobody else is told
+        third.close();
+        assert!(
+            wait_driver_changed(&first_events, true),
+            "the oldest remaining session was promoted"
+        );
+        assert_no_promotion(&second_events, Duration::from_millis(500));
+
+        // The promoted session drives: its write reaches the pane
+        let mut block = open_feed(&first, pane.block);
+        block.write(b"echo-after-promotion\n");
+        read_until_marker(&mut block, "echo-after-promotion");
+        drop(block);
+        // An explicit close: dropping the connection cannot end the session (see the take-over
+        // test)
+        third.close();
+        second.close();
+        first.close();
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_attach_reply_names_panes_that_exited_while_detached() {
+        let harness = Harness::start();
+        // The first client attaches with a program that exits right away: it sees the exit
+        // live, and the pane stays (its block is kept)
+        let (first, first_events) = harness.client();
+        let dying = running("echo dying-marker", "echo dying-marker");
+        match first
+            .attach(&dying, 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { pane, .. } => assert_eq!(pane.pane, PaneId(0)),
+            other => panic!("expected a fresh server, got {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_exit = false;
+        while Instant::now() < deadline {
+            match first_events.recv_timeout(Duration::from_millis(200)) {
+                Ok(WireEventKind::PaneExited { .. }) => {
+                    saw_exit = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_exit, "the exit reached the attached session live");
+
+        first.close();
+        harness.wait_no_sessions();
+
+        // The next attach names the exited pane, and clears the list once delivered
+        let (second, _second_events) = harness.client();
+        let (panes, exited) = attach_existing(&second);
+        assert_eq!(panes.len(), 1, "the held pane still travels");
+        assert_eq!(
+            exited,
+            vec![PaneId(0)],
+            "the exit while detached is delivered once"
+        );
+        let (third, _third_events) = harness.client();
+        let (_, exited) = attach_existing(&third);
+        assert!(exited.is_empty(), "the list is cleared once delivered");
     }
 }
