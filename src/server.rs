@@ -5182,8 +5182,10 @@ mod tests {
 
     // ---- Several sessions (stage 4) -------------------------------------------------------
     // Two and three clients over one socket: the most recently attached one drives, the
-    // others watch; take-over, gating and promotion are all server-side.
+    // others watch; take-over, gating and promotion are all server-side. The socket harness
+    // is unix-only; Windows exercises the same policies through the transport abstraction.
 
+    #[cfg(unix)]
     static HARNESS_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A server process for the multi-session tests: its socket endpoint and shared state.
