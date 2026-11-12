@@ -625,7 +625,7 @@ mod tests {
         assert_eq!((config.window.columns, config.window.rows), (None, None));
         // With no fixed title, the window follows the program (and starts with DEFAULT_TITLE)
         assert_eq!(config.window.title, None);
-        assert_eq!(DEFAULT_TITLE, "Ghostty Rust Terminal Emulator");
+        assert_eq!(DEFAULT_TITLE, "Terminal Emulator");
         assert_eq!(config.scrollback, 10_000);
         assert_eq!(config.on_shell_exit, ShellExit::Close);
         assert!(config.shell.program.is_none());
