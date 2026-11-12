@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, de};
 
 use crate::actions::{self, Script, lua_message};
 
-pub const DEFAULT_TITLE: &str = "Ghostty Rust Terminal Emulator";
+pub const DEFAULT_TITLE: &str = "Terminal Emulator";
 
 #[cfg(windows)]
 const DEFAULT_FAMILY: &str = "Consolas";
