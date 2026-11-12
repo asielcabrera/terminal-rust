@@ -22,17 +22,18 @@ use libghostty_vt::terminal::{Mode, ScrollViewport};
 use mlua::Value;
 use mouse::MouseState;
 use pane::{MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, with_integration};
-use pane_io::{IoEvent, Notify};
+use pane_io::{IoEvent, Notify, PaneIo};
 use renderer::{PaneView, Renderer};
 use server::{
-    AttachAnswer, ControlDown, IpcConn, IpcEndpoint, OpSender, wire,
+    AttachAnswer, BlockId, ControlDown, IpcConn, IpcEndpoint, OpSender, wire,
     wire::{WireEventKind, WireShell},
 };
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(windows)]
@@ -245,6 +246,26 @@ fn spawn_detached_server() {
     }
     if let Err(error) = command.spawn() {
         eprintln!("[server] could not start the server process: {error}");
+    }
+}
+
+/// Connects to the server, starting it detached when none answers (the window and the
+/// automation CLI share this; the retries give the freshly spawned server time to bind)
+fn connect_or_start(endpoint: &IpcEndpoint) -> Result<(IpcConn, Box<dyn Read + Send>), String> {
+    match IpcConn::connect(endpoint) {
+        Ok(connected) => Ok(connected),
+        Err(_) => {
+            spawn_detached_server();
+            let mut connected = None;
+            for _ in 0..CONNECT_RETRIES {
+                thread::sleep(Duration::from_millis(100));
+                if let Ok(connected_now) = IpcConn::connect(endpoint) {
+                    connected = Some(connected_now);
+                    break;
+                }
+            }
+            connected.ok_or_else(|| "could not start or reach the terminal server".to_string())
+        }
     }
 }
 
@@ -1294,7 +1315,9 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() {
     // 0. The subcommands: `terminal server` runs the headless server process, `terminal
-    //    gateway` fronts it for remote clients over the tailnet; the bare binary is the window
+    //    gateway` fronts it for remote clients over the tailnet, and the automation CLI
+    //    subcommands are short-lived clients of a running server (stage 6); the bare
+    //    binary is the window
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("server") => {
@@ -1314,10 +1337,28 @@ fn main() {
             server::run_gateway_process(loaded.config.remote.allow, gateway_port(&args));
             unreachable!("the gateway serves until it is killed");
         }
-        // Reachable for future subcommands only; today the binary is the window, the server
-        // and the gateway
+        Some("ls") => {
+            cli_ls();
+            return;
+        }
+        Some("send") => {
+            cli_send(&args[2..]);
+            return;
+        }
+        Some("capture") => {
+            cli_capture(&args[2..]);
+            return;
+        }
+        Some("attach") => {
+            cli_attach(&args[2..]);
+            return;
+        }
+        // Reachable for future subcommands only; today the binary is the window, the
+        // server, the gateway and the automation CLI
         Some(other) => {
-            eprintln!("unknown subcommand {other:?}; usage: terminal [server|gateway]");
+            eprintln!(
+                "unknown subcommand {other:?}; usage: terminal [server|gateway|ls|send|capture|attach]"
+            );
             std::process::exit(2);
         }
         None => {}
@@ -1346,21 +1387,7 @@ fn main() {
     //    answers the asks (attach, the working directory) by rid.
     let (lua_tx, lua_events) = channel::<(PaneId, LuaEvent)>();
     let endpoint = IpcEndpoint::resolve();
-    let (conn, read) = match IpcConn::connect(&endpoint) {
-        Ok(connected) => connected,
-        Err(_) => {
-            spawn_detached_server();
-            let mut connected = None;
-            for _ in 0..CONNECT_RETRIES {
-                thread::sleep(Duration::from_millis(100));
-                if let Ok(connected_now) = IpcConn::connect(&endpoint) {
-                    connected = Some(connected_now);
-                    break;
-                }
-            }
-            connected.unwrap_or_else(|| panic!("could not start or reach the terminal server"))
-        }
-    };
+    let (conn, read) = connect_or_start(&endpoint).unwrap_or_else(|error| panic!("{error}"));
     {
         let conn = conn.clone();
         let reader_proxy = proxy.clone();
@@ -1475,4 +1502,477 @@ fn main() {
 
     // 5. Main event loop
     let _ = event_loop.run_app(&mut app);
+}
+
+/// One CLI connection: connects (starting the server detached when none answers) and spawns
+/// the reader thread. The CLI's correlated asks answer through `IpcConn`'s pending map; the
+/// reader callback stays empty unless a subcommand needs events (attach).
+fn cli_conn() -> IpcConn {
+    let endpoint = IpcEndpoint::resolve();
+    let (conn, read) = connect_or_start(&endpoint).unwrap_or_else(|error| {
+        eprintln!("terminal: {error}");
+        std::process::exit(1);
+    });
+    {
+        let conn = conn.clone();
+        thread::spawn(move || conn.read_loop(read, |_down| {}));
+    }
+    conn
+}
+
+/// A pane id argument of a CLI subcommand
+fn parse_pane_id(arg: &str) -> u32 {
+    arg.parse().unwrap_or_else(|_| {
+        eprintln!("terminal: {arg:?} is not a pane id (see `terminal ls`)");
+        std::process::exit(2);
+    })
+}
+
+/// `terminal ls`: the live panes as a table, alphabetical (numeric) by pane
+fn cli_ls() {
+    let conn = cli_conn();
+    let panes = conn.automation_list().unwrap_or_else(|error| {
+        eprintln!("terminal ls: {error}");
+        std::process::exit(1);
+    });
+    println!("{}", ls_table(&panes));
+}
+
+/// `terminal send <pane> <text...>`: writes the text to the pane's program, without a trailing
+/// newline (a shell keeps waiting for Enter unless the caller adds one, e.g. `$'echo hi\n'`)
+fn cli_send(args: &[String]) {
+    let (pane, text) = match args {
+        [pane, rest @ ..] if !rest.is_empty() => (parse_pane_id(pane), rest.join(" ")),
+        _ => {
+            eprintln!("usage: terminal send <pane> <text...>");
+            std::process::exit(2);
+        }
+    };
+    let conn = cli_conn();
+    let panes = conn.automation_list().unwrap_or_else(|error| {
+        eprintln!("terminal send: {error}");
+        std::process::exit(1);
+    });
+    let (_, block) = resolve_pane(&panes, pane).unwrap_or_else(|error| {
+        eprintln!("terminal send: {error}");
+        std::process::exit(1);
+    });
+    conn.automation_send_checked(block, text.as_bytes())
+        .unwrap_or_else(|error| {
+            eprintln!("terminal send: {error}");
+            std::process::exit(1);
+        });
+}
+
+/// `terminal capture <pane> [--vt]`: the pane's screen to stdout — plain text by default, the
+/// raw VT snapshot with `--vt`. A dead pane is refused: its screen is still served server-side,
+/// but `capture` mirrors `send` in refusing work on panes whose program has exited.
+fn cli_capture(args: &[String]) {
+    let mut pane = None;
+    let mut vt = false;
+    for arg in args {
+        match arg.as_str() {
+            "--vt" => vt = true,
+            _ if pane.is_none() => pane = Some(parse_pane_id(arg)),
+            _ => {
+                eprintln!("usage: terminal capture <pane> [--vt]");
+                std::process::exit(2);
+            }
+        }
+    }
+    let Some(pane) = pane else {
+        eprintln!("usage: terminal capture <pane> [--vt]");
+        std::process::exit(2);
+    };
+    let conn = cli_conn();
+    let panes = conn.automation_list().unwrap_or_else(|error| {
+        eprintln!("terminal capture: {error}");
+        std::process::exit(1);
+    });
+    let (_, block) = resolve_pane(&panes, pane).unwrap_or_else(|error| {
+        eprintln!("terminal capture: {error}");
+        std::process::exit(1);
+    });
+    if vt {
+        let bytes = conn.snapshot(block).unwrap_or_else(|error| {
+            eprintln!("terminal capture: {error}");
+            std::process::exit(1);
+        });
+        let _ = std::io::stdout().write_all(&bytes);
+    } else {
+        let text = conn.automation_capture(block).unwrap_or_else(|error| {
+            eprintln!("terminal capture: {error}");
+            std::process::exit(1);
+        });
+        let _ = std::io::stdout().write_all(text.as_bytes());
+    }
+}
+
+/// `terminal attach <pane>`: subscribes the pane's block data channel (snapshot served first),
+/// puts the local terminal in raw mode, forwards stdin to the program and streams its output
+/// to stdout. Exits on Ctrl-C or Ctrl-D (the exact escape: 0x03/0x04 arrive as plain bytes in
+/// raw mode), when the program exits, or when the server goes away. It never touches the
+/// window: no attach, no layout ops, no driver. The TTY is restored on every exit path.
+fn cli_attach(args: &[String]) {
+    let [pane] = args else {
+        eprintln!("usage: terminal attach <pane>");
+        std::process::exit(2);
+    };
+    let pane = parse_pane_id(pane);
+    let endpoint = IpcEndpoint::resolve();
+    let (conn, read) = connect_or_start(&endpoint).unwrap_or_else(|error| {
+        eprintln!("terminal attach: {error}");
+        std::process::exit(1);
+    });
+    // The pane's death arrives as an event; every other event is ignored
+    let (dead_tx, dead_rx) = channel::<()>();
+    {
+        let conn = conn.clone();
+        thread::spawn(move || {
+            conn.read_loop(read, move |down| match down {
+                ControlDown::Event(WireEventKind::PaneExited { pane: exited })
+                    if exited == PaneId(pane) =>
+                {
+                    let _ = dead_tx.send(());
+                }
+                _ => {}
+            });
+        });
+    }
+    let panes = conn.automation_list().unwrap_or_else(|error| {
+        eprintln!("terminal attach: {error}");
+        std::process::exit(1);
+    });
+    let (_, block) = resolve_pane(&panes, pane).unwrap_or_else(|error| {
+        eprintln!("terminal attach: {error}");
+        std::process::exit(1);
+    });
+    // Subscribe before claiming the feed: the snapshot is queued server-side first, and any
+    // frame arriving before `open_block` lands on the orphan shelf (replayed in order)
+    conn.automation_subscribe(block).unwrap_or_else(|error| {
+        eprintln!("terminal attach: {error}");
+        std::process::exit(1);
+    });
+    let (wake_tx, wake_rx) = channel::<()>();
+    let notify: Notify = Arc::new(move |_| {
+        let _ = wake_tx.send(());
+    });
+    let mut block_io = conn.open_block(block, notify);
+    // Raw mode from here on; the guard restores the TTY on every exit path
+    let _raw = RawGuard::new().unwrap_or_else(|error| {
+        eprintln!("terminal attach: {error}");
+        std::process::exit(1);
+    });
+    // stdin: every read is forwarded as an automation write (deliberately bypassing the
+    // driver gating — this is an explicit local act); Ctrl-C/Ctrl-D and end-of-file end it
+    let (stop_tx, stop_rx) = channel::<()>();
+    {
+        let conn = conn.clone();
+        thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        let _ = stop_tx.send(());
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Some(stop) = buf[..n]
+                            .iter()
+                            .position(|byte| *byte == 0x03 || *byte == 0x04)
+                        {
+                            if stop > 0 {
+                                conn.automation_send(block, &buf[..stop]);
+                            }
+                            let _ = stop_tx.send(());
+                            break;
+                        }
+                        conn.automation_send(block, &buf[..n]);
+                    }
+                }
+            }
+        });
+    }
+    // Stream: drain the block's feed to stdout, woken by the feed's notify; the exit signals
+    // are re-checked on a small cadence so nothing waits on a missing wake
+    let mut stdout = std::io::stdout().lock();
+    let gone =
+        |rx: &Receiver<()>| matches!(rx.try_recv(), Ok(()) | Err(TryRecvError::Disconnected));
+    loop {
+        loop {
+            block_io.rearm();
+            match block_io.try_read() {
+                Some(chunk) => {
+                    if stdout
+                        .write_all(&chunk)
+                        .and_then(|_| stdout.flush())
+                        .is_err()
+                    {
+                        return; // stdout closed: the attach is over (the guard restores the TTY)
+                    }
+                }
+                None => break,
+            }
+        }
+        if gone(&dead_rx) || gone(&stop_rx) {
+            break;
+        }
+        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
+    }
+    // The program may have written its last lines right before exiting: give the tail one
+    // bounded moment, then drain before restoring the TTY
+    thread::sleep(Duration::from_millis(100));
+    loop {
+        block_io.rearm();
+        match block_io.try_read() {
+            Some(chunk) => {
+                let _ = stdout.write_all(&chunk);
+                let _ = stdout.flush();
+            }
+            None => break,
+        }
+    }
+}
+
+/// Raw local terminal for `terminal attach`, restored on drop. Hand-rolled FFI (no new
+/// dependencies), the same dependency-free style as the Windows named-pipe plumbing: termios
+/// on macOS/Linux, console mode on Windows. Other unixes are refused with an error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct RawGuard {
+    saved: ffi::Termios,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl RawGuard {
+    /// Puts stdin into raw mode; fails when stdin is not a terminal
+    fn new() -> Result<Self, String> {
+        // SAFETY: tcgetattr only reads the fd and fills the (zeroed) struct on success
+        let mut saved: ffi::Termios = unsafe { std::mem::zeroed() };
+        if unsafe { ffi::tcgetattr(0, &mut saved) } != 0 {
+            return Err("stdin is not a terminal; attach needs one".to_string());
+        }
+        let mut raw = saved;
+        raw.c_iflag &= !(ffi::BRKINT | ffi::ICRNL | ffi::INPCK | ffi::ISTRIP | ffi::IXON);
+        raw.c_oflag &= !ffi::OPOST;
+        raw.c_lflag &= !(ffi::ECHO | ffi::ICANON | ffi::IEXTEN | ffi::ISIG);
+        raw.c_cc[ffi::VMIN] = 1;
+        raw.c_cc[ffi::VTIME] = 0;
+        // SAFETY: the struct was filled by tcgetattr just above
+        if unsafe { ffi::tcsetattr(0, ffi::TCSANOW, &raw) } != 0 {
+            return Err("could not put the terminal into raw mode".to_string());
+        }
+        Ok(Self { saved })
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore exactly what tcgetattr saved
+        unsafe { ffi::tcsetattr(0, ffi::TCSANOW, &self.saved) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod ffi {
+    // macOS `struct termios` (sys/termios.h): tcflag_t and speed_t are `unsigned long`
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(crate) struct Termios {
+        pub c_iflag: u64,
+        pub c_oflag: u64,
+        pub c_cflag: u64,
+        pub c_lflag: u64,
+        pub c_cc: [u8; 20],
+        pub c_ispeed: u64,
+        pub c_ospeed: u64,
+    }
+    pub(crate) const VMIN: usize = 16;
+    pub(crate) const VTIME: usize = 17;
+    pub(crate) const BRKINT: u64 = 0x2;
+    pub(crate) const ICRNL: u64 = 0x300;
+    pub(crate) const INPCK: u64 = 0x10;
+    pub(crate) const ISTRIP: u64 = 0x20;
+    pub(crate) const IXON: u64 = 0x400;
+    pub(crate) const OPOST: u64 = 0x1;
+    pub(crate) const ECHO: u64 = 0x8;
+    pub(crate) const ICANON: u64 = 0x100;
+    pub(crate) const IEXTEN: u64 = 0x8000;
+    pub(crate) const ISIG: u64 = 0x80;
+    pub(crate) const TCSANOW: i32 = 0;
+
+    unsafe extern "C" {
+        pub fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
+        pub fn tcsetattr(fd: i32, actions: i32, termios: *const Termios) -> i32;
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod ffi {
+    // Linux/glibc `struct termios` (bits/termios.h): tcflag_t and speed_t are `unsigned int`
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(crate) struct Termios {
+        pub c_iflag: u32,
+        pub c_oflag: u32,
+        pub c_cflag: u32,
+        pub c_lflag: u32,
+        pub c_line: u8,
+        pub c_cc: [u8; 32],
+        pub c_ispeed: u32,
+        pub c_ospeed: u32,
+    }
+    pub(crate) const VMIN: usize = 6;
+    pub(crate) const VTIME: usize = 5;
+    pub(crate) const BRKINT: u32 = 0x2;
+    pub(crate) const ICRNL: u32 = 0x100;
+    pub(crate) const INPCK: u32 = 0x10;
+    pub(crate) const ISTRIP: u32 = 0x20;
+    pub(crate) const IXON: u32 = 0x400;
+    pub(crate) const OPOST: u32 = 0x1;
+    pub(crate) const ECHO: u32 = 0x8;
+    pub(crate) const ICANON: u32 = 0x2;
+    pub(crate) const IEXTEN: u32 = 0x8000;
+    pub(crate) const ISIG: u32 = 0x1;
+    pub(crate) const TCSANOW: i32 = 0;
+
+    unsafe extern "C" {
+        pub fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
+        pub fn tcsetattr(fd: i32, actions: i32, termios: *const Termios) -> i32;
+    }
+}
+
+#[cfg(windows)]
+struct RawGuard {
+    saved: u32,
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl RawGuard {
+    /// Puts the console's input into raw mode; fails when stdin is not a console
+    fn new() -> Result<Self, String> {
+        const STD_INPUT_HANDLE: i32 = -10;
+        const ENABLE_PROCESSED_INPUT: u32 = 0x1;
+        const ENABLE_LINE_INPUT: u32 = 0x2;
+        const ENABLE_ECHO_INPUT: u32 = 0x4;
+        const ENABLE_WINDOW_INPUT: u32 = 0x8;
+        const ENABLE_MOUSE_INPUT: u32 = 0x10;
+        // SAFETY: FFI per the console API, mirroring the windows_pipe plumbing
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut saved = 0u32;
+        if handle == 0 || unsafe { GetConsoleMode(handle, &mut saved) } == 0 {
+            return Err("stdin is not a console; attach needs one".to_string());
+        }
+        let raw = saved
+            & !(ENABLE_PROCESSED_INPUT
+                | ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_WINDOW_INPUT
+                | ENABLE_MOUSE_INPUT);
+        if unsafe { SetConsoleMode(handle, raw) } == 0 {
+            return Err("could not put the console into raw mode".to_string());
+        }
+        Ok(Self { saved, handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore exactly what GetConsoleMode saved
+        unsafe { SetConsoleMode(self.handle, self.saved) };
+    }
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn GetStdHandle(handle: i32) -> isize;
+    fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
+    fn SetConsoleMode(handle: isize, mode: u32) -> i32;
+}
+
+// --- Automation CLI (stage 6) ---------------------------------------------------------------
+
+/// The live pane of an automation ask, resolved for a CLI subcommand: the pane must exist and
+/// its program must still be running. Errors name the pane and say why, for `terminal`'s stderr.
+fn resolve_pane(panes: &[wire::AutomationPane], pane: u32) -> Result<(PaneId, BlockId), String> {
+    match panes.iter().find(|entry| entry.pane == PaneId(pane)) {
+        None => Err(format!(
+            "unknown pane {pane}; run `terminal ls` to see the live panes"
+        )),
+        Some(entry) if !entry.alive => Err(format!("pane {pane}'s program has exited")),
+        Some(entry) => Ok((entry.pane, entry.block)),
+    }
+}
+
+/// The `terminal ls` table: `pane  block  size  state`, alphabetical (numeric) by pane
+fn ls_table(panes: &[wire::AutomationPane]) -> String {
+    let mut panes: Vec<_> = panes.to_vec();
+    panes.sort_unstable_by_key(|pane| pane.pane);
+    let pane_w = panes
+        .iter()
+        .map(|p| p.pane.0.to_string().len())
+        .chain([4])
+        .max()
+        .unwrap();
+    let block_w = panes
+        .iter()
+        .map(|p| p.block.0.to_string().len())
+        .chain([5])
+        .max()
+        .unwrap();
+    let mut lines = vec!["pane  block  size  state".to_string()];
+    for p in panes {
+        lines.push(format!(
+            "{:<pane_w$}  {:<block_w$}  {}x{}  {}",
+            p.pane.0,
+            p.block.0,
+            p.cols,
+            p.rows,
+            if p.alive { "alive" } else { "dead" },
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn listing(pane: u32, alive: bool) -> wire::AutomationPane {
+        wire::AutomationPane {
+            pane: PaneId(pane),
+            block: BlockId(u64::from(pane)),
+            cols: 80,
+            rows: 24,
+            alive,
+        }
+    }
+
+    #[test]
+    fn the_cli_resolves_a_pane_to_its_block() {
+        let panes = vec![listing(0, true), listing(1, false)];
+        assert_eq!(
+            resolve_pane(&panes, 0).expect("the alive pane resolves"),
+            (PaneId(0), BlockId(0))
+        );
+        let error = resolve_pane(&panes, 1).expect_err("a dead pane is refused");
+        assert!(error.contains("exited"), "the error says why: {error}");
+        let error = resolve_pane(&panes, 7).expect_err("an unknown pane is refused");
+        assert!(error.contains("7"), "the error names the pane: {error}");
+    }
+
+    #[test]
+    fn the_ls_table_is_sorted_and_reports_state() {
+        let panes = vec![listing(3, true), listing(12, false), listing(0, true)];
+        let table = ls_table(&panes);
+        let lines: Vec<_> = table.lines().collect();
+        assert_eq!(lines[0], "pane  block  size  state");
+        assert_eq!(lines[1], "0     0      80x24  alive");
+        assert_eq!(lines[2], "3     3      80x24  alive");
+        assert_eq!(lines[3], "12    12     80x24  dead");
+        assert_eq!(lines.len(), 4, "no trailing rows");
+    }
 }

@@ -216,6 +216,20 @@ pub(crate) enum Request {
     Close(BlockId),
     ForegroundDir(BlockId, Sender<Option<PathBuf>>),
     Snapshot(BlockId, Sender<Vec<u8>>),
+    // Automation (stage 6): served directly on the blocks. These deliberately bypass the S4
+    // driver gating — an automation CLI is an explicit local act (socket access is local
+    // trust), and gating its writes behind the window driver would make automation useless
+    // next to a window (S6 design, locked 2026-11-12)
+    AutomationList {
+        reply: Sender<Vec<wire::AutomationPane>>,
+    },
+    /// Writes straight to the block's PTY writer, exactly like the driver's `Write`
+    AutomationSend(BlockId, Vec<u8>, Sender<Result<(), String>>),
+    /// The screen as plain text (the pane's held screen is served too; the CLI checks alive
+    /// client-side and errors there)
+    AutomationCapture(BlockId, Sender<Result<String, String>>),
+    /// The snapshot to queue before live bytes start flowing (`None`: unknown block)
+    AutomationSubscribe(BlockId, Sender<Option<Vec<u8>>>),
     /// The program wrote something, or a paused client read: forward what is pending
     Drain(BlockId),
     /// The program exited (sent by the PTY's thread)
@@ -271,6 +285,10 @@ impl fmt::Debug for Request {
             Request::Close(_) => "Close(..)",
             Request::ForegroundDir(_, _) => "ForegroundDir(..)",
             Request::Snapshot(_, _) => "Snapshot(..)",
+            Request::AutomationList { .. } => "AutomationList(..)",
+            Request::AutomationSend(_, _, _) => "AutomationSend(..)",
+            Request::AutomationCapture(_, _) => "AutomationCapture(..)",
+            Request::AutomationSubscribe(_, _) => "AutomationSubscribe(..)",
             Request::Drain(_) => "Drain(..)",
             Request::Exited(_) => "Exited(..)",
             Request::Shutdown => "Shutdown",
@@ -305,6 +323,15 @@ struct Block {
     /// When the program's exit was noticed; the exit notice waits until every chunk was forwarded
     exit_requested: Option<Instant>,
     client: Client,
+}
+
+impl Block {
+    /// Whether the block's program is still running: an exit was noticed, or the PTY reader
+    /// closed. Windows keeps the ConPTY pipe open after the program dies (the bounded
+    /// `EXIT_GRACE` caveat), so this is exact on unix and grace-bounded on Windows
+    fn alive(&mut self) -> bool {
+        self.exit_requested.is_none() && !self.pty.output_finished()
+    }
 }
 
 /// The server thread's state: the blocks, and the authoritative layout they belong to
@@ -376,6 +403,29 @@ impl Server {
         for block in self.blocks.values_mut() {
             block.pty.kill();
         }
+    }
+
+    /// The live panes for the automation list: every pane of the layout that has a block, with
+    /// its block token, grid and alive state, sorted by pane
+    fn automation_panes(&mut self) -> Vec<wire::AutomationPane> {
+        let mut panes: Vec<_> = Vec::with_capacity(self.pane_blocks.len());
+        for (pane, block) in &self.pane_blocks {
+            let Some((cols, rows)) = self.pane_grids.get(pane) else {
+                continue;
+            };
+            let Some(running) = self.blocks.get_mut(block) else {
+                continue;
+            };
+            panes.push(wire::AutomationPane {
+                pane: *pane,
+                block: *block,
+                cols: *cols,
+                rows: *rows,
+                alive: running.alive(),
+            });
+        }
+        panes.sort_unstable_by_key(|pane| pane.pane);
+        panes
     }
 
     /// Handles one request: the single-transaction body of the run loop, wrapped in
@@ -489,6 +539,41 @@ impl Server {
                     .map(|block| snapshot(&block.terminal))
                     .unwrap_or_default();
                 let _ = reply.send(bytes);
+            }
+            // Automation (stage 6): served directly on the blocks for any session, deliberately
+            // bypassing the S4 driver gating — an automation CLI is an explicit local act (see
+            // the S6 design). A send goes straight to the block's writer thread, exactly like
+            // the driver's Write
+            Request::AutomationList { reply } => {
+                let _ = reply.send(self.automation_panes());
+            }
+            Request::AutomationSend(id, bytes, reply) => {
+                let outcome = match self.blocks.get_mut(&id) {
+                    None => Err(format!("no block {id:?} on this server")),
+                    Some(block) => {
+                        if !block.alive() {
+                            Err("the pane's program has exited".to_string())
+                        } else {
+                            // The block's own writer thread does the PTY write: it can block
+                            // on a full pipe, and no block may stall the loop or the others
+                            let _ = block.writer.send(bytes);
+                            Ok(())
+                        }
+                    }
+                };
+                let _ = reply.send(outcome);
+            }
+            Request::AutomationCapture(id, reply) => {
+                let text = self
+                    .blocks
+                    .get(&id)
+                    .map(|block| plain_screen(&block.terminal))
+                    .ok_or_else(|| format!("no block {id:?} on this server"));
+                let _ = reply.send(text);
+            }
+            Request::AutomationSubscribe(id, reply) => {
+                let snapshot = self.blocks.get(&id).map(|block| snapshot(&block.terminal));
+                let _ = reply.send(snapshot);
             }
             Request::Drain(id) => {
                 let finished = self.drain(id);
@@ -912,6 +997,19 @@ impl Block {
     }
 }
 
+/// The screen as plain text, for the automation capture: the same plain formatter the tests
+/// read, lossy-decoded to a String
+fn plain_screen(terminal: &Terminal<'static, 'static>) -> String {
+    let options = FormatterOptions::new().with_format(Format::Plain);
+    match Formatter::new(terminal, options).and_then(|mut f| f.format_alloc(None)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => {
+            eprintln!("[server] could not export the screen as text: {error}");
+            String::new()
+        }
+    }
+}
+
 /// The screen as VT sequences that rebuild it in a fresh terminal: content with scrollback,
 /// styles, modes, scrolling region, directory, keyboard modes, tabstops, hyperlinks and charsets.
 /// The palette is left out (the client's theme applies). An explicit cursor position goes last,
@@ -1119,6 +1217,37 @@ pub(crate) mod wire {
         Snapshot {
             block: BlockId,
         },
+        /// The automation CLI asks for the live panes (`terminal ls`)
+        AutomationList {},
+        /// The automation CLI writes bytes straight to a block's PTY writer (`terminal send`,
+        /// and `terminal attach`'s stdin). Deliberately NOT the driver-gated `Write`: an
+        /// automation CLI is an explicit local act (socket access is local trust), and gating
+        /// it behind the window driver would make automation useless next to a window (S6)
+        Send {
+            block: BlockId,
+            bytes: Vec<u8>,
+        },
+        /// The automation CLI reads a block's screen as plain text (`terminal capture`); the
+        /// raw VT snapshot rides the existing `Snapshot` op instead
+        Capture {
+            block: BlockId,
+        },
+        /// The automation CLI subscribes a block's data channel (`terminal attach`): the
+        /// snapshot is queued first, then the session starts receiving live bytes
+        AutomationSubscribe {
+            block: BlockId,
+        },
+    }
+
+    /// One live pane of the automation list: the pane id, its block token, the grid it was last
+    /// spawned or resized at, and whether its program is still running
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) struct AutomationPane {
+        pub pane: PaneId,
+        pub block: BlockId,
+        pub cols: u16,
+        pub rows: u16,
+        pub alive: bool,
     }
 
     /// One request for the server, versioned. `rid` names the sender's correlation id for the
@@ -1216,9 +1345,15 @@ pub(crate) mod wire {
                 Request::Close(id) => Self::CloseBlock { block: *id },
                 Request::ForegroundDir(id, _) => Self::ForegroundDir { block: *id },
                 Request::Snapshot(id, _) => Self::Snapshot { block: *id },
-                // Not on the wire: the server's own plumbing and the test-only create
+                // Not on the wire: the server's own plumbing and the test-only create. The
+                // automation asks travel the other way (a CLI op becomes its request in the
+                // session), so they have no request-to-op form either
                 Request::Drain(_) | Request::Exited(_) | Request::Shutdown => return None,
                 Request::Attach { .. } => return None,
+                Request::AutomationList { .. }
+                | Request::AutomationSend(..)
+                | Request::AutomationCapture(..)
+                | Request::AutomationSubscribe(..) => return None,
                 #[cfg(test)]
                 Request::Panic | Request::Create { .. } => return None,
             };
@@ -1329,7 +1464,13 @@ pub(crate) mod wire {
                 Self::ResizeBlock { block, cols, rows } => Request::Resize(block, cols, rows),
                 Self::Kill { block } => Request::Kill(block),
                 Self::CloseBlock { block } => Request::Close(block),
+                // The automation family is served by the session itself: the ops carry no
+                // in-process request form (they are CLI asks, never window traffic)
                 Self::ForegroundDir { .. } | Self::Snapshot { .. } => return None,
+                Self::AutomationList {}
+                | Self::Send { .. }
+                | Self::Capture { .. }
+                | Self::AutomationSubscribe { .. } => return None,
             };
             Some(request)
         }
@@ -1463,6 +1604,32 @@ pub(crate) mod wire {
         pub(crate) fn hello(login: String) -> Self {
             Self::new(0, WireReplyKind::Hello { login })
         }
+
+        /// The answer to `AutomationList`
+        pub(crate) fn automation_list(rid: u64, panes: Vec<AutomationPane>) -> Self {
+            Self::new(rid, WireReplyKind::AutomationList { panes })
+        }
+
+        /// The answer to a confirmed `Send`
+        pub(crate) fn automation_sent(rid: u64) -> Self {
+            Self::new(rid, WireReplyKind::AutomationSent {})
+        }
+
+        /// The answer to `Capture`
+        pub(crate) fn automation_capture(rid: u64, text: String) -> Self {
+            Self::new(rid, WireReplyKind::AutomationCapture { text })
+        }
+
+        /// The answer to `AutomationSubscribe` (the snapshot is already queued on the data
+        /// channel; the reply arrives ahead of it because controls overtake data)
+        pub(crate) fn automation_subscribed(rid: u64) -> Self {
+            Self::new(rid, WireReplyKind::AutomationSubscribed {})
+        }
+
+        /// A refused automation ask (unknown or dead block)
+        pub(crate) fn automation_failed(rid: u64, error: String) -> Self {
+            Self::new(rid, WireReplyKind::AutomationFailed { error })
+        }
     }
 
     /// What a reply answers with
@@ -1496,6 +1663,23 @@ pub(crate) mod wire {
         /// [`WireReply::hello`])
         Hello {
             login: String,
+        },
+        /// The answer to `AutomationList`: the server's live panes, sorted by pane
+        AutomationList {
+            panes: Vec<AutomationPane>,
+        },
+        /// The answer to a confirmed `Send`: the bytes are on their way to the PTY
+        AutomationSent {},
+        /// The answer to `Capture`: the screen as plain text
+        AutomationCapture {
+            text: String,
+        },
+        /// The answer to `AutomationSubscribe`: the snapshot is queued on the data channel and
+        /// live bytes follow
+        AutomationSubscribed {},
+        /// A refused automation ask (unknown or dead block)
+        AutomationFailed {
+            error: String,
         },
     }
 
@@ -2970,6 +3154,8 @@ impl Session {
             return false;
         }
         let rid = request.rid.unwrap_or(0);
+        // Fire-and-forget automation sends (the attach loop's keystrokes) answer nothing
+        let wants_reply = request.rid.is_some();
         match request.op {
             // A fresh start behaves like init, so the same path serves both ops
             WireOp::Init {
@@ -3010,6 +3196,94 @@ impl Session {
                 };
                 self.writer
                     .push_control(control_frame(&WireReply::snapshot(rid, bytes)));
+                true
+            }
+            // Automation (stage 6): served for ANY connection, deliberately bypassing the
+            // driver gate — an automation CLI is an explicit local act (socket access is local
+            // trust), and gating its writes behind the window driver would make automation
+            // useless next to a window (S6 design, locked 2026-11-12)
+            WireOp::AutomationList {} => {
+                let (reply, answer) = channel();
+                self.handle.send(Request::AutomationList { reply });
+                let panes = match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                    Ok(panes) => panes,
+                    Err(_) => {
+                        eprintln!("[server] a session request did not answer");
+                        return false;
+                    }
+                };
+                self.writer
+                    .push_control(control_frame(&WireReply::automation_list(rid, panes)));
+                true
+            }
+            WireOp::Send { block, bytes } => {
+                let (reply, answer) = channel();
+                self.handle
+                    .send(Request::AutomationSend(block, bytes, reply));
+                let outcome = match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        eprintln!("[server] a session request did not answer");
+                        return false;
+                    }
+                };
+                if wants_reply {
+                    let answer = match outcome {
+                        Ok(()) => WireReply::automation_sent(rid),
+                        Err(error) => WireReply::automation_failed(rid, error),
+                    };
+                    self.writer.push_control(control_frame(&answer));
+                }
+                true
+            }
+            WireOp::Capture { block } => {
+                let (answer_tx, answer) = channel();
+                self.handle
+                    .send(Request::AutomationCapture(block, answer_tx));
+                let text = match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        eprintln!("[server] a session request did not answer");
+                        return false;
+                    }
+                };
+                let reply = match text {
+                    Ok(text) => WireReply::automation_capture(rid, text),
+                    Err(error) => WireReply::automation_failed(rid, error),
+                };
+                self.writer.push_control(control_frame(&reply));
+                true
+            }
+            WireOp::AutomationSubscribe { block } => {
+                let (answer_tx, answer) = channel();
+                self.handle
+                    .send(Request::AutomationSubscribe(block, answer_tx));
+                let queued = match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                    Ok(queued) => queued,
+                    Err(_) => {
+                        eprintln!("[server] a session request did not answer");
+                        return false;
+                    }
+                };
+                match queued {
+                    None => self
+                        .writer
+                        .push_control(control_frame(&WireReply::automation_failed(
+                            rid,
+                            format!("no block {block:?} on this server"),
+                        ))),
+                    Some(bytes) => {
+                        // The snapshot is queued before live bytes start flowing: whoever reads
+                        // the stream sees the full screen first, exactly like an attach. The
+                        // reply arrives ahead of it (controls overtake queued data), so the
+                        // client claims the feed before it reads anything
+                        self.writer
+                            .push_data(data_frame(FRAME_SNAPSHOT, block, bytes));
+                        self.start_receiving();
+                        self.writer
+                            .push_control(control_frame(&WireReply::automation_subscribed(rid)));
+                    }
+                }
                 true
             }
             op => {
@@ -3715,6 +3989,98 @@ impl IpcConn {
                 ..
             }) => dir,
             _ => None,
+        }
+    }
+
+    /// The server's live panes, for the automation CLI (`terminal ls`): pane id, block token,
+    /// grid and alive state, sorted by pane
+    pub(crate) fn automation_list(&self) -> Result<Vec<wire::AutomationPane>, String> {
+        match self.ask(wire::WireOp::AutomationList {}) {
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationList { panes },
+                ..
+            }) => Ok(panes),
+            Ok(other) => Err(format!("the list got an unexpected reply: {other:?}")),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes bytes straight to a block's PTY writer, fire-and-forget (the attach loop's
+    /// stdin forwarding). Deliberately bypasses the driver gating: an automation CLI is an
+    /// explicit local act, and gating it behind the window driver would make automation
+    /// useless next to a window (S6 design)
+    pub(crate) fn automation_send(&self, block: BlockId, bytes: &[u8]) {
+        self.send_op(wire::WireOp::Send {
+            block,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    /// One checked send: the server confirms the block exists and its program is alive
+    pub(crate) fn automation_send_checked(
+        &self,
+        block: BlockId,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        match self.ask(wire::WireOp::Send {
+            block,
+            bytes: bytes.to_vec(),
+        }) {
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationSent {},
+                ..
+            }) => Ok(()),
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationFailed { error },
+                ..
+            }) => Err(error),
+            Ok(other) => Err(format!("the send got an unexpected reply: {other:?}")),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The block's screen as plain text, for `terminal capture`
+    pub(crate) fn automation_capture(&self, block: BlockId) -> Result<String, String> {
+        match self.ask(wire::WireOp::Capture { block }) {
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationCapture { text },
+                ..
+            }) => Ok(text),
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationFailed { error },
+                ..
+            }) => Err(error),
+            Ok(other) => Err(format!("the capture got an unexpected reply: {other:?}")),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The block's raw VT snapshot, for `terminal capture --vt`
+    pub(crate) fn snapshot(&self, block: BlockId) -> Result<Vec<u8>, String> {
+        match self.ask(wire::WireOp::Snapshot { block }) {
+            Ok(WireReply {
+                reply: WireReplyKind::Snapshot { bytes },
+                ..
+            }) => Ok(bytes),
+            Ok(other) => Err(format!("the snapshot got an unexpected reply: {other:?}")),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Subscribes the block's data channel for `terminal attach`: the snapshot is queued
+    /// first, then the connection receives live bytes (the session starts receiving)
+    pub(crate) fn automation_subscribe(&self, block: BlockId) -> Result<(), String> {
+        match self.ask(wire::WireOp::AutomationSubscribe { block }) {
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationSubscribed {},
+                ..
+            }) => Ok(()),
+            Ok(WireReply {
+                reply: WireReplyKind::AutomationFailed { error },
+                ..
+            }) => Err(error),
+            Ok(other) => Err(format!("the subscribe got an unexpected reply: {other:?}")),
+            Err(error) => Err(error),
         }
     }
 
@@ -6723,6 +7089,199 @@ mod tests {
         first
             .write_all(&masked_frame(0x8, true, &1000u16.to_be_bytes()))
             .expect("the close goes out");
+        harness.wait_no_sessions();
+    }
+
+    // --- Stage 6: the automation CLI ---------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn the_automation_cli_lists_panes() {
+        let harness = Harness::start();
+        // A fresh server has no panes to list
+        let (cli, _cli_events) = harness.client();
+        assert!(
+            cli.automation_list().expect("the list answers").is_empty(),
+            "a fresh server lists no panes"
+        );
+        // After the window attaches, the pane is listed with its block token, grid and state
+        let (window, _window_events) = harness.client();
+        let pane = attach_fresh(&window);
+        let panes = cli.automation_list().expect("the list answers");
+        assert_eq!(panes.len(), 1, "the live pane is listed");
+        assert_eq!(panes[0].pane, pane.pane);
+        assert_eq!(panes[0].block, pane.block);
+        assert_eq!((panes[0].cols, panes[0].rows), (80, 24));
+        assert!(panes[0].alive, "the held program is alive");
+        // The CLI never attached: the ask must not disturb the window's session
+        window.close();
+        cli.close();
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_automation_cli_send_bypasses_the_driver_gate_and_reaches_the_program() {
+        let harness = Harness::start();
+        let (window, _window_events) = harness.client();
+        let echo = running("cat", "more");
+        let pane = match window
+            .attach(&echo, 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { pane, .. } => pane,
+            other => panic!("expected a fresh server, got {other:?}"),
+        };
+        let mut block = open_feed(&window, pane.block);
+        // The CLI session never attaches, so it is never the driver; its automation send is
+        // served anyway (a plain Write from the same session would be dropped by the gate)
+        let (cli, _cli_events) = harness.client();
+        cli.automation_send_checked(pane.block, b"echo-from-cli\n")
+            .expect("the send is confirmed");
+        read_until_marker(&mut block, "echo-from-cli");
+        // An unknown block is refused with an error naming it
+        let error = cli
+            .automation_send_checked(BlockId(999), b"echo-nowhere\n")
+            .expect_err("an unknown block is refused");
+        assert!(error.contains("999"), "the error names the block: {error}");
+        // The window still drives: its write reaches the pane after the CLI traffic
+        block.write(b"echo-still-driver\n");
+        read_until_marker(&mut block, "echo-still-driver");
+        cli.close();
+        window.close();
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dead_pane_reports_dead_and_refuses_sends() {
+        let harness = Harness::start();
+        let (window, window_events) = harness.client();
+        let dying = running("echo dying-marker", "echo dying-marker");
+        let pane = match window
+            .attach(&dying, 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { pane, .. } => pane,
+            other => panic!("expected a fresh server, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_exit = false;
+        while Instant::now() < deadline {
+            match window_events.recv_timeout(Duration::from_millis(200)) {
+                Ok(WireEventKind::PaneExited { .. }) => {
+                    saw_exit = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_exit, "the exit reached the window");
+        // The list reports the pane dead, and sends to it are refused
+        let (cli, _cli_events) = harness.client();
+        let panes = cli.automation_list().expect("the list answers");
+        assert_eq!(panes.len(), 1, "the held pane is still listed");
+        assert!(!panes[0].alive, "the exited pane reports dead");
+        let error = cli
+            .automation_send_checked(panes[0].block, b"echo-ghost\n")
+            .expect_err("a dead pane refuses sends");
+        assert!(error.contains("exited"), "the error explains why: {error}");
+        // The held screen is still readable: capture answers the plain text (the CLI checks
+        // alive client-side and errors there; the server keeps serving the held screen)
+        let text = cli
+            .automation_capture(pane.block)
+            .expect("the capture answers");
+        assert!(
+            text.contains("dying-marker"),
+            "the screen is still captured: {text:?}"
+        );
+        cli.close();
+        window.close();
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_automation_cli_capture_matches_the_plain_screen() {
+        let harness = Harness::start();
+        let (window, _window_events) = harness.client();
+        let program = running(
+            "printf 'capture-line\\ncapture-marker'",
+            "echo capture-line & echo capture-marker",
+        );
+        let pane = match window
+            .attach(&program, 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { pane, .. } => pane,
+            other => panic!("expected a fresh server, got {other:?}"),
+        };
+        let mut block = open_feed(&window, pane.block);
+        let output = read_until_marker(&mut block, "capture-marker");
+        // The expectation: the same output, rendered in a fresh terminal, plain-formatted
+        let mut expected = terminal();
+        expected.vt_write(&output);
+        let (cli, _cli_events) = harness.client();
+        let text = cli
+            .automation_capture(pane.block)
+            .expect("the capture answers");
+        assert_eq!(
+            text,
+            plain_text(&expected),
+            "the capture is the plain exported screen"
+        );
+        // The raw snapshot (`capture --vt`) rebuilds the same screen
+        let vt = cli.snapshot(pane.block).expect("the snapshot answers");
+        let mut restored = terminal();
+        restored.vt_write(&vt);
+        assert_eq!(plain_text(&restored), plain_text(&expected));
+        cli.close();
+        window.close();
+        harness.wait_no_sessions();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attach_streams_the_snapshot_then_live_bytes() {
+        let harness = Harness::start();
+        let (window, _window_events) = harness.client();
+        let echo = running("cat", "more");
+        let pane = match window
+            .attach(&echo, 80, 24, 1000)
+            .expect("the attach answers")
+        {
+            AttachAnswer::Fresh { pane, .. } => pane,
+            other => panic!("expected a fresh server, got {other:?}"),
+        };
+        let mut win_block = open_feed(&window, pane.block);
+        win_block.write(b"seed-screen\n");
+        read_until_marker(&mut win_block, "seed-screen");
+        // The CLI subscribes to the block's data channel: the snapshot is served first
+        let (cli, _cli_events) = harness.client();
+        cli.automation_subscribe(pane.block)
+            .expect("the subscribe answers");
+        let mut cli_block = open_feed(&cli, pane.block);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let snapshot = loop {
+            cli_block.rearm();
+            match cli_block.try_read() {
+                Some(chunk) => break chunk,
+                None if Instant::now() > deadline => panic!("the snapshot never arrived"),
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("seed-screen"),
+            "the snapshot is served first: {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        // ...then live bytes follow, and the window still sees its own data
+        cli.automation_send(pane.block, b"echo-live\n");
+        read_until_marker(&mut cli_block, "echo-live");
+        read_until_marker(&mut win_block, "echo-live");
+        cli.close();
+        window.close();
         harness.wait_no_sessions();
     }
 }
