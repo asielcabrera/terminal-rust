@@ -3241,14 +3241,9 @@ impl IpcConn {
     }
 
     /// Ends the connection now: the server's session sees an end-of-file and frees itself (and
-    /// the blocks live on headless). The window process's exit does the same for every fd.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the window's process exit ends the connection; the explicit close is test-only today"
-        )
-    )]
+    /// the blocks live on headless). The window process's exit does the same for every fd; the
+    /// only caller today is the unix-socket round-trip test, so on Windows this is dead code.
+    #[allow(dead_code)]
     pub fn close(&self) {
         self.shared.write.lock().unwrap().shutdown();
     }
