@@ -6319,6 +6319,7 @@ mod tests {
     }
 
     /// Sends a control message from the test client: the 1-byte type prefix, then the JSON
+    #[cfg(unix)]
     fn ws_send_control(stream: &mut TcpStream, message: &impl serde::Serialize) {
         let json = serde_json::to_vec(message).expect("serializes");
         let mut message = vec![FRAME_CONTROL];
@@ -6328,6 +6329,7 @@ mod tests {
 
     /// Reads one WebSocket binary message off the test client (the server never fragments out);
     /// `None` when nothing arrived within the read timeout
+    #[cfg(unix)]
     fn ws_recv_maybe(stream: &mut TcpStream) -> Option<Vec<u8>> {
         stream
             .set_read_timeout(Some(Duration::from_millis(250)))
@@ -6377,6 +6379,7 @@ mod tests {
     }
 
     /// Reads WebSocket messages until one satisfies `wanted`, with a deadline
+    #[cfg(unix)]
     fn ws_recv_until(stream: &mut TcpStream, mut wanted: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
