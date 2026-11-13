@@ -2126,6 +2126,7 @@ dependencies = [
  "serde_path_to_error",
  "sha1_smol",
  "terminal-protocol",
+ "terminal-server",
  "ttf-parser",
  "wgpu",
  "winit",
@@ -2143,6 +2144,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1_smol",
+]
+
+[[package]]
+name = "terminal-server"
+version = "0.1.0"
+dependencies = [
+ "libghostty-vt",
+ "serde",
+ "serde_json",
+ "terminal-protocol",
 ]
 
 [[package]]

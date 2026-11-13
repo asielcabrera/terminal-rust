@@ -6,7 +6,6 @@ mod icon;
 mod mouse;
 mod pane;
 mod renderer;
-mod server;
 
 use actions::{Action, Command, Direction, EventKind, LeaderOutcome, LeaderState, Script};
 use blink::Blink;
@@ -35,6 +34,7 @@ use terminal_protocol::ipc::{AttachAnswer, BlockId, ControlDown, IpcConn, IpcEnd
 #[cfg(unix)]
 use terminal_protocol::wire::{self, WireEventKind, WireShell};
 use terminal_protocol::{layout, pane_io};
+
 #[cfg(windows)]
 use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows, WindowExtWindows};
 use winit::{
@@ -201,7 +201,7 @@ fn ensure_server_running(endpoint: &IpcEndpoint) {
 
 /// Reads the gateway subcommand's arguments: `--port N`, or the default port
 fn gateway_port(args: &[String]) -> u16 {
-    let mut port = server::DEFAULT_GATEWAY_PORT;
+    let mut port = terminal_server::DEFAULT_GATEWAY_PORT;
     let mut values = args.iter().skip(2);
     while let Some(flag) = values.next() {
         if flag != "--port" {
@@ -1333,7 +1333,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("server") => {
-            server::run_server_process();
+            terminal_server::run_server_process();
             unreachable!("the server process serves until it is killed");
         }
         Some("gateway") => {
@@ -1346,7 +1346,7 @@ fn main() {
             // and retry
             let endpoint = IpcEndpoint::resolve();
             ensure_server_running(&endpoint);
-            server::run_gateway_process(loaded.config.remote.allow, gateway_port(&args));
+            terminal_server::run_gateway_process(loaded.config.remote.allow, gateway_port(&args));
             unreachable!("the gateway serves until it is killed");
         }
         Some("ls") => {

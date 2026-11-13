@@ -17,6 +17,7 @@ categories = ["command-line-utilities"]
 arboard = { version = "3.7.0", default-features = false }
 portable-pty = "0.9.0"
 terminal-protocol = { path = "crates/terminal-protocol" }
+terminal-server = { path = "crates/terminal-server" }
 base64 = "0.22"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 fontdb = "0.24.0"
