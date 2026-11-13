@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
 [package]
 name = "terminal"
 version = "0.1.0"
@@ -11,6 +15,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 arboard = { version = "3.7.0", default-features = false }
+terminal-protocol = { path = "crates/terminal-protocol" }
 base64 = "0.22"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 fontdb = "0.24.0"

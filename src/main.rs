@@ -3,7 +3,6 @@ mod blink;
 mod config;
 mod glyphs;
 mod icon;
-mod layout;
 mod mouse;
 mod pane;
 mod pane_io;
@@ -39,6 +38,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use terminal_protocol::layout;
 #[cfg(windows)]
 use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows, WindowExtWindows};
 use winit::{

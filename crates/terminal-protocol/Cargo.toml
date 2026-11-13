@@ -1,0 +1,10 @@
+[package]
+name = "terminal-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Shared wire protocol, layout geometry and configuration types for the window and the server process"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

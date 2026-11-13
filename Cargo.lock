@@ -2125,10 +2125,18 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha1_smol",
+ "terminal-protocol",
  "ttf-parser",
  "wgpu",
  "winit",
  "winresource",
+]
+
+[[package]]
+name = "terminal-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
