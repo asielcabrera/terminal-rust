@@ -13,13 +13,8 @@ use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, Table, Value, VmState};
 use serde::Deserialize;
 use winit::keyboard::{Key, NamedKey};
 
-/// Modifier bits (independent of winit and libghostty)
-pub const CTRL: u8 = 1;
-pub const SHIFT: u8 = 2;
-pub const ALT: u8 = 4;
-pub const SUPER: u8 = 8;
-/// "Leader pressed": in a key's `mods`, binds it to the key pressed after the `leader`
-pub const LEADER: u8 = 16;
+use terminal_protocol::config::parse_mods_with;
+pub use terminal_protocol::config::{ALT, CTRL, LEADER, SHIFT, SUPER, parse_mods};
 
 /// Maximum run time for a script: the config on load, or each function call. Without it a
 /// `while true do end` would freeze the whole terminal, since Lua runs on the UI thread.
@@ -221,44 +216,6 @@ fn parse_key(name: &str) -> Result<KeyId, String> {
             "unknown key {name:?} (use a character like \"v\" or a name like \"PageUp\", \"F5\", \"Enter\", \"Space\")"
         )),
     }
-}
-
-/// "CTRL|SHIFT" to bits. Accepts CTRL, SHIFT, ALT, and SUPER (also CMD and WIN).
-pub fn parse_mods(text: &str) -> Result<u8, String> {
-    parse_mods_with(text, false)
-}
-
-/// Like `parse_mods`, but keys in `keys` may also use `LEADER`
-fn parse_binding_mods(text: &str) -> Result<u8, String> {
-    parse_mods_with(text, true)
-}
-
-fn parse_mods_with(text: &str, allow_leader: bool) -> Result<u8, String> {
-    let mut bits = 0;
-    for part in text
-        .split('|')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        bits |= match part.to_uppercase().as_str() {
-            "CTRL" | "CONTROL" => CTRL,
-            "SHIFT" => SHIFT,
-            "ALT" | "OPTION" => ALT,
-            "SUPER" | "CMD" | "WIN" | "META" => SUPER,
-            "LEADER" if allow_leader => LEADER,
-            _ if allow_leader => {
-                return Err(format!(
-                    "unknown modifier {part:?} (use CTRL, SHIFT, ALT, SUPER, or LEADER, separated by |)"
-                ));
-            }
-            _ => {
-                return Err(format!(
-                    "unknown modifier {part:?} (use CTRL, SHIFT, ALT, or SUPER, separated by |)"
-                ));
-            }
-        };
-    }
-    Ok(bits)
 }
 
 #[derive(Default)]
@@ -499,6 +456,11 @@ fn is_modifier_key(key: &Key) -> bool {
                 | NamedKey::NumLock
         )
     )
+}
+
+/// Like `parse_mods`, but keys in `keys` may also use `LEADER`
+fn parse_binding_mods(text: &str) -> Result<u8, String> {
+    parse_mods_with(text, true)
 }
 
 /// Parses the `keys` table from config.lua. Modifiers must match exactly (SHIFT too when the

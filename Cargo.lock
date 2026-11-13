@@ -2136,6 +2136,7 @@ dependencies = [
 name = "terminal-protocol"
 version = "0.1.0"
 dependencies = [
+ "libghostty-vt",
  "serde",
 ]
 

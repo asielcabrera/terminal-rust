@@ -7,4 +7,5 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+libghostty-vt = "0.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
