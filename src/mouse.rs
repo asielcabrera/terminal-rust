@@ -25,7 +25,7 @@ use crate::App;
 use crate::actions;
 use crate::config::{Decorations, RightClick};
 use crate::layout::{Axis, Edge, Hit, HitParams, PaneId, Path};
-use crate::server::{MoveFloatOp, Request, ResizeFloatEdgeOp, SetDividerOp};
+use terminal_protocol::ipc::{MoveFloatOp, Request, ResizeFloatEdgeOp, SetDividerOp};
 
 /// How often one line scrolls while a selection is dragged outside the window
 pub const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);

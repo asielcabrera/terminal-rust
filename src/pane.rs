@@ -229,6 +229,8 @@ pub(crate) fn with_integration(mut shell: ShellConfig) -> ShellConfig {
     shell
 }
 
+/// Writes a red notice into the grid itself, before the shell starts. When launched by
+/// double-click there is no console to read stderr, so the error shows up where the user is.
 pub fn write_notice(terminal: &mut Terminal<'static, 'static>, tag: &str, message: &str) {
     // The terminal needs a carriage return with each line feed; any other control character
     // (which could come from an error message) is dropped

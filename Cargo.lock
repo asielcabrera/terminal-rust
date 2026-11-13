@@ -2136,10 +2136,13 @@ dependencies = [
 name = "terminal-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "libc",
  "libghostty-vt",
  "portable-pty",
  "serde",
+ "serde_json",
+ "sha1_smol",
 ]
 
 [[package]]

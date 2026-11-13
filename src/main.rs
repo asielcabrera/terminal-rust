@@ -22,10 +22,6 @@ use pane::{
 };
 use pane_io::{IoEvent, Notify, PaneIo};
 use renderer::{PaneView, Renderer};
-use server::{
-    AttachAnswer, BlockId, ControlDown, IpcConn, IpcEndpoint, OpSender, wire,
-    wire::{WireEventKind, WireShell},
-};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,8 +31,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use terminal_protocol::ipc::{AttachAnswer, BlockId, ControlDown, IpcConn, IpcEndpoint, OpSender};
 #[cfg(unix)]
-use terminal_protocol::proc_cwd;
+use terminal_protocol::wire::{self, WireEventKind, WireShell};
 use terminal_protocol::{layout, pane_io};
 #[cfg(windows)]
 use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows, WindowExtWindows};

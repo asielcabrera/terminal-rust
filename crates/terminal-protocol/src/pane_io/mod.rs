@@ -285,8 +285,5 @@ fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
     }
 }
 
-/// Writes a red notice into the grid itself, before the shell starts. When launched by
-/// double-click there is no console to read stderr, so the error shows up where the user is.
-
 #[cfg(test)]
 mod tests;
