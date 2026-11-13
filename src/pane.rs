@@ -26,6 +26,12 @@ use crate::pane_io::PaneIo;
 /// image is decoded exactly once (at transmit) no matter how often the renderer queries it.
 pub(crate) static PNG_DECODES: AtomicU64 = AtomicU64::new(0);
 
+/// Serializes image-transmit tests against the decode counter: the counter is process-wide
+/// (libghostty installs one global decoder), so a count test would otherwise see other
+/// parallel tests' decodes in its deltas. Only tests hold it; production decode never does.
+#[cfg(test)]
+pub(crate) static PNG_DECODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A PNG decoder for the kitty graphics protocol: it decodes into the 8-bit RGBA pixels
 /// libghostty expects, expanding palettes and grayscales and stripping 16-bit channels. The
 /// output buffer is reused across images so a burst of transmits does not reallocate every time.
@@ -808,6 +814,7 @@ mod tests {
         .unwrap();
         enable_graphics(&mut terminal, &Config::default());
         terminal.resize(10, 3, 8, 16).unwrap();
+        let _decode_lock = PNG_DECODE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         terminal.vt_write(kitty_apc(RED_PNG_B64).as_bytes());
 
         let graphics = terminal.kitty_graphics().unwrap();
@@ -863,6 +870,7 @@ mod tests {
         enable_graphics(&mut terminal, &disabled);
         assert_eq!(terminal.kitty_image_storage_limit().unwrap(), 0);
         terminal.resize(10, 3, 8, 16).unwrap();
+        let _decode_lock = PNG_DECODE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         terminal.vt_write(kitty_apc(RED_PNG_B64).as_bytes());
 
         let graphics = terminal.kitty_graphics().unwrap();
@@ -895,6 +903,7 @@ mod tests {
             png.len()
         );
         let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        let _decode_lock = PNG_DECODE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         terminal.vt_write(format!("\x1b_Ga=T,f=100,q=1;{b64}\x1b\\").as_bytes());
 
         // It is stored whole, decoded to RGBA, and placed at its natural size: the transmit is
@@ -936,6 +945,7 @@ mod tests {
             "the payload exceeds the cap: {} bytes",
             b64.len()
         );
+        let _decode_lock = PNG_DECODE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         terminal.vt_write(format!("\x1b_Ga=T,f=100,q=1;{b64}\x1b\\").as_bytes());
 
         let graphics = terminal.kitty_graphics().unwrap();
@@ -1027,6 +1037,7 @@ mod tests {
         let configured = config_from("return { graphics = { storage_limit = 4096 } }");
         enable_graphics(&mut terminal, &configured);
         terminal.resize(10, 3, 8, 16).unwrap();
+        let _decode_lock = PNG_DECODE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         terminal.vt_write(kitty_apc(RED_PNG_B64).as_bytes());
 
         let graphics = terminal.kitty_graphics().unwrap();
