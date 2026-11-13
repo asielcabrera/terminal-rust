@@ -21,7 +21,9 @@ use libghostty_vt::paste;
 use libghostty_vt::terminal::{Mode, ScrollViewport};
 use mlua::Value;
 use mouse::MouseState;
-use pane::{MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, with_integration};
+use pane::{
+    MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, install_png_decoder, with_integration,
+};
 use pane_io::{IoEvent, Notify, PaneIo};
 use renderer::{PaneView, Renderer};
 use server::{
@@ -1031,6 +1033,7 @@ impl App {
                         terminal: &pane.terminal,
                         render_state: &mut pane.render_state,
                         rect: pane.rect,
+                        grid: pane.grid,
                         focused: window_focused && pane.id == focus,
                         dim: several && pane.id != focus,
                         // With the prefix pressed there is a border even with a single pane
@@ -1109,6 +1112,9 @@ fn map_key(code: KeyCode) -> Key {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
+            // The kitty PNG decoder is a thread-local callback in libghostty: install it on the
+            // window thread (where panes are fed) before any pane exists
+            install_png_decoder();
             let decorated = self.config.window.decorations == config::Decorations::Full;
             let attrs = Window::default_attributes()
                 .with_title(self.window_title())

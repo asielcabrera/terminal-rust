@@ -78,3 +78,36 @@ fn fs_glyph(v: GlyphOut) -> @location(0) vec4<f32> {
     let coverage = textureLoad(atlas, vec2<i32>(floor(v.texel)), 0).r;
     return vec4<f32>(v.color.rgb, v.color.a * coverage);
 }
+
+// --- Kitty graphics images ---
+// One instanced quad per placement; the texture and sampler live in a per-image bind group at
+// group(1), created and cached by the renderer. The uv interval covers the placement's source
+// rectangle, and pixel art stays pixelated: nearest sampling, no filtering.
+
+@group(1) @binding(0) var image_tex: texture_2d<f32>;
+@group(1) @binding(1) var image_samp: sampler;
+
+struct ImageOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_image(
+    @builtin(vertex_index) vertex: u32,
+    @location(0) pos: vec2<f32>,
+    @location(1) size: vec2<f32>,
+    @location(2) uv_origin: vec2<f32>,
+    @location(3) uv_size: vec2<f32>,
+) -> ImageOut {
+    let c = corner(vertex);
+    var out: ImageOut;
+    out.clip = to_clip(pos + c * size);
+    out.uv = uv_origin + c * uv_size;
+    return out;
+}
+
+@fragment
+fn fs_image(v: ImageOut) -> @location(0) vec4<f32> {
+    return textureSample(image_tex, image_samp, v.uv);
+}
