@@ -14,7 +14,6 @@ use libghostty_vt::terminal::{
     DeviceType, PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
-use portable_pty::CommandBuilder;
 
 use crate::LuaEvent;
 use crate::config::{self, Config, ShellConfig};
@@ -230,39 +229,6 @@ pub(crate) fn with_integration(mut shell: ShellConfig) -> ShellConfig {
     shell
 }
 
-pub(crate) fn build_command(shell: &ShellConfig) -> CommandBuilder {
-    // `args` panics with the default shell; config.rs validation already guarantees
-    // there are only arguments when there is a program.
-    let mut command = match &shell.program {
-        Some(program) => {
-            let mut command = CommandBuilder::new(program);
-            command.args(&shell.args);
-            command
-        }
-        None => CommandBuilder::new_default_prog(),
-    };
-    if let Some(cwd) = &shell.cwd {
-        command.cwd(cwd);
-    }
-    for (key, value) in &shell.env {
-        command.env(key, value);
-    }
-    command
-}
-
-/// `portable-pty` returns the `CreateProcessW` failure as plain text ("CreateProcessW `...`
-/// in cwd `...` failed: <cause>") with escaped NUL characters. For display this keeps only the
-/// cause; if the format ever changes, it returns the full message.
-pub(crate) fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
-    let text = error.to_string();
-    match text.rsplit_once(" failed: ") {
-        Some((_, cause)) => cause.to_string(),
-        None => text,
-    }
-}
-
-/// Writes a red notice into the grid itself, before the shell starts. When launched by
-/// double-click there is no console to read stderr, so the error shows up where the user is.
 pub fn write_notice(terminal: &mut Terminal<'static, 'static>, tag: &str, message: &str) {
     // The terminal needs a carriage return with each line feed; any other control character
     // (which could come from an error message) is dropped

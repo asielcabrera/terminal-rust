@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::thread;
 
-use portable_pty::{ChildKiller, MasterPty, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 
 use crate::config::ShellConfig;
-use crate::pane::{build_command, spawn_failure_cause};
 
 /// What a pane's byte source reports to the event loop
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +46,7 @@ pub trait PaneIo {
 
 /// Chunks that fit in the output channel before the reader thread blocks (backpressure to the PTY,
 /// and to ConPTY on Windows, instead of memory growing without limit)
-pub(crate) const CHANNEL_CAPACITY: usize = 64;
+pub const CHANNEL_CAPACITY: usize = 64;
 
 /// A program running in a PTY of this machine
 pub struct LocalPty {
@@ -232,7 +231,7 @@ impl LocalPty {
     /// block, and the server loop must never block on one block's write. It hands the write end
     /// to one thread per block, which also keeps the write order per block. After this only the
     /// writer thread writes; [`LocalPty::write`] (tests, and a link-less pane) writes nothing.
-    pub(crate) fn take_writer(&mut self) -> Box<dyn Write + Send> {
+    pub fn take_writer(&mut self) -> Box<dyn Write + Send> {
         self.writer
             .take()
             .expect("the PTY's write end was already detached")
@@ -241,7 +240,7 @@ impl LocalPty {
     /// Whether the output really ended: the reader thread finished (the channel is disconnected)
     /// and nothing is left, so no chunk can arrive anymore. A chunk met on the way is stashed for
     /// the next [`LocalPty::try_read`].
-    pub(crate) fn output_finished(&mut self) -> bool {
+    pub fn output_finished(&mut self) -> bool {
         match self.rx.try_recv() {
             Ok(chunk) => {
                 self.stashed = Some(chunk);
@@ -253,145 +252,41 @@ impl LocalPty {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc::{Receiver, channel};
-    use std::time::{Duration, Instant};
+// (moved from pane.rs, which kept the window-side pieces)
 
-    fn shell(program: &str, args: &[&str]) -> ShellConfig {
-        ShellConfig {
-            program: Some(program.to_string()),
-            args: args.iter().map(|arg| arg.to_string()).collect(),
-            integration: false,
-            ..ShellConfig::default()
+fn build_command(shell: &ShellConfig) -> CommandBuilder {
+    // `args` panics with the default shell; config.rs validation already guarantees
+    // there are only arguments when there is a program.
+    let mut command = match &shell.program {
+        Some(program) => {
+            let mut command = CommandBuilder::new(program);
+            command.args(&shell.args);
+            command
         }
+        None => CommandBuilder::new_default_prog(),
+    };
+    if let Some(cwd) = &shell.cwd {
+        command.cwd(cwd);
     }
-
-    /// A program that prints `text` and exits, on every system
-    fn printing(text: &str) -> ShellConfig {
-        if cfg!(windows) {
-            shell("cmd", &["/C", &format!("echo {text}")])
-        } else {
-            shell("sh", &["-c", &format!("echo {text}")])
-        }
+    for (key, value) in &shell.env {
+        command.env(key, value);
     }
+    command
+}
 
-    /// A program that waits until it is killed
-    fn waiting() -> ShellConfig {
-        if cfg!(windows) {
-            shell("cmd", &["/C", "ping -n 30 127.0.0.1 >NUL"])
-        } else {
-            shell("sh", &["-c", "sleep 30"])
-        }
-    }
-
-    fn events() -> (Notify, Receiver<IoEvent>) {
-        let (tx, rx) = channel();
-        let tx = std::sync::Mutex::new(tx);
-        let notify: Notify = Arc::new(move |event| {
-            let _ = tx.lock().unwrap().send(event);
-        });
-        (notify, rx)
-    }
-
-    /// Reads output until `pending` returns false or 10 s pass
-    fn read_until(io: &mut LocalPty, mut pending: impl FnMut(&str) -> bool) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut output = Vec::new();
-        while pending(&String::from_utf8_lossy(&output)) && Instant::now() < deadline {
-            io.rearm();
-            match io.try_read() {
-                Some(chunk) => {
-                    // ConPTY asks for the cursor position at startup and shows nothing until the
-                    // terminal answers; in the app libghostty answers, here the test does
-                    if chunk.windows(4).any(|query| query == b"\x1b[6n") {
-                        io.write(b"\x1b[1;1R");
-                    }
-                    output.extend(chunk);
-                }
-                None => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        String::from_utf8_lossy(&output).into_owned()
-    }
-
-    fn wait_for(rx: &Receiver<IoEvent>, wanted: IoEvent) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(left) {
-                Ok(event) if event == wanted => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-        false
-    }
-
-    #[test]
-    fn the_program_output_arrives_and_its_exit_is_reported() {
-        let (notify, rx) = events();
-        let (mut io, notice) = LocalPty::spawn(&printing("hello-pane-io"), true, 80, 24, notify)
-            .expect("the program starts");
-        assert_eq!(notice, None);
-        let output = read_until(&mut io, |text| !text.contains("hello-pane-io"));
-        assert!(output.contains("hello-pane-io"), "{output:?}");
-        assert!(wait_for(&rx, IoEvent::Exited), "the exit is reported");
-    }
-
-    #[test]
-    fn output_wakes_the_event_loop() {
-        let (notify, rx) = events();
-        let (_io, _) = LocalPty::spawn(&printing("wake"), true, 80, 24, notify).unwrap();
-        assert!(wait_for(&rx, IoEvent::Output));
-    }
-
-    #[test]
-    fn notify_again_sends_another_output_event() {
-        let (notify, rx) = events();
-        let (io, _) = LocalPty::spawn(&waiting(), true, 80, 24, notify).unwrap();
-        while rx.try_recv().is_ok() {}
-        io.notify_again();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(IoEvent::Output));
-    }
-
-    #[test]
-    fn killing_the_program_reports_its_exit() {
-        let (notify, rx) = events();
-        let (mut io, _) = LocalPty::spawn(&waiting(), true, 80, 24, notify).unwrap();
-        io.kill();
-        assert!(wait_for(&rx, IoEvent::Exited));
-    }
-
-    #[test]
-    fn an_explicit_program_that_cannot_start_is_an_error() {
-        let (notify, _rx) = events();
-        let error = LocalPty::spawn(&shell("no-such-program-pane-io", &[]), true, 80, 24, notify)
-            .err()
-            .expect("it does not start");
-        assert!(
-            error.starts_with("could not start \"no-such-program-pane-io\": "),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_configured_shell_that_cannot_start_falls_back_to_the_default_shell() {
-        let (notify, _rx) = events();
-        let (mut io, notice) = LocalPty::spawn(
-            &shell("no-such-program-pane-io", &[]),
-            false,
-            80,
-            24,
-            notify,
-        )
-        .expect("the default shell starts");
-        let notice = notice.expect("a notice explains the fallback");
-        assert!(
-            notice.starts_with("could not start \"no-such-program-pane-io\": "),
-            "{notice}"
-        );
-        assert!(notice.ends_with("; using the default shell"), "{notice}");
-        io.kill();
+/// `portable-pty` returns the `CreateProcessW` failure as plain text ("CreateProcessW `...`
+/// in cwd `...` failed: <cause>") with escaped NUL characters. For display this keeps only the
+/// cause; if the format ever changes, it returns the full message.
+fn spawn_failure_cause(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    match text.rsplit_once(" failed: ") {
+        Some((_, cause)) => cause.to_string(),
+        None => text,
     }
 }
+
+/// Writes a red notice into the grid itself, before the shell starts. When launched by
+/// double-click there is no console to read stderr, so the error shows up where the user is.
+
+#[cfg(test)]
+mod tests;

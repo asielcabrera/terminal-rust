@@ -5,9 +5,6 @@ mod glyphs;
 mod icon;
 mod mouse;
 mod pane;
-mod pane_io;
-#[cfg(unix)] // Windows has no API for another process' cwd; pane.rs only calls it on unix
-mod proc_cwd;
 mod renderer;
 mod server;
 
@@ -38,7 +35,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use terminal_protocol::layout;
+#[cfg(unix)]
+use terminal_protocol::proc_cwd;
+use terminal_protocol::{layout, pane_io};
 #[cfg(windows)]
 use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows, WindowExtWindows};
 use winit::{
