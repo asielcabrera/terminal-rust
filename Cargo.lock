@@ -2104,7 +2104,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "terminal"
+name = "terminal-app"
+version = "0.1.0"
+dependencies = [
+ "terminal-client",
+ "terminal-protocol",
+ "terminal-server",
+ "winresource",
+]
+
+[[package]]
+name = "terminal-client"
 version = "0.1.0"
 dependencies = [
  "arboard",
@@ -2120,17 +2130,12 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "png",
  "pollster",
- "portable-pty",
  "serde",
- "serde_json",
  "serde_path_to_error",
- "sha1_smol",
  "terminal-protocol",
- "terminal-server",
  "ttf-parser",
  "wgpu",
  "winit",
- "winresource",
 ]
 
 [[package]]

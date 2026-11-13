@@ -39,8 +39,10 @@ use terminal_protocol::layout::{Closed, Layout, LayoutState, PaneId, Rect};
 use terminal_protocol::layout::{Dir, Edge, Limits};
 use terminal_protocol::pane_io::{CHANNEL_CAPACITY, IoEvent, LocalPty, Notify, PaneIo};
 
+pub use terminal_protocol::ipc::DEFAULT_GATEWAY_PORT;
 #[cfg(windows)]
 use terminal_protocol::ipc::windows_pipe;
+
 use terminal_protocol::ipc::{
     AddFloatOp, AttachOutcome, AttachedPaneInfo, BlockId, Client, ConnWrite, Created, CreatedPane,
     IpcEndpoint, IpcListener, IpcStream, LayoutEvent, Request, ServerBlock, SplitOp, WireFrame,
@@ -1829,10 +1831,6 @@ pub fn run_server_process() {
 // identical payloads. The gateway itself is a transport bridge, not a window: its connection
 // to the local server is a regular S4 session, so the registry, driver policy and event fan-out
 // serve a remote client unchanged (attach → the remote client drives, like any window).
-
-/// The default loopback port `terminal gateway` serves on. Real deployments front it with
-/// `tailscale serve`, which proxies a tailnet HTTPS endpoint onto this port.
-pub const DEFAULT_GATEWAY_PORT: u16 = 42061;
 
 /// Both halves of the gateway's own session at the local server
 fn connect_server_halves(endpoint: &IpcEndpoint) -> io::Result<(Box<dyn Read + Send>, ConnWrite)> {

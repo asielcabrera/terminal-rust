@@ -1,0 +1,22 @@
+[package]
+name = "terminal-app"
+version = "0.1.0"
+edition = "2024"
+description = "A GPU-accelerated, cross-platform terminal emulator built on libghostty-vt and wgpu"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cabrerasiel/terminal"
+readme = "README.md"
+keywords = ["terminal", "terminal-emulator", "gpu", "wgpu", "ghostty"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+terminal-protocol = { path = "../terminal-protocol" }
+terminal-client = { path = "../terminal-client" }
+terminal-server = { path = "../terminal-server" }
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.34"
+
+[[bin]]
+name = "terminal"
+path = "src/main.rs"

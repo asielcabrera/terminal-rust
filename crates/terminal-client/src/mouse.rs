@@ -252,11 +252,11 @@ pub fn wheel_lines(
 }
 
 impl App {
-    fn undecorated(&self) -> bool {
+    pub(crate) fn undecorated(&self) -> bool {
         self.config.window.decorations == Decorations::None
     }
 
-    fn hit_params(&self) -> Option<HitParams> {
+    pub(crate) fn hit_params(&self) -> Option<HitParams> {
         let scale = self.window.as_ref()?.scale_factor();
         let padding = f64::from(self.renderer.as_ref()?.padding());
         // The edge band of a floating pane cannot eat all of its padding: what remains is the
@@ -270,7 +270,7 @@ impl App {
     }
 
     /// Floating pane under the pointer, whether over its content, its padding or its edge
-    fn float_under_pointer(&self) -> Option<PaneId> {
+    pub(crate) fn float_under_pointer(&self) -> Option<PaneId> {
         match self.hit_at_pointer()? {
             Hit::Pane(id) | Hit::FloatMove(id) | Hit::FloatResize(id, _)
                 if self.layout.is_float(id) =>
@@ -282,7 +282,7 @@ impl App {
     }
 
     /// What is under the pointer: a pane's content, a divider, a floating pane's edge...
-    fn hit_at_pointer(&self) -> Option<Hit> {
+    pub(crate) fn hit_at_pointer(&self) -> Option<Hit> {
         let area = self.window_area()?;
         let params = self.hit_params()?;
         let (x, y) = self.mouse.pointer;
@@ -290,7 +290,7 @@ impl App {
     }
 
     /// Pane whose content is under the pointer
-    fn pane_at_pointer(&self) -> Option<usize> {
+    pub(crate) fn pane_at_pointer(&self) -> Option<usize> {
         match self.hit_at_pointer()? {
             Hit::Pane(id) => self.index_of(id),
             _ => None,
@@ -299,7 +299,7 @@ impl App {
 
     /// Pane that receives the mouse: the one that captured it on button press or, otherwise,
     /// the one underneath. With a divider captured, none receives it.
-    fn target_pane(&self) -> Option<usize> {
+    pub(crate) fn target_pane(&self) -> Option<usize> {
         match &self.mouse.capture {
             Some(Capture::Pane(id)) => self.index_of(*id),
             Some(_) => None,
@@ -308,7 +308,7 @@ impl App {
     }
 
     /// Pane that captured the mouse on button press
-    fn captured_pane(&self) -> Option<usize> {
+    pub(crate) fn captured_pane(&self) -> Option<usize> {
         match &self.mouse.capture {
             Some(Capture::Pane(id)) => self.index_of(*id),
             _ => None,
@@ -316,7 +316,7 @@ impl App {
     }
 
     /// Starts dragging a divider or a floating pane
-    fn start_drag(&mut self, capture: Capture) {
+    pub(crate) fn start_drag(&mut self, capture: Capture) {
         self.mouse.drag_from = self.mouse.pointer;
         self.mouse.capture = Some(capture);
         self.update_pointer_icon();
@@ -325,7 +325,7 @@ impl App {
     /// Moves (`edge` = `None`) or resizes a floating pane by however much the pointer moved since
     /// the last step. One message per step; the server answers with a state event and the
     /// window relayouts from its projection.
-    fn drag_float(&mut self, id: PaneId, edge: Option<Edge>) {
+    pub(crate) fn drag_float(&mut self, id: PaneId, edge: Option<Edge>) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
         };
@@ -358,7 +358,7 @@ impl App {
     }
 
     /// Moves the captured divider to where the pointer is: one message per drag step
-    fn drag_divider(&mut self, path: &[bool], axis: Axis) {
+    pub(crate) fn drag_divider(&mut self, path: &[bool], axis: Axis) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
         };
@@ -376,7 +376,7 @@ impl App {
     }
 
     /// Pointer position relative to the pane's corner
-    fn local_pointer(&self, idx: usize) -> (f64, f64) {
+    pub(crate) fn local_pointer(&self, idx: usize) -> (f64, f64) {
         let rect = self.panes[idx].rect;
         (
             self.mouse.pointer.0 - f64::from(rect.x),
@@ -386,7 +386,7 @@ impl App {
 
     /// Did that pane's program ask to receive the mouse? With Shift held the mouse always
     /// belongs to the terminal (selection), as in any emulator.
-    fn app_wants_mouse_at(&self, idx: usize) -> bool {
+    pub(crate) fn app_wants_mouse_at(&self, idx: usize) -> bool {
         self.panes[idx]
             .terminal
             .is_mouse_tracking()
@@ -394,12 +394,12 @@ impl App {
             && self.mod_bits & actions::SHIFT == 0
     }
 
-    fn rectangle_requested(&self) -> bool {
+    pub(crate) fn rectangle_requested(&self) -> bool {
         self.mod_bits == self.config.mouse.rectangle_modifiers.0
     }
 
     /// Window edge under the pointer, only if the window is undecorated and not maximized
-    fn edge_under_pointer(&self) -> Option<ResizeDirection> {
+    pub(crate) fn edge_under_pointer(&self) -> Option<ResizeDirection> {
         let window = self.window.as_ref()?;
         if !self.undecorated() || window.is_maximized() || window.fullscreen().is_some() {
             return None;
@@ -416,7 +416,7 @@ impl App {
     }
 
     /// Cell (column, row) of the pane under the pointer
-    fn cell_in_pane(&self, idx: usize) -> Option<(u16, u16)> {
+    pub(crate) fn cell_in_pane(&self, idx: usize) -> Option<(u16, u16)> {
         let renderer = self.renderer.as_ref()?;
         let pane = self.panes.get(idx)?;
         let (cell_width, cell_height) = renderer.cell_size();
@@ -432,7 +432,7 @@ impl App {
         ))
     }
 
-    fn encoder_size(&self, idx: usize) -> Option<EncoderSize> {
+    pub(crate) fn encoder_size(&self, idx: usize) -> Option<EncoderSize> {
         let renderer = self.renderer.as_ref()?;
         let rect = self.panes.get(idx)?.rect;
         let (cell_width, cell_height) = renderer.cell_size();
@@ -452,7 +452,7 @@ impl App {
     /// System cursor based on what is under the pointer: resize arrows on the edges of a window
     /// without a title bar, the normal arrow if the program owns the mouse, and the text cursor
     /// everywhere else
-    fn update_pointer_icon(&mut self) {
+    pub(crate) fn update_pointer_icon(&mut self) {
         let icon = if let Some(direction) = self.edge_under_pointer() {
             resize_icon(direction)
         } else if let Some(icon) = self.mouse.capture.as_ref().and_then(capture_icon) {
@@ -630,7 +630,7 @@ impl App {
     }
 
     /// Once the pane no longer has a button pressed, it stops holding the mouse capture
-    fn release_capture(&mut self, idx: usize) {
+    pub(crate) fn release_capture(&mut self, idx: usize) {
         let pane = &self.panes[idx];
         if !pane.selecting && pane.reported.is_none() {
             self.mouse.capture = None;
@@ -685,7 +685,12 @@ impl App {
     }
 
     /// Sends a pane's program a mouse event encoded in the protocol it requested
-    fn send_mouse(&mut self, idx: usize, action: mouse::Action, button: Option<mouse::Button>) {
+    pub(crate) fn send_mouse(
+        &mut self,
+        idx: usize,
+        action: mouse::Action,
+        button: Option<mouse::Button>,
+    ) {
         let Some(size) = self.encoder_size(idx) else {
             return;
         };
@@ -720,7 +725,7 @@ impl App {
         }
     }
 
-    fn send_key_repeatedly(&mut self, idx: usize, key: Key, count: u32) {
+    pub(crate) fn send_key_repeatedly(&mut self, idx: usize, key: Key, count: u32) {
         let Ok(mut event) = GhosttyKeyEvent::new() else {
             return;
         };
@@ -744,7 +749,7 @@ impl App {
         }
     }
 
-    fn gesture_geometry(&self, idx: usize) -> Option<Geometry> {
+    pub(crate) fn gesture_geometry(&self, idx: usize) -> Option<Geometry> {
         let renderer = self.renderer.as_ref()?;
         let pane = self.panes.get(idx)?;
         let (cell_width, _) = renderer.cell_size();
@@ -758,7 +763,7 @@ impl App {
 
     /// Left press: starts a selection (or extends it to a word or line on double or
     /// triple click)
-    fn begin_selection(&mut self, idx: usize) {
+    pub(crate) fn begin_selection(&mut self, idx: usize) {
         let Some((column, row)) = self.cell_in_pane(idx) else {
             return;
         };
@@ -793,7 +798,7 @@ impl App {
     }
 
     /// The pointer moves with the left button held: the selection follows the pointer
-    fn drag_selection(&mut self, idx: usize) {
+    pub(crate) fn drag_selection(&mut self, idx: usize) {
         let Some((column, row)) = self.cell_in_pane(idx) else {
             return;
         };
@@ -889,7 +894,7 @@ impl App {
     }
 
     /// Releasing the left button ends the selection (and copies it if `copy_on_select`)
-    fn finish_selection(&mut self, idx: usize) {
+    pub(crate) fn finish_selection(&mut self, idx: usize) {
         let grid_ref_cell = self.cell_in_pane(idx);
         let pane = &mut self.panes[idx];
         let grid_ref = grid_ref_cell
@@ -907,7 +912,7 @@ impl App {
 
     /// Copies a pane's selection to the clipboard, without soft-wrap line breaks or trailing
     /// spaces
-    fn copy_selection_at(&mut self, idx: usize) {
+    pub(crate) fn copy_selection_at(&mut self, idx: usize) {
         let options = FormatOptions::new().with_unwrap(true).with_trim(true);
         let text = match self.panes[idx]
             .terminal
@@ -952,7 +957,7 @@ impl App {
         self.redraw();
     }
 
-    fn redraw(&self) {
+    pub(crate) fn redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }

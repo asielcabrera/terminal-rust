@@ -2,46 +2,11 @@
 members = ["crates/*"]
 resolver = "2"
 
-[package]
-name = "terminal"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "A GPU-accelerated, cross-platform terminal emulator built on libghostty-vt and wgpu"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cabrerasiel/terminal"
-readme = "README.md"
-keywords = ["terminal", "terminal-emulator", "gpu", "wgpu", "ghostty"]
-categories = ["command-line-utilities"]
-
-[dependencies]
-arboard = { version = "3.7.0", default-features = false }
-portable-pty = "0.9.0"
-terminal-protocol = { path = "crates/terminal-protocol" }
-terminal-server = { path = "crates/terminal-server" }
-base64 = "0.22"
-bytemuck = { version = "1.25.2", features = ["derive"] }
-fontdb = "0.24.0"
-fontdue = "0.9.5"
-libghostty-vt = "0.2.2"
-mlua = { version = "0.12.2", features = ["lua54", "vendored", "serialize"] }
-png = "0.18.1"
-pollster = "1.0.1"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.145"
-serde_path_to_error = "0.1.20"
-sha1_smol = "1.0"
-ttf-parser = "0.25"
-wgpu = "30.0.1"
-winit = "0.30.13"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
-
-[target."cfg(windows)".build-dependencies]
-winresource = "0.1.34"
 
 # Dependency crates are compiled optimized even in debug builds: the kitty PNG decoder runs
 # inside the `png` crate (miniz_oxide inflate), and a debug-mode inflate of a photo-scale image

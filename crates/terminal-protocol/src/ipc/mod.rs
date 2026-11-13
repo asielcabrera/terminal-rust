@@ -506,6 +506,10 @@ fn unix_listen(path: &std::path::Path) -> io::Result<UnixListener> {
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
+/// The default loopback port `terminal gateway` serves on. Real deployments front it with
+/// `tailscale serve`, which proxies a tailnet HTTPS endpoint onto this port.
+pub const DEFAULT_GATEWAY_PORT: u16 = 42061;
+
 // ---- The client side of the server process --------------------------------------------------
 //
 // The window connects to the endpoint (or starts `terminal server` first; that part lives in

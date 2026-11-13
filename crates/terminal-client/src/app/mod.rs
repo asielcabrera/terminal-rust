@@ -1,26 +1,17 @@
-mod actions;
-mod blink;
-mod config;
-mod glyphs;
-mod icon;
-mod mouse;
-mod pane;
-mod renderer;
-
-use actions::{Action, Command, Direction, EventKind, LeaderOutcome, LeaderState, Script};
-use blink::Blink;
-use config::Config;
-use layout::{Axis, Layout, LayoutState, Limits, PaneId, Rect};
+use crate::actions::{Action, Command, Direction, EventKind, LeaderOutcome, LeaderState, Script};
+use crate::blink::Blink;
+use crate::config::Config;
+use crate::layout::{Axis, Layout, LayoutState, Limits, PaneId, Rect};
+use crate::mouse::MouseState;
+use crate::pane::{
+    MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, install_png_decoder, with_integration,
+};
+use crate::pane_io::{IoEvent, Notify, PaneIo};
+use crate::renderer::{PaneView, Renderer};
 use libghostty_vt::key::{Action as KeyAction, Encoder, Event as GhosttyKeyEvent, Key, Mods};
 use libghostty_vt::paste;
 use libghostty_vt::terminal::{Mode, ScrollViewport};
 use mlua::Value;
-use mouse::MouseState;
-use pane::{
-    MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, install_png_decoder, with_integration,
-};
-use pane_io::{IoEvent, Notify, PaneIo};
-use renderer::{PaneView, Renderer};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,9 +22,9 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use terminal_protocol::ipc::{AttachAnswer, BlockId, ControlDown, IpcConn, IpcEndpoint, OpSender};
+use terminal_protocol::layout;
 #[cfg(unix)]
 use terminal_protocol::wire::{self, WireEventKind, WireShell};
-use terminal_protocol::{layout, pane_io};
 
 #[cfg(windows)]
 use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows, WindowExtWindows};
@@ -56,7 +47,7 @@ const MIN_PANE_ROWS: u32 = 3;
 
 /// Events other threads send to the UI loop to wake it up
 #[derive(Debug)]
-enum UserEvent {
+pub(crate) enum UserEvent {
     /// The server applied a layout mutation, or a pane's program wrote or exited
     Layout(WireEventKind),
     /// The configuration file changed on disk
@@ -65,7 +56,7 @@ enum UserEvent {
 
 /// Something that happened inside a terminal during `vt_write` that Lua hooks may care about.
 /// Queued from libghostty callbacks and dispatched once `vt_write` has finished.
-enum LuaEvent {
+pub enum LuaEvent {
     TitleChanged(String),
     Bell,
 }
@@ -112,7 +103,7 @@ fn corner_preference(rounded: bool) -> CornerPreference {
 
 /// The application icon at `size`×`size` for winit (title bar and taskbar)
 fn window_icon(size: u32) -> Option<winit::window::Icon> {
-    winit::window::Icon::from_rgba(icon::rgba(size), size, size).ok()
+    winit::window::Icon::from_rgba(crate::icon::rgba(size), size, size).ok()
 }
 
 /// Sets the icon in the Dock and the app switcher (Cmd+Tab). Without an `.app` bundle macOS
@@ -126,7 +117,7 @@ fn set_dock_icon() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let data = NSData::with_bytes(&icon::ico(&[256, 128, 64, 32, 16]));
+    let data = NSData::with_bytes(&crate::icon::ico(&[256, 128, 64, 32, 16]));
     let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
         return;
     };
@@ -134,49 +125,49 @@ fn set_dock_icon() {
     unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
 }
 
-struct App {
-    config: Config,
-    config_path: Option<PathBuf>,
+pub struct App {
+    pub(crate) config: Config,
+    pub(crate) config_path: Option<PathBuf>,
     /// Keys, hooks, and the Lua interpreter of the current configuration
-    script: Script,
+    pub(crate) script: Script,
     /// Terminal events waiting to be passed to the Lua hooks (and the sender for new
     /// panes)
-    lua_events: Receiver<(PaneId, LuaEvent)>,
-    lua_tx: Sender<(PaneId, LuaEvent)>,
+    pub(crate) lua_events: Receiver<(PaneId, LuaEvent)>,
+    pub(crate) lua_tx: Sender<(PaneId, LuaEvent)>,
     /// While a hook's commands run, no other hooks fire, so one that triggers its own event
     /// (e.g. reloading the config from `config-reloaded`) does not
     /// loop forever
-    in_hook: bool,
-    /// Pressed modifiers (bits of `actions::CTRL`, etc.) for looking up key bindings
-    mod_bits: u8,
+    pub(crate) in_hook: bool,
+    /// Pressed modifiers (bits of `crate::actions::CTRL`, etc.) for looking up key bindings
+    pub(crate) mod_bits: u8,
     /// How far the font size was moved by the increase/decrease actions. A configuration
     /// reload resets it to zero.
-    font_delta: f32,
+    pub(crate) font_delta: f32,
     /// Cursor blink phase, and whether the last frame had a blinking cursor (only then
     /// does the loop need to wake up to toggle it)
-    blink: Blink,
-    cursor_blinks: bool,
-    mouse: MouseState,
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
-    focused: bool,
+    pub(crate) blink: Blink,
+    pub(crate) cursor_blinks: bool,
+    pub(crate) mouse: MouseState,
+    pub(crate) window: Option<Arc<Window>>,
+    pub(crate) renderer: Option<Renderer>,
+    pub(crate) focused: bool,
     /// All panes; the layout projection decides where each one goes and which one has focus.
     /// The layout is rebuilt from server state events and never mutated here.
-    panes: Vec<Pane>,
-    layout: Layout,
+    pub(crate) panes: Vec<Pane>,
+    pub(crate) layout: Layout,
     /// The prefix (like tmux's Ctrl+B) is pressed and waiting for the next key
-    leader: LeaderState,
-    key_encoder: Encoder<'static>,
-    mods: Mods,
+    pub(crate) leader: LeaderState,
+    pub(crate) key_encoder: Encoder<'static>,
+    pub(crate) mods: Mods,
     /// Owns the programs behind the panes, over the server-process connection
-    conn: IpcConn,
+    pub(crate) conn: IpcConn,
     /// The op sender the mouse driver uses, shaped like the in-process handle it replaced
-    server: OpSender,
+    pub(crate) server: OpSender,
     /// Wakes the UI loop from the reader thread when a pane's output arrives
-    proxy: EventLoopProxy<UserEvent>,
+    pub(crate) proxy: EventLoopProxy<UserEvent>,
     /// Panes the attach reply reported as exited while this window was detached; processed
     /// once the event loop runs (drain, hook, close-or-hold)
-    attach_exited: Vec<PaneId>,
+    pub(crate) attach_exited: Vec<PaneId>,
 }
 
 /// How often a starting window retries the server connection after spawning (and spawning) it
@@ -185,7 +176,7 @@ const CONNECT_RETRIES: usize = 50;
 /// Connects to the server (starting it detached if it is not running), exactly like the
 /// window does before attaching. The gateway dials again per remote client; this only
 /// guarantees the server is up.
-fn ensure_server_running(endpoint: &IpcEndpoint) {
+pub fn ensure_server_running(endpoint: &IpcEndpoint) {
     if IpcConn::connect(endpoint).is_ok() {
         return;
     }
@@ -200,8 +191,8 @@ fn ensure_server_running(endpoint: &IpcEndpoint) {
 }
 
 /// Reads the gateway subcommand's arguments: `--port N`, or the default port
-fn gateway_port(args: &[String]) -> u16 {
-    let mut port = terminal_server::DEFAULT_GATEWAY_PORT;
+pub fn gateway_port(args: &[String]) -> u16 {
+    let mut port = terminal_protocol::ipc::DEFAULT_GATEWAY_PORT;
     let mut values = args.iter().skip(2);
     while let Some(flag) = values.next() {
         if flag != "--port" {
@@ -279,63 +270,63 @@ fn output_notify(proxy: EventLoopProxy<UserEvent>, pane: PaneId) -> Notify {
 }
 
 impl App {
-    fn index_of(&self, id: PaneId) -> Option<usize> {
+    pub(crate) fn index_of(&self, id: PaneId) -> Option<usize> {
         self.panes.iter().position(|pane| pane.id == id)
     }
 
     /// Index in `panes` of the focused pane. Always present: closing the last one exits the app.
-    fn focused_index(&self) -> usize {
+    pub(crate) fn focused_index(&self) -> usize {
         self.index_of(self.layout.focus()).unwrap_or(0)
     }
 
-    fn focused(&self) -> &Pane {
+    pub(crate) fn focused(&self) -> &Pane {
         &self.panes[self.focused_index()]
     }
 
-    fn focused_mut(&mut self) -> &mut Pane {
+    pub(crate) fn focused_mut(&mut self) -> &mut Pane {
         let index = self.focused_index();
         &mut self.panes[index]
     }
 
     /// The configured fixed title or, if none, the one set by the focused pane's program
     /// (or the default)
-    fn window_title(&self) -> String {
+    pub(crate) fn window_title(&self) -> String {
         if let Some(title) = &self.config.window.title {
             return title.clone();
         }
         self.focused()
             .title()
-            .unwrap_or_else(|| config::DEFAULT_TITLE.to_string())
+            .unwrap_or_else(|| crate::config::DEFAULT_TITLE.to_string())
     }
 
-    fn refresh_title(&self) {
+    pub(crate) fn refresh_title(&self) {
         if let Some(window) = &self.window {
             window.set_title(&self.window_title());
         }
     }
 
     /// Focuses a pane (a click, an action): one message, and the state event applies it
-    fn focus_pane(&mut self, id: PaneId) {
+    pub(crate) fn focus_pane(&mut self, id: PaneId) {
         if self.layout.focus() == id {
             return;
         }
         self.conn.send_op(wire::WireOp::SetFocus { pane: id });
     }
 
-    fn redraw_window(&self) {
+    pub(crate) fn redraw_window(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
     /// Window area (physical pixels) shared among the panes
-    fn window_area(&self) -> Option<Rect> {
+    pub(crate) fn window_area(&self) -> Option<Rect> {
         let size = self.window.as_ref()?.inner_size();
         Some(Rect::new(0, 0, size.width, size.height))
     }
 
     /// Minimum pane size with the current cell size and padding
-    fn pane_limits(&self) -> Option<Limits> {
+    pub(crate) fn pane_limits(&self) -> Option<Limits> {
         let renderer = self.renderer.as_ref()?;
         let (cell_width, cell_height) = renderer.cell_size();
         let padding = 2 * renderer.padding();
@@ -347,7 +338,7 @@ impl App {
 
     /// Directory where a new pane starts: that of pane `from` (via OSC 7 or, on macOS and
     /// Linux, by asking the OS) if `panes.inherit_cwd` allows it; otherwise `shell.cwd`
-    fn inherited_cwd(&self, from: PaneId) -> Option<PathBuf> {
+    pub(crate) fn inherited_cwd(&self, from: PaneId) -> Option<PathBuf> {
         if !self.config.panes.inherit_cwd {
             return None;
         }
@@ -359,7 +350,7 @@ impl App {
 
     /// Splits the focused pane (or the last tiled one, from a floating pane): one message to
     /// the server, which applies it, starts the block and reports both back
-    fn split(&mut self, axis: Axis) {
+    pub(crate) fn split(&mut self, axis: Axis) {
         let (Some(area), Some(limits), Some(renderer)) =
             (self.window_area(), self.pane_limits(), &self.renderer)
         else {
@@ -396,7 +387,7 @@ impl App {
 
     /// Opens a floating pane and focuses it. With `program` it runs that program instead of the
     /// shell (and the floating pane closes when it exits). `width`/`height` are window fractions.
-    fn new_float(
+    pub(crate) fn new_float(
         &mut self,
         program: Option<(String, Vec<String>)>,
         width: Option<f32>,
@@ -437,7 +428,7 @@ impl App {
     }
 
     /// Hides or shows the floating panes; if there are none, opens one
-    fn toggle_floats(&mut self) {
+    pub(crate) fn toggle_floats(&mut self) {
         if !self.layout.has_floats() {
             self.new_float(None, None, None, None, BTreeMap::new());
             return;
@@ -446,7 +437,7 @@ impl App {
     }
 
     /// Moves the focused floating pane `amount` cells toward `direction`
-    fn move_pane(&mut self, direction: Direction, amount: u16) {
+    pub(crate) fn move_pane(&mut self, direction: Direction, amount: u16) {
         let (Some(area), Some(renderer)) = (self.window_area(), &self.renderer) else {
             return;
         };
@@ -473,7 +464,7 @@ impl App {
         });
     }
 
-    fn focus_direction(&mut self, direction: Direction) {
+    pub(crate) fn focus_direction(&mut self, direction: Direction) {
         let Some(area) = self.window_area() else {
             return;
         };
@@ -483,12 +474,12 @@ impl App {
         });
     }
 
-    fn focus_cycle(&mut self, forward: bool) {
+    pub(crate) fn focus_cycle(&mut self, forward: bool) {
         self.conn.send_op(wire::WireOp::FocusCycle { forward });
     }
 
     /// Moves the focused pane's border `amount` cells toward `direction`
-    fn resize_pane(&mut self, direction: Direction, amount: u16) {
+    pub(crate) fn resize_pane(&mut self, direction: Direction, amount: u16) {
         let (Some(area), Some(limits), Some(renderer)) =
             (self.window_area(), self.pane_limits(), &self.renderer)
         else {
@@ -509,7 +500,7 @@ impl App {
     }
 
     /// Rectangles of the lines separating the tiled panes
-    fn divider_rects(&self) -> Vec<Rect> {
+    pub(crate) fn divider_rects(&self) -> Vec<Rect> {
         let (Some(area), Some(renderer)) = (self.window_area(), &self.renderer) else {
             return Vec::new();
         };
@@ -523,12 +514,16 @@ impl App {
 
     /// Closes a pane. If it was the last tiled one, the server kills everything and tells the
     /// window to quit.
-    fn close_pane(&mut self, id: PaneId) {
+    pub(crate) fn close_pane(&mut self, id: PaneId) {
         self.conn.send_op(wire::WireOp::Close { pane: id });
     }
 
     /// Rebuilds the projection from a server state event and syncs the panes with it
-    fn apply_state(&mut self, state: LayoutState, created: Option<wire::IpcCreatedPane>) {
+    pub(crate) fn apply_state(
+        &mut self,
+        state: LayoutState,
+        created: Option<wire::IpcCreatedPane>,
+    ) {
         self.layout = Layout::from_state(state);
         // Panes the server removed are gone: this window's panes do not hold blocks anymore (the
         // shells live in the server process), dropping them only frees the view
@@ -565,7 +560,7 @@ impl App {
         self.relayout_window();
     }
 
-    fn handle_key(&mut self, event_loop: &ActiveEventLoop, key_event: &KeyEvent) {
+    pub(crate) fn handle_key(&mut self, event_loop: &ActiveEventLoop, key_event: &KeyEvent) {
         if key_event.state != ElementState::Pressed {
             return;
         }
@@ -651,12 +646,12 @@ impl App {
     }
 
     /// Writes to the focused pane's shell input
-    fn write_to_pty(&mut self, bytes: &[u8]) {
+    pub(crate) fn write_to_pty(&mut self, bytes: &[u8]) {
         self.focused_mut().write(bytes);
     }
 
     /// Runs an action from a key, a hook (`ctx:perform`), or a Lua function
-    fn perform(&mut self, event_loop: &ActiveEventLoop, action: Action) {
+    pub(crate) fn perform(&mut self, event_loop: &ActiveEventLoop, action: Action) {
         match action {
             Action::SendString { text } => {
                 self.clear_selection();
@@ -728,7 +723,7 @@ impl App {
     }
 
     /// Runs what a Lua function requested, once its call has finished
-    fn run_commands(&mut self, event_loop: &ActiveEventLoop, commands: Vec<Command>) {
+    pub(crate) fn run_commands(&mut self, event_loop: &ActiveEventLoop, commands: Vec<Command>) {
         self.in_hook = true;
         for command in commands {
             match command {
@@ -741,7 +736,12 @@ impl App {
     }
 
     /// Calls an event's hook, if the configuration defines it
-    fn fire_event(&mut self, event_loop: &ActiveEventLoop, kind: EventKind, args: Vec<Value>) {
+    pub(crate) fn fire_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        kind: EventKind,
+        args: Vec<Value>,
+    ) {
         if self.in_hook || !self.script.has_handler(kind) {
             return;
         }
@@ -750,7 +750,7 @@ impl App {
     }
 
     /// Dispatches what happened inside the terminals during `vt_write`
-    fn dispatch_terminal_events(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn dispatch_terminal_events(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok((id, event)) = self.lua_events.try_recv() {
             match event {
                 LuaEvent::TitleChanged(title) => {
@@ -771,19 +771,19 @@ impl App {
     }
 
     /// Scrolls the focused pane's history
-    fn scroll(&mut self, scroll: ScrollViewport) {
+    pub(crate) fn scroll(&mut self, scroll: ScrollViewport) {
         let index = self.focused_index();
         self.scroll_pane(index, scroll);
     }
 
-    fn scroll_pane(&mut self, index: usize, scroll: ScrollViewport) {
+    pub(crate) fn scroll_pane(&mut self, index: usize, scroll: ScrollViewport) {
         self.panes[index].terminal.scroll_viewport(scroll);
         self.redraw_window();
     }
 
     /// Pastes the clipboard, using bracketed paste if the program enabled it. libghostty
     /// sanitizes control bytes in the pasted text.
-    fn paste(&mut self) {
+    pub(crate) fn paste(&mut self) {
         let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
             Ok(text) if !text.is_empty() => text,
             Ok(_) => return,
@@ -820,7 +820,7 @@ impl App {
     }
 
     /// Changes the font size relative to the configured one (in logical pixels)
-    fn set_font_delta(&mut self, delta: f32) {
+    pub(crate) fn set_font_delta(&mut self, delta: f32) {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
@@ -844,11 +844,11 @@ impl App {
 
     /// Rereads config.lua. If it has errors the previous configuration is kept and a warning is
     /// shown in the window title and on stderr.
-    fn reload_config(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) fn reload_config(&mut self, event_loop: &ActiveEventLoop) {
         let Some(path) = self.config_path.clone() else {
             return;
         };
-        let result = config::load_script_path(&path)
+        let result = crate::config::load_script_path(&path)
             .and_then(|(config, script)| self.apply_config(config, script));
         match result {
             Ok(()) => {
@@ -870,7 +870,7 @@ impl App {
 
     /// Applies a new configuration live: font, size, padding, colors, cursor, and title.
     /// Scrollback, initial window size, and shell are only read at startup.
-    fn apply_config(&mut self, new: Config, script: Script) -> Result<(), String> {
+    pub(crate) fn apply_config(&mut self, new: Config, script: Script) -> Result<(), String> {
         // The first thing that can fail (a font that does not exist) goes before changing anything
         let metrics_changed = match &mut self.renderer {
             Some(renderer) => {
@@ -889,7 +889,7 @@ impl App {
         if new.window.decorations != self.config.window.decorations
             && let Some(window) = &self.window
         {
-            let decorated = new.window.decorations == config::Decorations::Full;
+            let decorated = new.window.decorations == crate::config::Decorations::Full;
             window.set_decorations(decorated);
             #[cfg(windows)]
             window.set_undecorated_shadow(!decorated);
@@ -935,7 +935,7 @@ impl App {
 
     /// Feeds libghostty what a pane's shell wrote, answers its queries, notifies the
     /// Lua hooks, and requests a redraw
-    fn drain_pty(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
+    pub(crate) fn drain_pty(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
         let Some(index) = self.index_of(id) else {
             return;
         };
@@ -956,7 +956,7 @@ impl App {
         }
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
+    pub(crate) fn resize(&mut self, width: u32, height: u32) {
         // Minimizing the window reports 0×0: nothing to draw or reflow
         if width == 0 || height == 0 {
             return;
@@ -969,7 +969,7 @@ impl App {
     }
 
     /// Relayouts the panes with the current window size
-    fn relayout_window(&mut self) {
+    pub(crate) fn relayout_window(&mut self) {
         let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
             return;
         };
@@ -980,7 +980,7 @@ impl App {
 
     /// Divides `area` among the visible panes and, for each one whose column and row count
     /// changed, notifies its PTY and libghostty (which reflows the buffer)
-    fn relayout(&mut self, area: Rect) {
+    pub(crate) fn relayout(&mut self, area: Rect) {
         let Some(renderer) = &self.renderer else {
             return;
         };
@@ -1000,7 +1000,7 @@ impl App {
         self.redraw_window();
     }
 
-    fn render(&mut self) {
+    pub(crate) fn render(&mut self) {
         let focus = self.layout.focus();
         let window_focused = self.focused;
         // The views, bottom to top: the tiled layout, then the floating panes. Only when there
@@ -1046,7 +1046,7 @@ impl App {
     }
 
     /// A pane's program exited: drain its last output, fire the hook, and close or hold
-    fn shell_exited(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
+    pub(crate) fn shell_exited(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
         // A pane that was already closed by hand has nothing left to do
         let Some(index) = self.index_of(id) else {
             return;
@@ -1055,8 +1055,8 @@ impl App {
         self.drain_pty(event_loop, id);
         self.fire_event(event_loop, EventKind::ShellExit, Vec::new());
         match self.config.on_shell_exit {
-            config::ShellExit::Close => self.close_pane(id),
-            config::ShellExit::Hold => {
+            crate::config::ShellExit::Close => self.close_pane(id),
+            crate::config::ShellExit::Hold => {
                 self.panes[index]
                     .terminal
                     .vt_write(b"\r\n\x1b[2m[process exited]\x1b[0m\r\n");
@@ -1067,7 +1067,7 @@ impl App {
 
     /// The cursor becomes visible again and the blink cycle restarts: while typing or while
     /// output arrives it stays solid
-    fn reset_blink(&mut self) {
+    pub(crate) fn reset_blink(&mut self) {
         if self.blink.reset(Instant::now())
             && let Some(window) = &self.window
         {
@@ -1111,7 +1111,7 @@ impl ApplicationHandler<UserEvent> for App {
             // The kitty PNG decoder is a thread-local callback in libghostty: install it on the
             // window thread (where panes are fed) before any pane exists
             install_png_decoder();
-            let decorated = self.config.window.decorations == config::Decorations::Full;
+            let decorated = self.config.window.decorations == crate::config::Decorations::Full;
             let attrs = Window::default_attributes()
                 .with_title(self.window_title())
                 .with_decorations(decorated)
@@ -1267,10 +1267,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let mut bits = 0;
                 for (pressed, bit) in [
-                    (state.control_key(), actions::CTRL),
-                    (state.shift_key(), actions::SHIFT),
-                    (state.alt_key(), actions::ALT),
-                    (state.super_key(), actions::SUPER),
+                    (state.control_key(), crate::actions::CTRL),
+                    (state.shift_key(), crate::actions::SHIFT),
+                    (state.alt_key(), crate::actions::ALT),
+                    (state.super_key(), crate::actions::SUPER),
                 ] {
                     if pressed {
                         bits |= bit;
@@ -1325,60 +1325,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-fn main() {
-    // 0. The subcommands: `terminal server` runs the headless server process, `terminal
-    //    gateway` fronts it for remote clients over the tailnet, and the automation CLI
-    //    subcommands are short-lived clients of a running server (stage 6); the bare
-    //    binary is the window
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("server") => {
-            terminal_server::run_server_process();
-            unreachable!("the server process serves until it is killed");
-        }
-        Some("gateway") => {
-            // The allow-list lives in the configuration (empty denies everyone)
-            let loaded = config::load();
-            if let Some(error) = &loaded.error {
-                eprintln!("[config] {error}");
-            }
-            // Same endpoint resolution as the window: connect, or start the server detached
-            // and retry
-            let endpoint = IpcEndpoint::resolve();
-            ensure_server_running(&endpoint);
-            terminal_server::run_gateway_process(loaded.config.remote.allow, gateway_port(&args));
-            unreachable!("the gateway serves until it is killed");
-        }
-        Some("ls") => {
-            cli_ls();
-            return;
-        }
-        Some("send") => {
-            cli_send(&args[2..]);
-            return;
-        }
-        Some("capture") => {
-            cli_capture(&args[2..]);
-            return;
-        }
-        Some("attach") => {
-            cli_attach(&args[2..]);
-            return;
-        }
-        // Reachable for future subcommands only; today the binary is the window, the
-        // server, the gateway and the automation CLI
-        Some(other) => {
-            eprintln!(
-                "unknown subcommand {other:?}; usage: terminal [server|gateway|ls|send|capture|attach]"
-            );
-            std::process::exit(2);
-        }
-        None => {}
-    }
-
-    // 1. Load config.lua. If it fails, defaults are used and the error is written to the first
-    //    pane's grid once its terminal exists.
-    let loaded = config::load();
+/// Runs the window: the bare `terminal` invocation. Loads config.lua, connects to the server
+/// (starting it detached when none answers), attaches, and serves the winit event loop.
+pub fn run_window() {
+    let loaded = crate::config::load();
     if let Some(error) = &loaded.error {
         eprintln!("[config] {error}");
     }
@@ -1541,7 +1491,7 @@ fn parse_pane_id(arg: &str) -> u32 {
 }
 
 /// `terminal ls`: the live panes as a table, alphabetical (numeric) by pane
-fn cli_ls() {
+pub fn cli_ls() {
     let conn = cli_conn();
     let panes = conn.automation_list().unwrap_or_else(|error| {
         eprintln!("terminal ls: {error}");
@@ -1552,7 +1502,7 @@ fn cli_ls() {
 
 /// `terminal send <pane> <text...>`: writes the text to the pane's program, without a trailing
 /// newline (a shell keeps waiting for Enter unless the caller adds one, e.g. `$'echo hi\n'`)
-fn cli_send(args: &[String]) {
+pub fn cli_send(args: &[String]) {
     let (pane, text) = match args {
         [pane, rest @ ..] if !rest.is_empty() => (parse_pane_id(pane), rest.join(" ")),
         _ => {
@@ -1579,7 +1529,7 @@ fn cli_send(args: &[String]) {
 /// `terminal capture <pane> [--vt]`: the pane's screen to stdout — plain text by default, the
 /// raw VT snapshot with `--vt`. A dead pane is refused: its screen is still served server-side,
 /// but `capture` mirrors `send` in refusing work on panes whose program has exited.
-fn cli_capture(args: &[String]) {
+pub fn cli_capture(args: &[String]) {
     let mut pane = None;
     let mut vt = false;
     for arg in args {
@@ -1625,7 +1575,7 @@ fn cli_capture(args: &[String]) {
 /// to stdout. Exits on Ctrl-C or Ctrl-D (the exact escape: 0x03/0x04 arrive as plain bytes in
 /// raw mode), when the program exits, or when the server goes away. It never touches the
 /// window: no attach, no layout ops, no driver. The TTY is restored on every exit path.
-fn cli_attach(args: &[String]) {
+pub fn cli_attach(args: &[String]) {
     let [pane] = args else {
         eprintln!("usage: terminal attach <pane>");
         std::process::exit(2);
@@ -1950,41 +1900,4 @@ fn ls_table(panes: &[wire::AutomationPane]) -> String {
 }
 
 #[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    fn listing(pane: u32, alive: bool) -> wire::AutomationPane {
-        wire::AutomationPane {
-            pane: PaneId(pane),
-            block: BlockId(u64::from(pane)),
-            cols: 80,
-            rows: 24,
-            alive,
-        }
-    }
-
-    #[test]
-    fn the_cli_resolves_a_pane_to_its_block() {
-        let panes = vec![listing(0, true), listing(1, false)];
-        assert_eq!(
-            resolve_pane(&panes, 0).expect("the alive pane resolves"),
-            (PaneId(0), BlockId(0))
-        );
-        let error = resolve_pane(&panes, 1).expect_err("a dead pane is refused");
-        assert!(error.contains("exited"), "the error says why: {error}");
-        let error = resolve_pane(&panes, 7).expect_err("an unknown pane is refused");
-        assert!(error.contains("7"), "the error names the pane: {error}");
-    }
-
-    #[test]
-    fn the_ls_table_is_sorted_and_reports_state() {
-        let panes = vec![listing(3, true), listing(12, false), listing(0, true)];
-        let table = ls_table(&panes);
-        let lines: Vec<_> = table.lines().collect();
-        assert_eq!(lines[0], "pane  block  size  state");
-        assert_eq!(lines[1], "0     0      80x24  alive");
-        assert_eq!(lines[2], "3     3      80x24  alive");
-        assert_eq!(lines[3], "12    12     80x24  dead");
-        assert_eq!(lines.len(), 4, "no trailing rows");
-    }
-}
+mod tests;
