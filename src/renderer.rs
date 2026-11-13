@@ -1133,13 +1133,16 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     globals: wgpu::Buffer,
     rect_pipeline: wgpu::RenderPipeline,
-    rect_bind_group: wgpu::BindGroup,
+    /// The one group(0) bind group shared by the rect and image pipelines (both built from the
+    /// same layout object)
+    globals_bind_group: wgpu::BindGroup,
     rect_buffer: GrowBuffer,
     glyph_pipeline: wgpu::RenderPipeline,
     glyph_bind_group: wgpu::BindGroup,
     glyph_buffer: GrowBuffer,
     image_pipeline: wgpu::RenderPipeline,
-    image_bind_group_layout: wgpu::BindGroupLayout,
+    /// Layout every kitty image bind group is created from (the image pipeline's group(1))
+    image_texture_layout: wgpu::BindGroupLayout,
     image_sampler: wgpu::Sampler,
     image_buffer: GrowBuffer,
     /// GPU textures for kitty images, mirroring the ledger's keys exactly
@@ -1208,11 +1211,22 @@ impl Renderer {
         });
         let rect_attributes =
             wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4];
+        let globals_layout = create_globals_layout(&device);
+        let glyph_layout = create_glyph_layout(&device);
+        let image_texture_layout = create_image_texture_layout(&device);
+        let pipeline_layout = |label: &'static str, layouts: &[Option<&wgpu::BindGroupLayout>]| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: layouts,
+                immediate_size: 0,
+            })
+        };
         let rect_pipeline = create_pipeline(
             &device,
             &shader,
             config.format,
             ("vs_rect", "fs_rect"),
+            &pipeline_layout("rect", &[Some(&globals_layout)]),
             wgpu::VertexBufferLayout {
                 array_stride: size_of::<RectInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
@@ -1227,6 +1241,7 @@ impl Renderer {
             &shader,
             config.format,
             ("vs_glyph", "fs_glyph"),
+            &pipeline_layout("glyph", &[Some(&glyph_layout)]),
             wgpu::VertexBufferLayout {
                 array_stride: size_of::<GlyphInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
@@ -1241,13 +1256,16 @@ impl Renderer {
             &shader,
             config.format,
             ("vs_image", "fs_image"),
+            &pipeline_layout(
+                "image",
+                &[Some(&globals_layout), Some(&image_texture_layout)],
+            ),
             wgpu::VertexBufferLayout {
                 array_stride: size_of::<ImageInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &image_attributes,
             },
         );
-        let image_bind_group_layout = image_pipeline.get_bind_group_layout(1);
         let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("kitty image"),
             // Images render 1:1 on pixels: no filtering, pixel art stays pixelated
@@ -1258,10 +1276,11 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Layouts are inferred from the shader: the rectangle one only sees `globals`
-        let rect_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rectangles"),
-            layout: &rect_pipeline.get_bind_group_layout(0),
+        // One `globals` bind group for both the rect and the image pipelines: both were built
+        // from the same layout object, so it is compatible with either
+        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals"),
+            layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: globals.as_entire_binding(),
@@ -1270,7 +1289,7 @@ impl Renderer {
         let atlas = cache.atlas_view();
         let glyph_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("glyphs"),
-            layout: &glyph_pipeline.get_bind_group_layout(0),
+            layout: &glyph_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1305,11 +1324,11 @@ impl Renderer {
             config,
             globals,
             rect_pipeline,
-            rect_bind_group,
+            globals_bind_group,
             glyph_pipeline,
             glyph_bind_group,
             image_pipeline,
-            image_bind_group_layout,
+            image_texture_layout,
             image_sampler,
             cache,
         })
@@ -1452,7 +1471,7 @@ impl Renderer {
                     let cached = upload_image_texture(
                         &self.device,
                         &self.queue,
-                        &self.image_bind_group_layout,
+                        &self.image_texture_layout,
                         &self.image_sampler,
                         upload,
                     );
@@ -1466,7 +1485,7 @@ impl Renderer {
                     let cached = upload_image_texture(
                         &self.device,
                         &self.queue,
-                        &self.image_bind_group_layout,
+                        &self.image_texture_layout,
                         &self.image_sampler,
                         upload,
                     );
@@ -1689,7 +1708,7 @@ impl Renderer {
                 // 1. Cell backgrounds
                 if !batch.backgrounds.is_empty() {
                     pass.set_pipeline(&self.rect_pipeline);
-                    pass.set_bind_group(0, &self.rect_bind_group, &[]);
+                    pass.set_bind_group(0, &self.globals_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.rect_buffer.buffer.slice(..background_bytes));
                     pass.draw(0..4, batch.backgrounds.clone());
                 }
@@ -1697,7 +1716,7 @@ impl Renderer {
                 draw_image_range(
                     &mut pass,
                     &self.image_pipeline,
-                    &self.rect_bind_group,
+                    &self.globals_bind_group,
                     &self.image_buffer.buffer,
                     &self.textures,
                     &self.frame.image_keys,
@@ -1714,7 +1733,7 @@ impl Renderer {
                 // 4. Underlines, strikethroughs, and cursor on top of the text
                 if !batch.overlays.is_empty() {
                     pass.set_pipeline(&self.rect_pipeline);
-                    pass.set_bind_group(0, &self.rect_bind_group, &[]);
+                    pass.set_bind_group(0, &self.globals_bind_group, &[]);
                     pass.set_vertex_buffer(
                         0,
                         self.rect_buffer
@@ -1727,7 +1746,7 @@ impl Renderer {
                 draw_image_range(
                     &mut pass,
                     &self.image_pipeline,
-                    &self.rect_bind_group,
+                    &self.globals_bind_group,
                     &self.image_buffer.buffer,
                     &self.textures,
                     &self.frame.image_keys,
@@ -1758,11 +1777,16 @@ fn create_pipeline(
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     (vertex, fragment): (&str, &str),
+    layout: &wgpu::PipelineLayout,
     instance_layout: wgpu::VertexBufferLayout<'_>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(vertex),
-        layout: None,
+        // Explicit layouts: wgpu treats two separately-inferred-but-identical layouts as
+        // different objects, and a bind group created from one pipeline's layout cannot be set
+        // while another pipeline is bound (it panics in validation at draw time). Sharing ONE
+        // layout object across pipelines makes bind groups compatible everywhere they are used.
+        layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some(vertex),
@@ -1787,6 +1811,81 @@ fn create_pipeline(
         }),
         multiview_mask: None,
         cache: None,
+    })
+}
+
+/// The group(0) layout the rect and image pipelines share: the screen-size uniform. ONE layout
+/// object is created and both pipelines are built from it, so the one `globals` bind group is
+/// valid with either pipeline bound.
+fn create_globals_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("globals"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+/// The group(0) layout of the glyph pipeline: the uniform plus the atlas texture, which the
+/// fragment stage reads with `textureLoad` (no filtering, hence not filterable)
+fn create_glyph_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("glyph atlas"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The group(1) layout of the image pipeline: one kitty image texture and its nearest sampler,
+/// sampled in the fragment stage. Every image bind group is created from this same object.
+fn create_image_texture_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("image-texture"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
     })
 }
 
@@ -2297,6 +2396,195 @@ mod tests {
 
     /// The exact payload libghostty-vt's documentation uses: a 1x1 opaque red PNG
     const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    /// Headless GPU check (skips when no adapter): the bind groups the renderer creates must be
+    /// compatible with every pipeline that draws with them. This exact setup, with layouts left
+    /// to be inferred per pipeline, reproduced the production panic where the rect pipeline's
+    /// globals bind group was set while the image pipeline was bound.
+    #[test]
+    fn the_pipelines_bind_groups_stay_compatible_with_every_drawing_pipeline() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                ..Default::default()
+            }))
+        else {
+            eprintln!("skipped: no GPU adapter available headless");
+            return;
+        };
+        let (device, queue) =
+            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+                Ok(devices) => devices,
+                Err(error) => {
+                    eprintln!("skipped: no usable headless device: {error}");
+                    return;
+                }
+            };
+        let errors: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        {
+            let errors = errors.clone();
+            device.on_uncaptured_error(Arc::new(move |error| {
+                errors.lock().unwrap().push(error.to_string());
+            }));
+        }
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("terminal"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+        let globals_layout = create_globals_layout(&device);
+        let image_texture_layout = create_image_texture_layout(&device);
+        let pipeline_layout = |label: &'static str, layouts: &[Option<&wgpu::BindGroupLayout>]| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: layouts,
+                immediate_size: 0,
+            })
+        };
+        let rect_pipeline = create_pipeline(
+            &device,
+            &shader,
+            wgpu::TextureFormat::Rgba8Unorm,
+            ("vs_rect", "fs_rect"),
+            &pipeline_layout("rect", &[Some(&globals_layout)]),
+            wgpu::VertexBufferLayout {
+                array_stride: size_of::<RectInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![
+                    0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4
+                ],
+            },
+        );
+        let image_pipeline = create_pipeline(
+            &device,
+            &shader,
+            wgpu::TextureFormat::Rgba8Unorm,
+            ("vs_image", "fs_image"),
+            &pipeline_layout(
+                "image",
+                &[Some(&globals_layout), Some(&image_texture_layout)],
+            ),
+            wgpu::VertexBufferLayout {
+                array_stride: size_of::<ImageInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![
+                    0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2
+                ],
+            },
+        );
+        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: size_of::<[f32; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("image-texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image-texture"),
+            layout: &image_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        &device.create_sampler(&wgpu::SamplerDescriptor::default()),
+                    ),
+                },
+            ],
+        });
+        // The one shared globals bind group, as present() uses it
+        let rect_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals"),
+            layout: &globals_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals.as_entire_binding(),
+            }],
+        });
+
+        let target_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("target"),
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let target = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scratch"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        // Instance data (zeroed, 4 dummy instances each); the draws below are otherwise
+        // fully populated
+        let quad_data = [0u8; 4 * size_of::<ImageInstance>()];
+        let quad_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scratch instances"),
+            size: quad_data.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: true,
+        });
+        quad_buffer.unmap();
+
+        // Exactly the sequence present() runs when an image draws
+        pass.set_scissor_rect(0, 0, 8, 8);
+        pass.set_pipeline(&image_pipeline);
+        pass.set_vertex_buffer(0, quad_buffer.slice(..));
+        pass.set_bind_group(0, &rect_bind_group, &[]);
+        pass.set_bind_group(1, &texture_bind_group, &[]);
+        pass.draw(0..4, 0..1);
+        pass.set_pipeline(&rect_pipeline);
+        pass.set_bind_group(0, &rect_bind_group, &[]);
+        pass.set_vertex_buffer(0, quad_buffer.slice(..));
+        pass.draw(0..4, 0..1);
+        drop(pass);
+        queue.submit([encoder.finish()]);
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        assert!(
+            errors.lock().unwrap().is_empty(),
+            "validation errors: {:?}",
+            errors.lock().unwrap()
+        );
+    }
 
     #[test]
     fn a_transmitted_image_becomes_one_quad_above_the_text_and_its_texture_is_uploaded_once() {
