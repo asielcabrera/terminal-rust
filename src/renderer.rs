@@ -2588,6 +2588,9 @@ mod tests {
 
     #[test]
     fn a_transmitted_image_becomes_one_quad_above_the_text_and_its_texture_is_uploaded_once() {
+        let _decode_lock = crate::pane::PNG_DECODE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         crate::pane::install_png_decoder();
         let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
             cols: 10,
@@ -2764,6 +2767,9 @@ mod tests {
 
     #[test]
     fn a_unicode_placeholder_run_renders_per_cell_slices() {
+        let _decode_lock = crate::pane::PNG_DECODE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         use base64::Engine as _;
         crate::pane::install_png_decoder();
         let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
@@ -2865,6 +2871,9 @@ mod tests {
 
     #[test]
     fn a_virtual_placement_without_placeholder_cells_renders_nothing() {
+        let _decode_lock = crate::pane::PNG_DECODE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         use base64::Engine as _;
         crate::pane::install_png_decoder();
         let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
