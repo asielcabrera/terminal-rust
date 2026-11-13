@@ -2,6 +2,7 @@
 //! selection state. The app has one or more, arranged by `layout`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use libghostty_vt::kitty::graphics;
@@ -20,6 +21,11 @@ use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
 use crate::pane_io::PaneIo;
 
+/// How many PNG decodes have run process-wide. libghostty invokes the registered callback, so
+/// this counts every decode regardless of who triggered it: tests use it to prove that a stored
+/// image is decoded exactly once (at transmit) no matter how often the renderer queries it.
+pub(crate) static PNG_DECODES: AtomicU64 = AtomicU64::new(0);
+
 /// A PNG decoder for the kitty graphics protocol: it decodes into the 8-bit RGBA pixels
 /// libghostty expects, expanding palettes and grayscales and stripping 16-bit channels. The
 /// output buffer is reused across images so a burst of transmits does not reallocate every time.
@@ -34,6 +40,7 @@ impl graphics::DecodePng for PngDecoder {
         alloc: &'alloc libghostty_vt::alloc::Allocator<'_>,
         data: &[u8],
     ) -> Option<graphics::DecodedImage<'alloc>> {
+        PNG_DECODES.fetch_add(1, Ordering::Relaxed);
         match self.decode(alloc, data) {
             Ok(image) => Some(image),
             // The transport answers the transmit with a kitty error (when the program asked for
@@ -937,6 +944,74 @@ mod tests {
         assert!(
             placements.next().is_none(),
             "the oversized payload is dropped"
+        );
+    }
+
+    /// Decoding must happen exactly once per stored image: at transmit. The renderer queries
+    /// the image and its pixels every frame; if libghostty re-ran the decoder per query, a
+    /// multi-megapixel photo would freeze every frame (observed in the field as ~10 s previews
+    /// in debug builds). The count is read before/after to also catch decodes triggered by the
+    /// transmit itself and its placement queries.
+    #[test]
+    fn a_stored_image_decodes_exactly_once_regardless_of_how_often_it_is_queried() {
+        use base64::Engine as _;
+        install_png_decoder();
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        enable_graphics(&mut terminal, &Config::default());
+        terminal.resize(40, 24, 8, 16).unwrap();
+
+        let png = noise_png(512, 512);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let before = PNG_DECODES.load(Ordering::Relaxed);
+        terminal.vt_write(format!("\x1b_Ga=T,f=100,i=9,q=1;{b64}\x1b\\").as_bytes());
+
+        {
+            let graphics = terminal.kitty_graphics().unwrap();
+            let mut iter = graphics::PlacementIterator::new().unwrap();
+            // Simulate 30 render frames querying the placement, the image, and its pixels
+            for _ in 0..30 {
+                let mut placements = iter.update(&graphics).unwrap();
+                if let Some(placement) = placements.next() {
+                    let id = placement.image_id().unwrap();
+                    let image = graphics.image(id).unwrap();
+                    let _ = placement.pixel_size(&image, &terminal);
+                    assert_eq!(image.data().unwrap().len(), 512 * 512 * 4);
+                }
+            }
+            assert_eq!(
+                PNG_DECODES.load(Ordering::Relaxed) - before,
+                1,
+                "exactly one decode for the (id, generation), no matter how often it is queried"
+            );
+        }
+
+        // A retransmission of the same id (a new generation, possibly new pixels) costs exactly
+        // one more decode
+        terminal.vt_write(format!("\x1b_Ga=T,f=100,i=9,q=1;{b64}\x1b\\").as_bytes());
+        assert_eq!(
+            PNG_DECODES.load(Ordering::Relaxed) - before,
+            2,
+            "exactly one more decode for the new generation"
+        );
+        {
+            let graphics = terminal.kitty_graphics().unwrap();
+            let mut iter = graphics::PlacementIterator::new().unwrap();
+            for _ in 0..10 {
+                let mut placements = iter.update(&graphics).unwrap();
+                let placement = placements.next().unwrap();
+                let image = graphics.image(placement.image_id().unwrap()).unwrap();
+                let _ = image.data().unwrap();
+            }
+        }
+        assert_eq!(
+            PNG_DECODES.load(Ordering::Relaxed) - before,
+            2,
+            "queries still do not decode"
         );
     }
 
