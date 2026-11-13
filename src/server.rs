@@ -16,7 +16,7 @@
 //! The server-side terminal never answers the program's queries: the client's terminal does,
 //! through [`PaneIo::write`], exactly as with a local PTY.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -100,6 +100,8 @@ pub(crate) struct SplitOp {
 pub(crate) struct AddFloatOp {
     pub shell: ShellConfig,
     pub explicit: bool,
+    /// Entries merged over the shell's environment (the action's win over the global shell.env)
+    pub env: BTreeMap<String, String>,
     pub width: f32,
     pub height: f32,
     pub cols: u16,
@@ -1175,6 +1177,7 @@ pub(crate) mod wire {
         AddFloat {
             shell: WireShell,
             explicit: bool,
+            env: BTreeMap<String, String>,
             width: f32,
             height: f32,
             cols: u16,
@@ -1311,6 +1314,7 @@ pub(crate) mod wire {
                 Request::LayoutAddFloat(op) => Self::AddFloat {
                     shell: WireShell::from_config(&op.shell),
                     explicit: op.explicit,
+                    env: op.env.clone(),
                     width: op.width,
                     height: op.height,
                     cols: op.cols,
@@ -1419,20 +1423,27 @@ pub(crate) mod wire {
                 Self::AddFloat {
                     shell,
                     explicit,
+                    env,
                     width,
                     height,
                     cols,
                     rows,
                     scrollback,
-                } => Request::LayoutAddFloat(AddFloatOp {
-                    shell: shell.into_config(),
-                    explicit,
-                    width,
-                    height,
-                    cols,
-                    rows,
-                    scrollback,
-                }),
+                } => {
+                    let mut shell = shell.into_config();
+                    // The action's entries win over the global shell.env
+                    shell.env.extend(env);
+                    Request::LayoutAddFloat(AddFloatOp {
+                        shell,
+                        explicit,
+                        env: BTreeMap::new(),
+                        width,
+                        height,
+                        cols,
+                        rows,
+                        scrollback,
+                    })
+                }
                 Self::ToggleFloats => Request::LayoutToggleFloats,
                 Self::MoveFloat {
                     pane,
@@ -5444,6 +5455,11 @@ mod tests {
             WireOp::AddFloat {
                 shell: WireShell::from_config(&full_shell()),
                 explicit: false,
+                env: [(
+                    "ASPNETCORE_ENVIRONMENT".to_string(),
+                    "Development".to_string(),
+                )]
+                .into(),
                 width: 0.5,
                 height: 0.25,
                 cols: 60,
@@ -5539,6 +5555,40 @@ mod tests {
             WireOp::from_request(&Request::Shutdown).is_none(),
             "shutdown stays in the process"
         );
+
+        // The float's env entries land in the spawned shell, over the global shell.env
+        let request = WireOp::AddFloat {
+            shell: WireShell::from_config(&ShellConfig {
+                env: BTreeMap::from([("GLOBAL".to_string(), "one".to_string())]),
+                ..full_shell()
+            }),
+            explicit: false,
+            env: BTreeMap::from([
+                (
+                    "ASPNETCORE_ENVIRONMENT".to_string(),
+                    "Development".to_string(),
+                ),
+                ("GLOBAL".to_string(), "two".to_string()),
+            ]),
+            width: 0.5,
+            height: 0.25,
+            cols: 60,
+            rows: 10,
+            scrollback: 0,
+        }
+        .into_request()
+        .expect("a float add travels");
+        let Request::LayoutAddFloat(op) = request else {
+            panic!("{request:?}")
+        };
+        assert_eq!(
+            op.shell
+                .env
+                .get("ASPNETCORE_ENVIRONMENT")
+                .map(String::as_str),
+            Some("Development")
+        );
+        assert_eq!(op.shell.env.get("GLOBAL").map(String::as_str), Some("two"));
 
         // Every op that travels survives JSON wrapped in the versioned envelope
         for op in wire_ops() {

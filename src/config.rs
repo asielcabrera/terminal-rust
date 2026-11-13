@@ -1145,6 +1145,7 @@ mod tests {
               { key = "x", mods = "LEADER", action = "Quit" },
               { key = "v", mods = "LEADER", action = terminal.action.SplitRight },
               { key = "g", mods = "LEADER|CTRL", action = terminal.action.NewFloat({ program = "lazygit", args = { "--version" }, width = 0.9 }) },
+              { key = "d", mods = "LEADER", action = terminal.action.NewFloat({ program = "dotnet", args = { "run" }, env = { ASPNETCORE_ENVIRONMENT = "Development" } }) },
             } }"#,
         )
         .unwrap();
@@ -1167,11 +1168,24 @@ mod tests {
                 width,
                 height,
                 cwd,
+                env,
             }) => {
                 assert_eq!(program.as_deref(), Some("lazygit"));
                 assert_eq!(args, vec!["--version"]);
                 assert_eq!(width, Some(0.9));
                 assert_eq!((height, cwd), (None, None));
+                assert!(env.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        step(&script, &mut state, &char_key("b"), actions::CTRL);
+        match step(&script, &mut state, &char_key("d"), 0) {
+            LeaderOutcome::Run(Action::NewFloat { program, env, .. }) => {
+                assert_eq!(program.as_deref(), Some("dotnet"));
+                assert_eq!(
+                    env.get("ASPNETCORE_ENVIRONMENT").map(String::as_str),
+                    Some("Development")
+                );
             }
             other => panic!("{other:?}"),
         }

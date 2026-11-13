@@ -5,7 +5,7 @@
 //! [`Command`] and `App` executes it once the function returns.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -102,7 +102,8 @@ pub enum Action {
     /// Opens a floating pane with its own shell, or with `program`, that closes when it exits
     /// (like a popup). `width` and `height` are fractions of the window (by default,
     /// `panes.float_width` and `panes.float_height`); `cwd` defaults to the focused pane's
-    /// directory if the shell reports it.
+    /// directory if the shell reports it. `env` entries are merged over the shell's
+    /// environment (this action's entries win over the global `shell.env`).
     NewFloat {
         #[serde(default)]
         program: Option<String>,
@@ -114,6 +115,8 @@ pub enum Action {
         height: Option<f32>,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
     },
     /// Hides or shows all floating panes without closing their shells; if there are none, opens one
     ToggleFloats,
@@ -321,6 +324,7 @@ impl Bindings {
                 width: None,
                 height: None,
                 cwd: None,
+                env: BTreeMap::new(),
             },
         );
         for (key, dir) in [

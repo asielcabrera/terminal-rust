@@ -28,6 +28,7 @@ use server::{
     AttachAnswer, BlockId, ControlDown, IpcConn, IpcEndpoint, OpSender, wire,
     wire::{WireEventKind, WireShell},
 };
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -403,6 +404,7 @@ impl App {
         width: Option<f32>,
         height: Option<f32>,
         cwd: Option<String>,
+        env: BTreeMap<String, String>,
     ) {
         let (Some(area), Some(renderer)) = (self.window_area(), &self.renderer) else {
             return;
@@ -427,6 +429,7 @@ impl App {
         self.conn.send_op(wire::WireOp::AddFloat {
             shell: WireShell::from_config(&with_integration(shell)),
             explicit,
+            env,
             width,
             height,
             cols,
@@ -438,7 +441,7 @@ impl App {
     /// Hides or shows the floating panes; if there are none, opens one
     fn toggle_floats(&mut self) {
         if !self.layout.has_floats() {
-            self.new_float(None, None, None, None);
+            self.new_float(None, None, None, None, BTreeMap::new());
             return;
         }
         self.conn.send_op(wire::WireOp::ToggleFloats);
@@ -703,7 +706,14 @@ impl App {
                 width,
                 height,
                 cwd,
-            } => self.new_float(program.map(|program| (program, args)), width, height, cwd),
+                env,
+            } => self.new_float(
+                program.map(|program| (program, args)),
+                width,
+                height,
+                cwd,
+                env,
+            ),
             Action::ToggleFloats => self.toggle_floats(),
             Action::MovePane { dir, amount } => self.move_pane(dir, amount),
             Action::Quit => {
