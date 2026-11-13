@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use libghostty_vt::kitty::graphics;
 use libghostty_vt::mouse;
 use libghostty_vt::selection::gesture::Gesture;
 use libghostty_vt::style::{Palette, PaletteIndex, RgbColor};
@@ -18,6 +19,60 @@ use crate::LuaEvent;
 use crate::config::{self, Config, ShellConfig};
 use crate::layout::{PaneId, Rect};
 use crate::pane_io::PaneIo;
+
+/// A PNG decoder for the kitty graphics protocol: it decodes into the 8-bit RGBA pixels
+/// libghostty expects, expanding palettes and grayscales and stripping 16-bit channels. The
+/// output buffer is reused across images so a burst of transmits does not reallocate every time.
+#[derive(Default)]
+struct PngDecoder {
+    buf: Vec<u8>,
+}
+
+impl graphics::DecodePng for PngDecoder {
+    fn decode_png<'alloc>(
+        &mut self,
+        alloc: &'alloc libghostty_vt::alloc::Allocator<'_>,
+        data: &[u8],
+    ) -> Option<graphics::DecodedImage<'alloc>> {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+        decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
+
+        let mut frame = decoder.read_info().ok()?;
+        let size = frame.output_buffer_size()?;
+        // png checks the buffer by LENGTH, not capacity: resize it to the frame's size
+        if size > self.buf.capacity() {
+            self.buf.reserve(size - self.buf.capacity());
+        }
+        self.buf.resize(size, 0);
+
+        let info = frame.next_frame(&mut self.buf).ok()?;
+        let mut bytes =
+            libghostty_vt::alloc::Bytes::new_with_alloc(alloc, info.buffer_size()).ok()?;
+        bytes.copy_from_slice(&self.buf[..info.buffer_size()]);
+        frame.finish().ok()?;
+
+        Some(graphics::DecodedImage {
+            width: info.width,
+            height: info.height,
+            data: bytes,
+        })
+    }
+}
+
+/// Registers the PNG decoder the kitty graphics protocol needs to accept PNG data. It is a
+/// thread-local callback inside libghostty: call it on the window thread, before its panes are
+/// created and fed.
+pub fn install_png_decoder() {
+    if let Err(error) = graphics::set_png_decoder(Some(Box::<PngDecoder>::default())) {
+        eprintln!("[terminal] kitty PNG decoding unavailable: {error}");
+    }
+}
+
+/// Enables image storage on the terminal: without a non-zero cap the kitty graphics protocol is
+/// off and `ESC _G` sequences are ignored. A cap of 0 (configurable) also disables it.
+pub(crate) fn enable_graphics(terminal: &mut Terminal<'static, 'static>, config: &Config) {
+    let _ = terminal.set_kitty_image_storage_limit(config.graphics.storage_limit);
+}
 
 /// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
 /// events (redraw, close) interleave instead of waiting until the end.
@@ -288,6 +343,7 @@ impl Pane {
         })
         .map_err(vt_error)?;
         apply_theme(&mut terminal, config);
+        enable_graphics(&mut terminal, config);
         if let Some((tag, message)) = notice {
             write_notice(&mut terminal, tag, message);
         }
@@ -406,6 +462,7 @@ impl Drop for Pane {
 mod tests {
     use super::*;
     use libghostty_vt::RenderState;
+    use libghostty_vt::kitty::graphics::DecodePng as _;
 
     type Rgb = (u8, u8, u8);
 
@@ -691,6 +748,119 @@ mod tests {
                 entry(&mut state, &terminal, 17)
             ),
             factory
+        );
+    }
+
+    /// A 1x1 red opaque PNG, base64: the exact payload libghostty-vt's own documentation uses
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    /// The kitty APC transmit-and-display payload for a tiny PNG:
+    /// `ESC _G a=T,f=100,q=1;<base64 PNG data> ESC \`
+    fn kitty_apc(png_base64: &str) -> String {
+        format!("\x1b_Ga=T,f=100,q=1;{png_base64}\x1b\\")
+    }
+
+    #[test]
+    fn a_kitty_apc_image_is_decoded_and_stored_when_graphics_are_enabled() {
+        install_png_decoder();
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 10,
+            rows: 3,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        enable_graphics(&mut terminal, &Config::default());
+        terminal.resize(10, 3, 8, 16).unwrap();
+        terminal.vt_write(kitty_apc(RED_PNG_B64).as_bytes());
+
+        let graphics = terminal.kitty_graphics().unwrap();
+        let mut iter = graphics::PlacementIterator::new().unwrap();
+        let mut placements = iter.update(&graphics).unwrap();
+        let mut seen = 0;
+        while let Some(placement) = placements.next() {
+            seen += 1;
+            let id = placement.image_id().unwrap();
+            let image = graphics
+                .image(id)
+                .unwrap_or_else(|| panic!("image {id} missing"));
+            assert_eq!(image.width().unwrap(), 1);
+            assert_eq!(image.height().unwrap(), 1);
+            assert_eq!(image.format().unwrap(), graphics::ImageFormat::Rgba);
+            assert_eq!(image.data().unwrap(), [255, 0, 0, 255]);
+            assert!(placement.pixel_size(&image, &terminal).unwrap().width > 0);
+        }
+        assert_eq!(seen, 1, "the transmitted image is displayed once");
+    }
+
+    #[test]
+    fn the_kitty_storage_limit_comes_from_the_config() {
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 10,
+            rows: 3,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        enable_graphics(&mut terminal, &Config::default());
+        assert_eq!(
+            terminal.kitty_image_storage_limit().unwrap(),
+            512 * 1024 * 1024
+        );
+
+        let configured = config_from("return { graphics = { storage_limit = 4096 } }");
+        enable_graphics(&mut terminal, &configured);
+        assert_eq!(terminal.kitty_image_storage_limit().unwrap(), 4096);
+    }
+
+    #[test]
+    fn a_zero_storage_limit_turns_the_protocol_off_and_stores_nothing() {
+        // libghostty's factory default cap is 10 MiB, so images work without configuration; the
+        // `0` the configuration accepts is the documented way of turning the protocol off
+        install_png_decoder();
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 10,
+            rows: 3,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let disabled = config_from("return { graphics = { storage_limit = 0 } }");
+        enable_graphics(&mut terminal, &disabled);
+        assert_eq!(terminal.kitty_image_storage_limit().unwrap(), 0);
+        terminal.resize(10, 3, 8, 16).unwrap();
+        terminal.vt_write(kitty_apc(RED_PNG_B64).as_bytes());
+
+        let graphics = terminal.kitty_graphics().unwrap();
+        // The transmit still stamps the storage (the disabling itself counts as a mutation), but
+        // nothing is kept and nothing is drawn
+        let mut iter = graphics::PlacementIterator::new().unwrap();
+        let mut placements = iter.update(&graphics).unwrap();
+        assert!(placements.next().is_none(), "no placement rendered");
+        assert!(graphics.image(1).is_none(), "the image is not stored");
+    }
+
+    #[test]
+    fn the_png_decoder_produces_rgba8_pixels_and_rejects_other_data() {
+        // Hand-encode a 1x2 opaque gradient PNG with the same crate the decoder uses
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 1, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[10, 20, 30, 40, 200, 150, 100, 50])
+                .unwrap();
+        }
+        let alloc = libghostty_vt::alloc::Allocator::GLOBAL;
+        let decoded = PngDecoder::default().decode_png(&alloc, &encoded).unwrap();
+        assert_eq!(decoded.width, 1);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(&decoded.data[..], &[10, 20, 30, 40, 200, 150, 100, 50]);
+
+        assert!(
+            PngDecoder::default()
+                .decode_png(&alloc, b"not a png")
+                .is_none(),
+            "invalid data is rejected (kitty answers the transmit with an error)"
         );
     }
 }

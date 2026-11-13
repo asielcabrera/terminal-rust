@@ -17,6 +17,7 @@ fontdb = "0.24.0"
 fontdue = "0.9.5"
 libghostty-vt = "0.2.2"
 mlua = { version = "0.12.2", features = ["lua54", "vendored", "serialize"] }
+png = "0.18.1"
 pollster = "1.0.1"
 portable-pty = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }

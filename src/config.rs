@@ -66,6 +66,8 @@ pub struct Config {
     pub disable_default_keys: bool,
     /// Remote access over the tailnet (`terminal gateway`)
     pub remote: RemoteConfig,
+    /// Kitty graphics protocol (images the shell draws with `ESC _G`)
+    pub graphics: GraphicsConfig,
 }
 
 impl Default for Config {
@@ -83,6 +85,30 @@ impl Default for Config {
             on_shell_exit: ShellExit::Close,
             disable_default_keys: false,
             remote: RemoteConfig::default(),
+            graphics: GraphicsConfig::default(),
+        }
+    }
+}
+
+/// Kitty graphics protocol: images a program transmits and displays inline (kitty's `ESC _G`
+/// sequence) when its PNG renderings are enabled.
+///
+/// Images are session-only: they live in the pane's terminal, they scroll with its content, and
+/// they are GONE when the window re-attaches — a snapshot is VT text and cannot carry them.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GraphicsConfig {
+    /// Total size, in bytes, of decoded images the protocol may store per pane (all of the
+    /// screens: primary and alternate). When the cap is reached the oldest images are evicted
+    /// (libghostty's policy). The default is 512 MiB; set it lower to bound the memory a
+    /// runaway could spend on images, or to 0 to turn the protocol off. Startup only.
+    pub storage_limit: u64,
+}
+
+impl Default for GraphicsConfig {
+    fn default() -> Self {
+        Self {
+            storage_limit: 512 * 1024 * 1024,
         }
     }
 }
@@ -1846,5 +1872,21 @@ mod tests {
 
         let error = parse_str("return { remote = { allow = 4 } }").unwrap_err();
         assert!(error.contains("remote"), "{error}");
+    }
+
+    #[test]
+    fn the_kitty_storage_limit_defaults_to_512_mebibytes_and_is_read_from_the_config() {
+        let defaults = Config::default();
+        assert_eq!(defaults.graphics.storage_limit, 512 * 1024 * 1024);
+
+        let config = parse_str("return { graphics = { storage_limit = 1048576 } }").unwrap();
+        assert_eq!(config.graphics.storage_limit, 1_048_576);
+        // 0 turns the protocol off
+        assert!(parse_str("return { graphics = { storage_limit = 0 } }").is_ok());
+
+        let error = parse_str(r#"return { graphics = { storage_limit = "big" } }"#).unwrap_err();
+        assert!(error.contains("graphics"), "{error}");
+        let error = parse_str("return { gruaphics = {} }").unwrap_err();
+        assert!(error.contains("gruaphics"), "{error}");
     }
 }
