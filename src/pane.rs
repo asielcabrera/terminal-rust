@@ -34,24 +34,50 @@ impl graphics::DecodePng for PngDecoder {
         alloc: &'alloc libghostty_vt::alloc::Allocator<'_>,
         data: &[u8],
     ) -> Option<graphics::DecodedImage<'alloc>> {
+        match self.decode(alloc, data) {
+            Ok(image) => Some(image),
+            // The transport answers the transmit with a kitty error (when the program asked for
+            // one), but it gives no cause on our side: log it so broken images are diagnosable
+            Err(error) => {
+                eprintln!("[terminal] kitty PNG decode failed: {error}");
+                None
+            }
+        }
+    }
+}
+
+impl PngDecoder {
+    fn decode<'alloc>(
+        &mut self,
+        alloc: &'alloc libghostty_vt::alloc::Allocator<'_>,
+        data: &[u8],
+    ) -> Result<graphics::DecodedImage<'alloc>, String> {
         let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
         decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
 
-        let mut frame = decoder.read_info().ok()?;
-        let size = frame.output_buffer_size()?;
+        let mut frame = decoder
+            .read_info()
+            .map_err(|error| format!("reading PNG header: {error}"))?;
+        let size = frame
+            .output_buffer_size()
+            .ok_or("PNG buffer size unknown".to_string())?;
         // png checks the buffer by LENGTH, not capacity: resize it to the frame's size
         if size > self.buf.capacity() {
             self.buf.reserve(size - self.buf.capacity());
         }
         self.buf.resize(size, 0);
 
-        let info = frame.next_frame(&mut self.buf).ok()?;
-        let mut bytes =
-            libghostty_vt::alloc::Bytes::new_with_alloc(alloc, info.buffer_size()).ok()?;
+        let info = frame
+            .next_frame(&mut self.buf)
+            .map_err(|error| format!("decoding PNG pixels: {error}"))?;
+        let mut bytes = libghostty_vt::alloc::Bytes::new_with_alloc(alloc, info.buffer_size())
+            .map_err(|error| format!("allocating a kitty image buffer: {error}"))?;
         bytes.copy_from_slice(&self.buf[..info.buffer_size()]);
-        frame.finish().ok()?;
+        frame
+            .finish()
+            .map_err(|error| format!("finishing PNG decode: {error}"))?;
 
-        Some(graphics::DecodedImage {
+        Ok(graphics::DecodedImage {
             width: info.width,
             height: info.height,
             data: bytes,
@@ -69,9 +95,13 @@ pub fn install_png_decoder() {
 }
 
 /// Enables image storage on the terminal: without a non-zero cap the kitty graphics protocol is
-/// off and `ESC _G` sequences are ignored. A cap of 0 (configurable) also disables it.
+/// off and `ESC _G` sequences are ignored. A cap of 0 (configurable) also disables it. Also ties
+/// the APC parser's per-payload byte cap to the same limit: the factory default is 65 MiB, which
+/// silently drops legitimate photo transmits on configurations with a lower cap, and ours keeps
+/// the buffering worst case bounded by the storage limit the user already accepted.
 pub(crate) fn enable_graphics(terminal: &mut Terminal<'static, 'static>, config: &Config) {
     let _ = terminal.set_kitty_image_storage_limit(config.graphics.storage_limit);
+    let _ = terminal.set_apc_max_bytes_kitty(Some(config.graphics.storage_limit as usize));
 }
 
 /// Shell chunks processed per wakeup. With heavy output (`cat` of a large file) this lets window
@@ -835,6 +865,125 @@ mod tests {
         let mut placements = iter.update(&graphics).unwrap();
         assert!(placements.next().is_none(), "no placement rendered");
         assert!(graphics.image(1).is_none(), "the image is not stored");
+    }
+
+    #[test]
+    fn a_large_photo_png_transmits_decodes_and_places() {
+        use base64::Engine as _;
+        install_png_decoder();
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        enable_graphics(&mut terminal, &Config::default());
+        terminal.resize(40, 24, 8, 16).unwrap();
+
+        // 800x800 RGBA noise: a worst-case >1 MB photo-like PNG (2.5 MB, base64 3.3 MB)
+        let png = noise_png(800, 800);
+        assert!(
+            png.len() > 1024 * 1024,
+            "a large photo, {} bytes",
+            png.len()
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        terminal.vt_write(format!("\x1b_Ga=T,f=100,q=1;{b64}\x1b\\").as_bytes());
+
+        // It is stored whole, decoded to RGBA, and placed at its natural size: the transmit is
+        // not silently dropped by the APC parser and the decoder handles it
+        let graphics = terminal.kitty_graphics().unwrap();
+        let mut iter = graphics::PlacementIterator::new().unwrap();
+        let mut placements = iter.update(&graphics).unwrap();
+        let placement = placements.next().expect("the image is placed");
+        assert!(!placement.is_virtual().unwrap());
+        let image = graphics.image(placement.image_id().unwrap()).unwrap();
+        assert_eq!(
+            (image.width().unwrap(), image.height().unwrap()),
+            (800, 800)
+        );
+        assert_eq!(image.data().unwrap().len(), 800 * 800 * 4, "fully decoded");
+        assert_eq!(placement.pixel_size(&image, &terminal).unwrap().width, 800);
+        assert!(placements.next().is_none(), "one placement");
+    }
+
+    #[test]
+    fn a_payload_larger_than_the_storage_limit_is_dropped_at_the_apc_parser() {
+        use base64::Engine as _;
+        install_png_decoder();
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        // 975x975 RGBA noise: decoded 3.8 MB (fits the 4 MB limit), base64 ~5.2 MB (over the
+        // APC cap the limit implies)
+        let configured = config_from("return { graphics = { storage_limit = 4000000 } }");
+        enable_graphics(&mut terminal, &configured);
+        terminal.resize(40, 24, 8, 16).unwrap();
+        let png = noise_png(975, 975);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        assert!(
+            b64.len() > 4_000_000,
+            "the payload exceeds the cap: {} bytes",
+            b64.len()
+        );
+        terminal.vt_write(format!("\x1b_Ga=T,f=100,q=1;{b64}\x1b\\").as_bytes());
+
+        let graphics = terminal.kitty_graphics().unwrap();
+        let mut iter = graphics::PlacementIterator::new().unwrap();
+        let mut placements = iter.update(&graphics).unwrap();
+        assert!(
+            placements.next().is_none(),
+            "the oversized payload is dropped"
+        );
+    }
+
+    #[test]
+    fn a_small_image_still_stores_under_a_tight_apc_cap() {
+        install_png_decoder();
+        let mut terminal: Terminal<'static, 'static> = Terminal::new(TerminalOptions {
+            cols: 10,
+            rows: 3,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let configured = config_from("return { graphics = { storage_limit = 4096 } }");
+        enable_graphics(&mut terminal, &configured);
+        terminal.resize(10, 3, 8, 16).unwrap();
+        terminal.vt_write(kitty_apc(RED_PNG_B64).as_bytes());
+
+        let graphics = terminal.kitty_graphics().unwrap();
+        let mut iter = graphics::PlacementIterator::new().unwrap();
+        let mut placements = iter.update(&graphics).unwrap();
+        assert!(
+            placements.next().is_some(),
+            "small losses nothing to the cap"
+        );
+    }
+
+    /// Encodes a `width` x `height` RGBA PNG full of pseudo-random pixels (deflate cannot
+    /// compress it, so its size is a worst case for both the parser and the decoder)
+    fn noise_png(width: u32, height: u32) -> Vec<u8> {
+        let mut words = vec![0u32; (width as usize) * (height as usize)];
+        let mut state = 0x12345678u64;
+        for word in &mut words {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *word = state as u32;
+        }
+        let pixels: Vec<u8> = words.iter().copied().flat_map(u32::to_le_bytes).collect();
+        let mut encoded = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut encoded, width, height);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        encoded
     }
 
     #[test]
