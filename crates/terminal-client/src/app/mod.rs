@@ -24,7 +24,6 @@ use std::time::{Duration, Instant, SystemTime};
 use terminal_protocol::ipc::{AttachAnswer, BlockId, ControlDown, IpcConn, IpcEndpoint, OpSender};
 use terminal_protocol::layout;
 use terminal_protocol::wire;
-#[cfg(unix)]
 use terminal_protocol::wire::{WireEventKind, WireShell};
 
 #[cfg(windows)]
