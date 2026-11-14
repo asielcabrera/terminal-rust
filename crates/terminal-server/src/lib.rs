@@ -44,13 +44,13 @@ pub use terminal_protocol::ipc::DEFAULT_GATEWAY_PORT;
 #[cfg(windows)]
 use terminal_protocol::ipc::windows_pipe;
 
+#[cfg(test)]
+use terminal_protocol::ipc::IpcConn;
 use terminal_protocol::ipc::{
     AddFloatOp, AttachOutcome, AttachedPaneInfo, BlockId, Client, ConnWrite, Created, CreatedPane,
     IpcEndpoint, IpcListener, IpcStream, LayoutEvent, Request, ServerBlock, SplitOp, WireFrame,
     control_frame, data_frame, read_typed_frame,
 };
-#[cfg(test)]
-use terminal_protocol::ipc::IpcConn;
 #[cfg(all(test, not(windows)))]
 use terminal_protocol::ipc::{AttachAnswer, ControlDown, IpcBlock};
 use terminal_protocol::ipc::{FRAME_CONTROL, FRAME_DATA, FRAME_SNAPSHOT};
