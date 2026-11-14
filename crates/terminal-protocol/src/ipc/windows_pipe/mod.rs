@@ -204,7 +204,7 @@ impl Write for PipeWriter {
     }
 }
 
-pub(crate) struct PipeListener {
+pub struct PipeListener {
     name: String,
 }
 

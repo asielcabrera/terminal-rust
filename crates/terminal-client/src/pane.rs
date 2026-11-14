@@ -945,6 +945,8 @@ mod tests {
 
         let png = noise_png(512, 512);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Held for the whole test: no parallel image-transmit test may skew the counters
+        let _count_lock = PNG_DECODE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let before = PNG_DECODES.load(Ordering::Relaxed);
         terminal.vt_write(format!("\x1b_Ga=T,f=100,i=9,q=1;{b64}\x1b\\").as_bytes());
 
