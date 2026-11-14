@@ -50,7 +50,9 @@ use terminal_protocol::ipc::{
     control_frame, data_frame, read_typed_frame,
 };
 #[cfg(test)]
-use terminal_protocol::ipc::{AttachAnswer, ControlDown, IpcBlock, IpcConn};
+use terminal_protocol::ipc::IpcConn;
+#[cfg(all(test, not(windows)))]
+use terminal_protocol::ipc::{AttachAnswer, ControlDown, IpcBlock};
 use terminal_protocol::ipc::{FRAME_CONTROL, FRAME_DATA, FRAME_SNAPSHOT};
 use terminal_protocol::wire::ws;
 use terminal_protocol::wire::{
