@@ -1,0 +1,32 @@
+[package]
+name = "terminal-client"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal window: winit event loop, wgpu renderer, panes and the automation CLI"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+terminal-protocol = { path = "../terminal-protocol" }
+arboard = { version = "3.7.0", default-features = false }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+fontdb = "0.24.0"
+fontdue = "0.9.5"
+libghostty-vt = "0.2.2"
+mlua = { version = "0.12.2", features = ["lua54", "vendored", "serialize"] }
+png = "0.18.1"
+pollster = "1.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_path_to_error = "0.1.20"
+ttf-parser = "0.25"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
+[dev-dependencies]
+base64 = "0.22"

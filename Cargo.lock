@@ -2104,7 +2104,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "terminal"
+name = "terminal-app"
+version = "0.1.0"
+dependencies = [
+ "terminal-client",
+ "terminal-protocol",
+ "terminal-server",
+ "winresource",
+]
+
+[[package]]
+name = "terminal-client"
 version = "0.1.0"
 dependencies = [
  "arboard",
@@ -2120,15 +2130,35 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "png",
  "pollster",
- "portable-pty",
  "serde",
- "serde_json",
  "serde_path_to_error",
- "sha1_smol",
+ "terminal-protocol",
  "ttf-parser",
  "wgpu",
  "winit",
- "winresource",
+]
+
+[[package]]
+name = "terminal-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "libghostty-vt",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sha1_smol",
+]
+
+[[package]]
+name = "terminal-server"
+version = "0.1.0"
+dependencies = [
+ "libghostty-vt",
+ "serde",
+ "serde_json",
+ "terminal-protocol",
 ]
 
 [[package]]

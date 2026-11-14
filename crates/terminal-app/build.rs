@@ -1,13 +1,13 @@
 //! Embeds the application icon (drawn in `src/icon.rs`) in the Windows executable, so Explorer,
 //! shortcuts and the taskbar show it. Other systems need nothing at build time.
 
-#[path = "src/icon.rs"]
+#[path = "../terminal-client/src/icon.rs"]
 #[allow(dead_code)]
 mod icon;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/icon.rs");
+    println!("cargo:rerun-if-changed=../terminal-client/src/icon.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_icon();
     }

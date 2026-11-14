@@ -1,0 +1,17 @@
+[package]
+name = "terminal-server"
+version = "0.1.0"
+edition = "2024"
+description = "Headless terminal server: owns the panes' programs and the authoritative layout"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+terminal-protocol = { path = "../terminal-protocol" }
+libghostty-vt = "0.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+
+[[bin]]
+name = "terminal-server"
+path = "src/main.rs"
