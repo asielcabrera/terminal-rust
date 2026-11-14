@@ -164,7 +164,7 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 /// The read half of a pipe
-pub(crate) struct PipeReader {
+pub struct PipeReader {
     pipe: Arc<PipeHandle>,
     event: PipeHandle,
 }
@@ -181,7 +181,7 @@ impl Read for PipeReader {
 }
 
 /// The write half of a pipe
-pub(crate) struct PipeWriter {
+pub struct PipeWriter {
     pipe: Arc<PipeHandle>,
     event: PipeHandle,
 }
