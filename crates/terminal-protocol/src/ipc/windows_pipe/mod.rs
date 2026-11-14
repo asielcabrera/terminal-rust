@@ -263,7 +263,7 @@ fn server_is_listening(full_name: &str) -> bool {
 }
 
 /// Connects as a client, waiting out a busy server like CreateFileW callers do
-pub(crate) fn connect_client(full_name: &str) -> io::Result<(PipeReader, PipeWriter)> {
+pub fn connect_client(full_name: &str) -> io::Result<(PipeReader, PipeWriter)> {
     let wide = wide(full_name);
     let mut waits = 0u32;
     loop {

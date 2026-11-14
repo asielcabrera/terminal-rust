@@ -19,6 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(test)]
 use std::path::PathBuf;
