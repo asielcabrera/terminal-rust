@@ -4,6 +4,7 @@ use libghostty_vt::{Terminal, TerminalOptions};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
+use terminal_protocol::ipc::SetDividerOp;
 use terminal_protocol::pane_io::IoEvent;
 
 fn shell(program: &str, args: &[&str]) -> ShellConfig {
@@ -414,6 +415,228 @@ fn a_refused_split_changes_nothing_and_stays_silent() {
     }
 }
 
+// ---- Splits inside floating panes (T9) -----------------------------------------------------
+
+/// Opens a floating pane of `width` x `height` window fractions; returns its pane id and
+/// the state event that reported it
+fn add_float(
+    server: &ServerHandle,
+    events: &Receiver<LayoutEvent>,
+    width: f32,
+    height: f32,
+) -> (PaneId, LayoutState) {
+    server.send(Request::LayoutAddFloat(AddFloatOp {
+        shell: waiting(),
+        explicit: false,
+        env: BTreeMap::new(),
+        width,
+        height,
+        cols: 40,
+        rows: 12,
+        scrollback: 1000,
+    }));
+    let (state, created) = wait_state(events);
+    (created.expect("the float reports its new pane").pane, state)
+}
+
+/// The float subtree's pane rects of a state, projected against `window`
+fn subtree_rects(state: &LayoutState, window: Rect) -> Vec<(PaneId, Rect)> {
+    Layout::from_state(state.clone()).float_subtree_rects(window)
+}
+
+#[test]
+fn a_split_inside_a_float_grows_its_subtree() {
+    let (server, events) = Server::start();
+    init(&server);
+    let window = Rect::new(0, 0, 800, 600);
+    let (float_pane, state) = add_float(&server, &events, 0.5, 0.5);
+    assert_eq!(state.floats.len(), 1);
+    assert_eq!(state.floats[0].id, float_pane);
+    assert!(
+        state.floats[0].tree.is_none(),
+        "a fresh float is a single pane"
+    );
+
+    split(&server, float_pane, waiting(), window);
+    let (state, created) = wait_state(&events);
+    let created = created.expect("the split reports its new pane");
+    let new_pane = created.pane;
+    let _block = created.block; // kept alive, as the window keeps it
+
+    let projection = Layout::from_state(state.clone());
+    assert_eq!(projection.focus(), new_pane, "the new pane gets the focus");
+    let float = &state.floats[0];
+    assert_eq!(float.id, float_pane);
+    assert!(float.tree.is_some(), "the split seeded the float's subtree");
+    assert_eq!(
+        state.pane_ids(),
+        vec![PaneId(0), float_pane, new_pane],
+        "the subtree's leaves are panes of the layout"
+    );
+
+    // The two subtree panes tile the float's rect exactly; the tiling is untouched
+    let subtree = subtree_rects(&state, window);
+    assert_eq!(subtree.len(), 2);
+    let float_rect = projection.float_rect(float_pane, window).unwrap();
+    let (a, b) = (subtree[0].1, subtree[1].1);
+    assert_eq!(a.w + b.w, float_rect.w);
+    assert_eq!(b.x, a.right());
+    assert_eq!((a.x, a.y, a.h), (float_rect.x, float_rect.y, float_rect.h));
+    assert_eq!(projection.rects(window).len(), 1, "one tiled pane still");
+}
+
+#[test]
+fn closing_a_subtree_pane_keeps_the_float_alive() {
+    let (server, events) = Server::start();
+    init(&server);
+    let window = Rect::new(0, 0, 800, 600);
+    let (float_pane, _) = add_float(&server, &events, 0.5, 0.5);
+    split(&server, float_pane, waiting(), window);
+    let (_state, created) = wait_state(&events);
+    let created = created.expect("the split reports its pane");
+    let second = created.pane;
+    let _block = created.block;
+
+    server.send(Request::LayoutClose { pane: second });
+    let (state, created) = wait_state(&events);
+    assert!(created.is_none(), "closing reports no new pane");
+    assert_eq!(
+        state.floats.len(),
+        1,
+        "the float survives with its last pane"
+    );
+    assert_eq!(state.pane_ids(), vec![PaneId(0), float_pane]);
+    // The survivor now fills the whole float again
+    let subtree = subtree_rects(&state, window);
+    assert_eq!(subtree.len(), 1);
+    let float_rect = Layout::from_state(state.clone())
+        .float_rect(float_pane, window)
+        .unwrap();
+    assert_eq!(subtree[0].1, float_rect);
+}
+
+#[test]
+fn closing_the_last_subtree_pane_removes_the_float() {
+    let (server, events) = Server::start();
+    init(&server);
+    let window = Rect::new(0, 0, 800, 600);
+    let (float_pane, _) = add_float(&server, &events, 0.5, 0.5);
+    split(&server, float_pane, waiting(), window);
+    let (_state, created) = wait_state(&events);
+    let created = created.expect("the split reports its pane");
+    let _block = created.block; // the first pane to close
+    server.send(Request::LayoutClose {
+        pane: PaneId(created.pane.0),
+    });
+    let _ = wait_state(&events);
+
+    server.send(Request::LayoutClose { pane: float_pane });
+    let (state, created) = wait_state(&events);
+    assert!(created.is_none());
+    assert!(
+        state.floats.is_empty(),
+        "the last subtree pane took the float"
+    );
+    assert_eq!(state.pane_ids(), vec![PaneId(0)]);
+    assert_eq!(
+        Layout::from_state(state).focus(),
+        PaneId(0),
+        "focus fell back to the tiling"
+    );
+}
+
+#[test]
+fn a_divider_drag_inside_a_float_moves_the_subtree_boundary() {
+    let (server, events) = Server::start();
+    init(&server);
+    let window = Rect::new(0, 0, 800, 600);
+    let limits = Limits {
+        min_w: 80,
+        min_h: 60,
+    };
+    let (float_pane, _) = add_float(&server, &events, 0.5, 0.5);
+    split(&server, float_pane, waiting(), window);
+    let (state, created) = wait_state(&events);
+    let created = created.expect("the split reports its pane");
+    let _block = created.block;
+    let projection = Layout::from_state(state);
+    let divider = projection
+        .dividers(window)
+        .into_iter()
+        .find(|divider| divider.float == Some(float_pane))
+        .expect("the subtree divider travels in the state");
+    assert_eq!(divider.axis, Axis::Horizontal);
+
+    // The split target is the subtree's first child; move its boundary 50px right of where
+    // it was (the boundary is on the divider's own axis)
+    let boundary = i64::from(divider.pos) + 50;
+    server.send(Request::LayoutSetDivider(SetDividerOp {
+        float: Some(float_pane),
+        path: divider.path.clone(),
+        boundary,
+        area: window,
+        limits,
+    }));
+    let (state, created) = wait_state(&events);
+    assert!(created.is_none());
+    let subtree = subtree_rects(&state, window);
+    let first = subtree
+        .iter()
+        .find(|(id, _)| *id == float_pane)
+        .expect("the subtree's first pane")
+        .1;
+    assert_eq!(first.right(), boundary as u32, "the boundary moved");
+}
+
+#[test]
+#[cfg(unix)]
+fn float_subtree_changes_reach_every_session() {
+    let harness = Harness::start();
+    let (first, first_events) = harness.client();
+    attach_fresh(&first);
+    let (second, second_events) = harness.client();
+    attach_existing(&second);
+
+    // The driver opens a float and splits inside it: both sessions rebuild from the
+    // same state events
+    second.send_op(WireOp::AddFloat {
+        shell: WireShell::from_config(&waiting()),
+        explicit: false,
+        env: BTreeMap::new(),
+        width: 0.5,
+        height: 0.5,
+        cols: 40,
+        rows: 12,
+        scrollback: 1000,
+    });
+    let driver_state = wait_wire_state(&second_events);
+    let float_pane = driver_state.floats[0].id;
+    let _ = wait_wire_state(&first_events); // the viewer sees the float too
+
+    second.send_op(WireOp::Split {
+        pane: float_pane,
+        dir: Dir::Down,
+        shell: WireShell::from_config(&waiting()),
+        explicit: false,
+        cols: 40,
+        rows: 12,
+        scrollback: 1000,
+        area: Rect::new(0, 0, 800, 600),
+        limits: Limits {
+            min_w: 80,
+            min_h: 60,
+        },
+    });
+    let split_state = wait_wire_state(&second_events);
+    assert!(
+        split_state.floats[0].tree.is_some(),
+        "the split seeded the subtree"
+    );
+    assert_eq!(split_state.pane_ids().len(), 3);
+    let viewer_state = wait_wire_state(&first_events);
+    assert_eq!(viewer_state, split_state, "the viewer saw the same subtree");
+}
+
 #[test]
 fn the_program_output_arrives_and_its_exit_is_reported() {
     let (server, _events) = Server::start();
@@ -628,6 +851,8 @@ fn the_exit_is_notified_after_all_the_output_was_forwarded() {
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::HashMap;
 use terminal_protocol::layout::Axis;
 use wire::{
     Deframed, IpcCreatedPane, WIRE_VERSION, WireEvent, WireEventKind, WireOp, WireReply,
@@ -693,6 +918,7 @@ fn wire_ops() -> Vec<WireOp> {
             limits,
         },
         WireOp::SetDivider {
+            float: Some(PaneId(7)),
             path: vec![false, true, true],
             boundary: 512,
             area: Rect::new(0, 0, 800, 600),
@@ -865,6 +1091,26 @@ fn wire_requests_name_their_op_and_a_rid_survives_the_round_trip() {
     assert!(json.starts_with("{\"v\":1"), "{json}");
     assert!(json.contains("\"op\":\"snapshot\""), "{json}");
     assert_eq!(round_trip(request.clone()), request);
+}
+
+#[test]
+fn an_old_set_divider_without_the_float_field_still_loads() {
+    // Servers before splits inside floats sent no float field: the op still decodes, as tiled
+    let json = r#"{"op":"set_divider","path":[false],"boundary":512,"area":{"x":0,"y":0,"w":800,"h":600},"limits":{"min_w":80,"min_h":60}}"#;
+    let op: WireOp = serde_json::from_str(json).expect("the old JSON still loads");
+    assert_eq!(
+        op,
+        WireOp::SetDivider {
+            float: None,
+            path: vec![false],
+            boundary: 512,
+            area: Rect::new(0, 0, 800, 600),
+            limits: Limits {
+                min_w: 80,
+                min_h: 60,
+            },
+        }
+    );
 }
 
 #[test]
@@ -2800,5 +3046,180 @@ fn attach_streams_the_snapshot_then_live_bytes() {
     read_until_marker(&mut win_block, "echo-live");
     cli.close();
     window.close();
+    harness.wait_no_sessions();
+}
+
+/// Connects WITHOUT the client reader thread: the raw socket halves, as a foreign wire client
+/// (the python probe) sees them. Requests go out through the connection's writer; frames are
+/// read raw, typed bytes included.
+#[cfg(unix)]
+fn raw_client(path: &std::path::Path) -> (IpcConn, Box<dyn Read + Send>) {
+    IpcConn::connect(&IpcEndpoint::Socket(path.to_path_buf())).expect("the raw client connects")
+}
+
+/// Reads raw frames on a thread until the connection ends, tallying the snapshot frames per
+/// block token (control frames are dropped: a raw client correlates by order, not content).
+/// A clone of the tally is returned for polling without blocking the read.
+#[cfg(unix)]
+type SnapshotTally = (
+    Arc<Mutex<HashMap<BlockId, Vec<Vec<u8>>>>>,
+    thread::JoinHandle<()>,
+);
+
+#[cfg(unix)]
+fn tally_snapshots(read: Box<dyn Read + Send>) -> SnapshotTally {
+    let snapshots: Arc<Mutex<HashMap<BlockId, Vec<Vec<u8>>>>> = Default::default();
+    let tally = snapshots.clone();
+    let reader = thread::spawn(move || {
+        let mut read = read;
+        loop {
+            match read_typed_frame(&mut *read) {
+                Ok(WireFrame::Snapshot(token, bytes)) => {
+                    tally
+                        .lock()
+                        .unwrap()
+                        .entry(BlockId(u64::from(token)))
+                        .or_default()
+                        .push(bytes);
+                }
+                Ok(_) => {}
+                Err(_) => return, // the connection ended
+            }
+        }
+    });
+    (snapshots, reader)
+}
+
+/// The invariant a session must hold: a block's snapshot is queued exactly once per session at
+/// attach (an existing pane's; a fresh pane has none), and only live chunks follow. A raw wire
+/// client used to receive the same 127-byte zsh-prompt snapshot every ~500 ms, forever — the
+/// flood starved the control channel until no reply or event made it through in time.
+#[test]
+#[cfg(unix)]
+fn a_session_receives_its_attach_snapshots_once_and_only_live_data_after() {
+    let harness = Harness::start();
+
+    // A raw client attaches to the fresh server: no snapshot exists yet, so only the init
+    // reply and the shell's earliest output may arrive
+    let (first, first_read) = raw_client(&harness.path);
+    let (first_flood, first_reader) = tally_snapshots(first_read);
+    first.send_op(wire::WireOp::Attach {
+        shell: wire::WireShell::from_config(&waiting()),
+        cols: 80,
+        rows: 24,
+        scrollback: 1000,
+    });
+    thread::sleep(Duration::from_secs(2));
+    let flood = first_flood.lock().unwrap().clone();
+    assert!(
+        flood.is_empty(),
+        "a fresh attach queues no snapshot, yet tokens {flood:?} were flooded"
+    );
+
+    // A second raw client attaches to the existing layout: its snapshot for the live pane is
+    // queued exactly once, and nothing re-queues it afterwards
+    let (second, second_read) = raw_client(&harness.path);
+    let (snapshots, second_reader) = tally_snapshots(second_read);
+    second.send_op(wire::WireOp::Attach {
+        shell: wire::WireShell::from_config(&waiting()),
+        cols: 80,
+        rows: 24,
+        scrollback: 1000,
+    });
+    thread::sleep(Duration::from_secs(2));
+    let taken = snapshots.lock().unwrap().clone();
+    let counts: Vec<_> = taken
+        .iter()
+        .map(|(token, bytes)| (*token, bytes.len()))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![(BlockId(0), 1)],
+        "the existing pane's snapshot is queued exactly once, got {taken:?}"
+    );
+
+    // Keep reading: only live data may follow, no new snapshot frames
+    let before = taken.get(&BlockId(0)).map_or(0, Vec::len);
+    thread::sleep(Duration::from_secs(1));
+    let after = snapshots.lock().unwrap().clone();
+    let grew = after
+        .iter()
+        .any(|(token, bytes)| bytes.len() > before.max(1) || !taken.contains_key(token));
+    assert!(!grew, "no new snapshot frames after the attach: {after:?}");
+    first.close();
+    second.close();
+    let _ = (first_reader.join(), second_reader.join());
+    harness.wait_no_sessions();
+}
+
+/// A session that already attached must not re-run the attach when a request repeats on its
+/// connection (a client retrying a request it believes went unanswered used to receive the
+/// whole snapshot set again per retry — the same 127-byte screen, over and over, until the
+/// control channel drowned). A repeat Init/Attach answers with the state only.
+#[test]
+#[cfg(unix)]
+fn an_already_attached_session_does_not_requeue_its_snapshots() {
+    let harness = Harness::start();
+    let (conn, read) = raw_client(&harness.path);
+    let (snapshots, reader) = tally_snapshots(read);
+    let attach = || {
+        conn.send_op(wire::WireOp::Attach {
+            shell: wire::WireShell::from_config(&waiting()),
+            cols: 80,
+            rows: 24,
+            scrollback: 1000,
+        });
+    };
+    attach(); // fresh: init, no snapshot
+    thread::sleep(Duration::from_millis(300));
+    attach(); // the layout exists now: this is the repeat that used to flood
+    thread::sleep(Duration::from_millis(300));
+    attach(); // and once more, for good measure
+    thread::sleep(Duration::from_secs(1));
+
+    let taken = snapshots.lock().unwrap().clone();
+    assert!(
+        taken.is_empty(),
+        "an already-attached session never re-queues snapshots, got {taken:?}"
+    );
+    conn.close();
+    let _ = reader.join();
+    harness.wait_no_sessions();
+}
+
+/// A session subscribed to a block receives that block's snapshot exactly once, no matter how
+/// many times the subscribe request repeats
+#[test]
+#[cfg(unix)]
+fn a_subscribed_block_snapshots_exactly_once_per_session() {
+    let harness = Harness::start();
+    let (window, _window_events) = harness.client();
+    let pane = attach_fresh(&window);
+    let mut win_block = open_feed(&window, pane.block);
+    win_block.write(b"seed-screen\n");
+    read_until_marker(&mut win_block, "seed-screen");
+
+    let (cli, read) = raw_client(&harness.path);
+    let (snapshots, reader) = tally_snapshots(read);
+    cli.send_op(wire::WireOp::AutomationSubscribe { block: pane.block });
+    thread::sleep(Duration::from_millis(300));
+    cli.send_op(wire::WireOp::AutomationSubscribe { block: pane.block });
+    thread::sleep(Duration::from_secs(1));
+
+    let taken = snapshots.lock().unwrap().clone();
+    let counts: Vec<_> = taken
+        .iter()
+        .map(|(token, bytes)| (*token, bytes.len()))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![(pane.block, 1)],
+        "the subscribed block snapshots exactly once per session, got {taken:?}"
+    );
+    win_block.write(b"after-subscribe\n");
+    read_until_marker(&mut win_block, "after-subscribe");
+    cli.close();
+    window.close();
+    let _ = reader.join();
     harness.wait_no_sessions();
 }

@@ -73,6 +73,10 @@ pub enum WireOp {
         limits: Limits,
     },
     SetDivider {
+        /// A divider inside this floating pane's subtree; `None` for a tiled one. Additive:
+        /// old JSON without the field reads as `None`.
+        #[serde(default)]
+        float: Option<PaneId>,
         path: Path,
         boundary: i64,
         area: Rect,
@@ -210,6 +214,7 @@ impl WireOp {
                 limits: op.limits,
             },
             Request::LayoutSetDivider(op) => Self::SetDivider {
+                float: op.float,
                 path: op.path.clone(),
                 boundary: op.boundary,
                 area: op.area,
@@ -314,11 +319,13 @@ impl WireOp {
                 limits,
             }),
             Self::SetDivider {
+                float,
                 path,
                 boundary,
                 area,
                 limits,
             } => Request::LayoutSetDivider(SetDividerOp {
+                float,
                 path,
                 boundary,
                 area,

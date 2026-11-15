@@ -348,8 +348,9 @@ impl App {
             .current_dir()
     }
 
-    /// Splits the focused pane (or the last tiled one, from a floating pane): one message to
-    /// the server, which applies it, starts the block and reports both back
+    /// Splits the focused pane: a tiled pane in the tiling, a floating pane inside its own
+    /// float. One message to the server, which applies it, starts the block and reports both
+    /// back
     pub(crate) fn split(&mut self, axis: Axis) {
         let (Some(area), Some(limits), Some(renderer)) =
             (self.window_area(), self.pane_limits(), &self.renderer)
@@ -987,6 +988,9 @@ impl App {
         let (cell_width, cell_height) = renderer.cell_size();
         let mut placed = self.layout.rects(area);
         placed.extend(self.layout.float_rects(area));
+        // Third rect source: the floating panes' subtrees (their leaf rects, which for a
+        // split float replace the float's full rect; for a single-pane float they repeat it)
+        placed.extend(self.layout.float_subtree_rects(area));
         for (id, rect) in placed {
             let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) else {
                 continue;
@@ -1012,7 +1016,7 @@ impl App {
             .panes
             .iter()
             .map(|pane| pane.id)
-            .filter(|&id| self.layout.is_float(id))
+            .filter(|&id| self.layout.is_float_pane(id))
             .collect();
         let dividers = self.divider_rects();
         let Some(renderer) = &mut self.renderer else {

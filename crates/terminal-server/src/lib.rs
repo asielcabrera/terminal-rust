@@ -16,7 +16,8 @@
 //! The server-side terminal never answers the program's queries: the client's terminal does,
 //! through [`PaneIo::write`], exactly as with a local PTY.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
@@ -227,9 +228,9 @@ impl Server {
             Request::LayoutResize(op) => {
                 self.apply(|layout| layout.resize(op.pane, op.dir, op.delta, op.area, op.limits))
             }
-            Request::LayoutSetDivider(op) => {
-                self.apply(|layout| layout.set_divider(&op.path, op.boundary, op.area, op.limits))
-            }
+            Request::LayoutSetDivider(op) => self.apply(|layout| {
+                layout.set_divider(op.float, &op.path, op.boundary, op.area, op.limits)
+            }),
             Request::LayoutToggleZoom => self.apply(Layout::toggle_zoom),
             Request::LayoutAddFloat(op) => self.add_float(op),
             Request::LayoutToggleFloats => self.apply(Layout::toggle_floats),
@@ -1242,6 +1243,14 @@ struct Session {
     /// Whether this session drives: mirrored from the registry, updated by its own attach and
     /// by the `DriverChanged` events an attach or a teardown sends
     driver: bool,
+    /// Set by this session's first attach. A request that repeats on a live connection (a
+    /// client retrying what it believes went unanswered) must not re-run the attach: that
+    /// re-queued the whole snapshot set per retry, flooding the data channel until the control
+    /// channel starved
+    attached: bool,
+    /// Blocks this session already subscribed to; a repeat subscribe must not re-queue the
+    /// block's snapshot (same flood, one snapshot per retry)
+    subscribed: std::collections::HashSet<BlockId>,
 }
 
 /// How long a request-with-reply may take. An attach can spawn a shell; the rest are quick
@@ -1430,9 +1439,14 @@ impl Session {
                         // The snapshot is queued before live bytes start flowing: whoever reads
                         // the stream sees the full screen first, exactly like an attach. The
                         // reply arrives ahead of it (controls overtake queued data), so the
-                        // client claims the feed before it reads anything
-                        self.writer
-                            .push_data(data_frame(FRAME_SNAPSHOT, block, bytes));
+                        // client claims the feed before it reads anything. A repeat subscribe
+                        // for a block this session already receives must not re-queue it: one
+                        // snapshot per session per block, or a retrying client stacks a
+                        // duplicate screen into its feed on every retry
+                        if self.subscribed.insert(block) {
+                            self.writer
+                                .push_data(data_frame(FRAME_SNAPSHOT, block, bytes));
+                        }
                         self.start_receiving();
                         self.writer
                             .push_control(control_frame(&WireReply::automation_subscribed(rid)));
@@ -1483,6 +1497,43 @@ impl Session {
         rows: u16,
         scrollback: usize,
     ) -> bool {
+        // A request that repeats on an already-attached connection is a retry, not a new
+        // attach: it gets the current state as an answer, with NO snapshot re-queue and no
+        // driver churn. The client's feeds already hold every pane's screen; replaying the
+        // snapshots would stack a duplicate screen on top of each feed on every retry, and the
+        // data flood starves the control channel (observed as endless identical snapshots).
+        if self.attached {
+            let (reply, answer) = channel();
+            self.handle.send(Request::Attach {
+                shell: shell.into_config(),
+                cols,
+                rows,
+                scrollback,
+                reply,
+            });
+            return match answer.recv_timeout(SESSION_ASK_TIMEOUT) {
+                Ok(AttachOutcome::Existing(state, panes)) => {
+                    self.writer.push_control(control_frame(&WireReply::new(
+                        rid,
+                        WireReplyKind::Attached {
+                            state,
+                            panes: panes
+                                .into_iter()
+                                .map(wire::IpcCreatedPane::from_attached)
+                                .collect(),
+                            exited: Vec::new(),
+                        },
+                    )));
+                    true
+                }
+                // A session that attached cannot see a fresh server: its own attach created
+                // the layout. A failure answering the ask ends the session, as everywhere else
+                _ => {
+                    eprintln!("[server] an attach re-ask did not answer");
+                    false
+                }
+            };
+        }
         let (reply, answer) = channel();
         self.handle.send(Request::Attach {
             shell: shell.into_config(),
@@ -1509,6 +1560,7 @@ impl Session {
                 self.start_receiving();
                 self.take_over_driver();
                 pump_pane(&self.shared, created.pane);
+                self.attached = true;
                 WireReply::new(
                     rid,
                     WireReplyKind::Init {
@@ -1536,6 +1588,7 @@ impl Session {
                 }
                 self.start_receiving();
                 self.take_over_driver();
+                self.attached = true;
                 WireReply::new(
                     rid,
                     WireReplyKind::Attached {
@@ -1766,6 +1819,8 @@ fn start_session(stream: IpcStream, handle: &ServerHandle, shared: &Arc<ProcessS
         conn,
         writer,
         driver: false,
+        attached: false,
+        subscribed: std::collections::HashSet::new(),
     };
     thread::Builder::new()
         .name("terminal-session".to_string())

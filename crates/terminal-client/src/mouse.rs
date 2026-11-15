@@ -41,8 +41,9 @@ const DIVIDER_ZONE: f64 = 4.0;
 pub enum Capture {
     /// A selection or a report to that pane's program
     Pane(PaneId),
-    /// Dragging a divider between panes
-    Divider(Path, Axis),
+    /// Dragging a divider between tiled panes, or inside a floating pane's subtree (`float`
+    /// names the float; the path is relative to its subtree's root)
+    Divider(Path, Axis, Option<PaneId>),
     /// Moving a floating pane by grabbing the ring of its padding
     FloatMove(PaneId),
     /// Resizing a floating pane by an edge or a corner
@@ -140,7 +141,7 @@ fn edge_icon(edge: Edge) -> CursorIcon {
 fn capture_icon(capture: &Capture) -> Option<CursorIcon> {
     match capture {
         Capture::Pane(_) => None,
-        Capture::Divider(_, axis) => Some(divider_icon(*axis)),
+        Capture::Divider(_, axis, _) => Some(divider_icon(*axis)),
         Capture::FloatMove(_) => Some(CursorIcon::Move),
         Capture::FloatResize(_, edge) => Some(edge_icon(*edge)),
     }
@@ -272,10 +273,8 @@ impl App {
     /// Floating pane under the pointer, whether over its content, its padding or its edge
     pub(crate) fn float_under_pointer(&self) -> Option<PaneId> {
         match self.hit_at_pointer()? {
-            Hit::Pane(id) | Hit::FloatMove(id) | Hit::FloatResize(id, _)
-                if self.layout.is_float(id) =>
-            {
-                Some(id)
+            Hit::Pane(id) | Hit::FloatMove(id) | Hit::FloatResize(id, _) => {
+                self.layout.float_of(id)
             }
             _ => None,
         }
@@ -358,7 +357,7 @@ impl App {
     }
 
     /// Moves the captured divider to where the pointer is: one message per drag step
-    pub(crate) fn drag_divider(&mut self, path: &[bool], axis: Axis) {
+    pub(crate) fn drag_divider(&mut self, path: &[bool], axis: Axis, float: Option<PaneId>) {
         let (Some(area), Some(limits)) = (self.window_area(), self.pane_limits()) else {
             return;
         };
@@ -368,6 +367,7 @@ impl App {
             Axis::Vertical => y,
         };
         self.server.send(Request::LayoutSetDivider(SetDividerOp {
+            float,
             path: path.to_vec(),
             boundary: boundary.round() as i64,
             area,
@@ -459,7 +459,7 @@ impl App {
             icon
         } else {
             match self.hit_at_pointer() {
-                Some(Hit::Divider(_, axis)) => divider_icon(axis),
+                Some(Hit::Divider(_, axis, _)) => divider_icon(axis),
                 Some(Hit::FloatMove(_)) => CursorIcon::Move,
                 Some(Hit::FloatResize(_, edge)) => edge_icon(edge),
                 Some(Hit::Pane(id))
@@ -483,8 +483,8 @@ impl App {
     pub fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.mouse.pointer = (position.x, position.y);
         match self.mouse.capture.clone() {
-            Some(Capture::Divider(path, axis)) => {
-                self.drag_divider(&path, axis);
+            Some(Capture::Divider(path, axis, float)) => {
+                self.drag_divider(&path, axis, float);
                 return;
             }
             Some(Capture::FloatMove(id)) => {
@@ -538,8 +538,8 @@ impl App {
                 }
                 // A divider between panes, or a floating pane's padding and edges, can be grabbed
                 match self.hit_at_pointer() {
-                    Some(Hit::Divider(path, axis)) => {
-                        self.start_drag(Capture::Divider(path, axis));
+                    Some(Hit::Divider(path, axis, float)) => {
+                        self.start_drag(Capture::Divider(path, axis, float));
                         return;
                     }
                     Some(Hit::FloatMove(id)) => {
@@ -1085,7 +1085,7 @@ mod tests {
             Some(CursorIcon::Move)
         );
         assert_eq!(
-            capture_icon(&Capture::Divider(vec![], Axis::Vertical)),
+            capture_icon(&Capture::Divider(vec![], Axis::Vertical, None)),
             Some(CursorIcon::NsResize)
         );
     }
@@ -1191,7 +1191,7 @@ mod tests {
         // one physical release: the first clears the drag, the second must not re-arm
         // or need the first's state
         let mut mouse = MouseState::new().unwrap();
-        mouse.capture = Some(Capture::Divider(vec![], Axis::Horizontal));
+        mouse.capture = Some(Capture::Divider(vec![], Axis::Horizontal, None));
         assert!(mouse.take_layout_drag());
         assert_eq!(mouse.capture, None);
         assert!(!mouse.take_layout_drag());
