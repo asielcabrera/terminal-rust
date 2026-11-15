@@ -355,8 +355,10 @@ fn a_closed_twice_pane_stays_silent() {
 
     server.send(Request::LayoutClose { pane: PaneId(1) });
     let _ = wait_state(&events);
-    // Drain whatever the kill still has in flight before the silence check
-    while events.try_recv().is_ok() {}
+    // Let the first close's async events settle (the kill's exit chain lands after the
+    // state reply: pane-exited + the shell-exit broadcast) — a bounded quiet gap, then the
+    // silence check measures only the SECOND close
+    while events.recv_timeout(Duration::from_millis(100)).is_ok() {}
 
     // Closing an unknown pane again answers nothing
     server.send(Request::LayoutClose { pane: PaneId(1) });
