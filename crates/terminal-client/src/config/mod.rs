@@ -97,7 +97,7 @@ pub fn parse_script(
     dir: Option<&Path>,
 ) -> Result<(Config, Script), String> {
     let mut script = Script::new().map_err(|e| lua_message(&e))?;
-    prepare(script.lua(), dir).map_err(|e| lua_message(&e))?;
+    prepare(script.lua(), dir, &script.commands_handle()).map_err(|e| lua_message(&e))?;
 
     let value: Value = script
         .lua()
@@ -170,8 +170,13 @@ end
 return action
 "#;
 
-/// What `config.lua` has at hand besides the Lua standard library
-fn prepare(lua: &Lua, dir: Option<&Path>) -> mlua::Result<()> {
+/// What `config.lua` has at hand besides the Lua standard library. `commands` is the
+/// script's command queue: `terminal.emit` queues onto it like the ctx methods.
+fn prepare(
+    lua: &Lua,
+    dir: Option<&Path>,
+    commands: &std::rc::Rc<std::cell::RefCell<Vec<crate::actions::Command>>>,
+) -> mlua::Result<()> {
     let terminal = lua.create_table()?;
     terminal.set("os", std::env::consts::OS)?;
     terminal.set(
@@ -187,6 +192,8 @@ fn prepare(lua: &Lua, dir: Option<&Path>) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+    // The event bus (T10): `terminal.on` and `terminal.emit`
+    crate::actions::install_event_api(lua, &terminal, commands)?;
 
     if let Some(dir) = dir {
         let dir = dir.display().to_string().replace('\\', "/");

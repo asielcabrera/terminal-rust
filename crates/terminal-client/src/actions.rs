@@ -130,6 +130,84 @@ pub enum Command {
     SendText(String),
     Log(String),
     Perform(Action),
+    /// An event-bus emission (T10): the app sends one `Emit` op over the wire; the server
+    /// broadcasts the echo to every session, the emitter's own handlers included
+    Emit {
+        name: String,
+        payload: serde_json::Value,
+        depth: u8,
+    },
+}
+
+/// Where the `terminal.on` registry lives: a Lua table in the interpreter's globals,
+/// keyed by event name. Handlers are Lua functions, so the registry is Lua-side; the
+/// dispatch path reads it back through [`Script::event_handler`].
+const EVENT_HANDLERS: &str = "__terminal_event_handlers";
+
+/// Turns a Lua payload into JSON for the wire. `nil` is an empty payload.
+fn payload_to_json(lua: &Lua, value: Value) -> mlua::Result<serde_json::Value> {
+    match value {
+        Value::Nil => Ok(serde_json::Value::Null),
+        Value::Table(_) => lua.from_value(value).map_err(|error| {
+            mlua::Error::runtime(format!(
+                "the payload could not become JSON: {}",
+                lua_message(&error)
+            ))
+        }),
+        other => Err(mlua::Error::runtime(format!(
+            "the payload must be a table (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Installs the event-bus API on the `terminal` table (T10): `terminal.on(name, fn)`
+/// registers a handler for an exact event name (replacing any prior one; `nil`
+/// unregisters), and `terminal.emit(name, payload_table)` emits with depth 0. Called from
+/// config loading, with the same command queue the ctx methods use.
+pub(crate) fn install_event_api(
+    lua: &Lua,
+    terminal: &Table,
+    commands: &Rc<RefCell<Vec<Command>>>,
+) -> mlua::Result<()> {
+    let handlers = lua.create_table()?;
+    lua.globals().set(EVENT_HANDLERS, handlers.clone())?;
+    terminal.set(
+        "on",
+        lua.create_function(
+            move |_, (name, handler): (String, Value)| -> mlua::Result<()> {
+                match handler {
+                    Value::Nil => {
+                        handlers.set(name, Value::Nil)?;
+                    }
+                    Value::Function(function) => {
+                        handlers.set(name, function)?;
+                    }
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "terminal.on needs a function (got {}) or nil to unregister",
+                            other.type_name()
+                        )));
+                    }
+                }
+                Ok(())
+            },
+        )?,
+    )?;
+    let queue = commands.clone();
+    terminal.set(
+        "emit",
+        lua.create_function(move |lua, (name, payload): (String, Value)| {
+            let payload = payload_to_json(lua, payload)?;
+            queue.borrow_mut().push(Command::Emit {
+                name,
+                payload,
+                depth: 0,
+            });
+            Ok(())
+        })?,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -742,6 +820,58 @@ impl Script {
         self.events.handlers.contains_key(&kind)
     }
 
+    /// The handle on the command queue, for the config loader to install `terminal.emit`
+    /// with (the queue lives as long as the script)
+    pub fn commands_handle(&self) -> Rc<RefCell<Vec<Command>>> {
+        self.commands.clone()
+    }
+
+    /// What queued since the last drain (top-level `terminal.emit` calls during config
+    /// evaluation queue here)
+    pub fn take_commands(&self) -> Vec<Command> {
+        self.commands.borrow_mut().drain(..).collect()
+    }
+
+    /// Whether a `terminal.on` handler is registered for the event name
+    pub fn has_event_handler(&self, name: &str) -> bool {
+        self.event_handler(name).is_some()
+    }
+
+    /// The handler registered with `terminal.on` for an event name, if any
+    pub fn event_handler(&self, name: &str) -> Option<Function> {
+        let handlers: Table = self.lua.globals().get(EVENT_HANDLERS).ok()?;
+        handlers.get(name).ok()
+    }
+
+    /// Calls the `terminal.on` handler for a wire `Event` (T10): the payload becomes a Lua
+    /// table, `ctx` gains the event's coordinates (`ctx.event.name`, `ctx.event.payload`,
+    /// `ctx.depth`), and the payload travels as the second argument. A handler's commands
+    /// run like any hook's (`run_commands`); emits chain one level deeper via `ctx.emit`.
+    pub fn fire_wire_event(
+        &self,
+        name: &str,
+        payload: &serde_json::Value,
+        depth: u8,
+    ) -> Vec<Command> {
+        let Some(handler) = self.event_handler(name) else {
+            return Vec::new();
+        };
+        let payload_value = match self.lua.to_value(payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[lua] event {name:?}: {}", lua_message(&error));
+                return Vec::new();
+            }
+        };
+        if let Ok(event) = self.lua.create_table() {
+            let _ = event.set("name", name);
+            let _ = event.set("payload", payload_value.clone());
+            let _ = self.ctx.set("event", event);
+        }
+        let _ = self.ctx.set("depth", depth);
+        self.call(&handler, vec![payload_value])
+    }
+
     /// A string as a Lua value, to pass as an argument to a hook
     pub fn text(&self, text: &str) -> Value {
         self.lua
@@ -793,7 +923,6 @@ fn make_ctx(lua: &Lua, commands: &Rc<RefCell<Vec<Command>>>) -> mlua::Result<Tab
         })?,
     )?;
 
-    // Runs a built-in action (`ctx:perform(terminal.action.Paste)`)
     let queue = commands.clone();
     ctx.set(
         "perform",
@@ -808,6 +937,26 @@ fn make_ctx(lua: &Lua, commands: &Rc<RefCell<Vec<Command>>>) -> mlua::Result<Tab
                 }
                 Err(message) => Err(mlua::Error::runtime(message)),
             }
+        })?,
+    )?;
+
+    // Emits on the event bus one level deeper than the event being handled (T10's loop
+    // guard): `ctx:emit("name", payload)` inside a handler
+    let queue = commands.clone();
+    ctx.set(
+        "emit",
+        lua.create_function(move |lua, (this, name, payload): (Value, String, Value)| {
+            let payload = payload_to_json(lua, payload)?;
+            let depth = match this {
+                Value::Table(table) => table.get::<u8>("depth").unwrap_or(0),
+                _ => 0,
+            };
+            queue.borrow_mut().push(Command::Emit {
+                name,
+                payload,
+                depth: depth.saturating_add(1),
+            });
+            Ok(())
         })?,
     )?;
     Ok(ctx)
@@ -936,5 +1085,119 @@ mod tests {
             .unwrap();
         let commands = script.call(&fine, vec![]);
         assert!(matches!(commands.as_slice(), [Command::Log(text)] if text == "still alive"));
+    }
+
+    // ---- The event bus (T10) --------------------------------------------------------------
+
+    /// A script with `terminal.on`/`terminal.emit` installed, as config loading does
+    fn script_with_event_api() -> Script {
+        let script = Script::new().unwrap();
+        let terminal = script.lua().create_table().unwrap();
+        install_event_api(script.lua(), &terminal, &script.commands_handle()).unwrap();
+        script.lua().globals().set("terminal", terminal).unwrap();
+        script
+    }
+
+    #[test]
+    fn terminal_on_registers_replaces_and_unregisters_handlers() {
+        let script = script_with_event_api();
+        script
+            .lua()
+            .load(r#"terminal.on("user.x", function(ctx, payload) ctx:log("first:" .. payload.who) end)"#)
+            .exec()
+            .unwrap();
+        assert!(script.has_event_handler("user.x"));
+        let commands = script.fire_wire_event("user.x", &serde_json::json!({ "who": "a" }), 0);
+        assert!(matches!(commands.as_slice(), [Command::Log(text)] if text == "first:a"));
+
+        // A second registration for the same name replaces the handler
+        script
+            .lua()
+            .load(r#"terminal.on("user.x", function(ctx, payload) ctx:log("second:" .. payload.who) end)"#)
+            .exec()
+            .unwrap();
+        let commands = script.fire_wire_event("user.x", &serde_json::json!({ "who": "b" }), 0);
+        assert!(matches!(commands.as_slice(), [Command::Log(text)] if text == "second:b"));
+
+        // `nil` unregisters
+        script
+            .lua()
+            .load("terminal.on('user.x', nil)")
+            .exec()
+            .unwrap();
+        assert!(!script.has_event_handler("user.x"));
+        assert!(
+            script
+                .fire_wire_event("user.x", &serde_json::json!({}), 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_event_handler_sees_ctx_event_payload_and_depth_and_ctx_emit_chains_one_deeper() {
+        let script = script_with_event_api();
+        script
+            .lua()
+            .load(
+                r#"
+                terminal.on("user.echo", function(ctx, payload)
+                    ctx:log(ctx.event.name .. "|" .. ctx.depth .. "|" .. payload.n)
+                    ctx:emit("user.chained", { from = ctx.event.name })
+                end)
+            "#,
+            )
+            .exec()
+            .unwrap();
+        let commands = script.fire_wire_event("user.echo", &serde_json::json!({ "n": 7 }), 3);
+        // The handler logs, then chains an emit one level deeper than its own event
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Log(text), Command::Emit { name, payload, depth }]
+                if text == "user.echo|3|7"
+                    && name == "user.chained"
+                    && *depth == 4
+                    && payload == &serde_json::json!({ "from": "user.echo" })
+        ));
+    }
+
+    #[test]
+    fn top_level_terminal_emit_sends_depth_zero() {
+        let script = script_with_event_api();
+        script
+            .lua()
+            .load("terminal.emit('user.top', { n = 1 })")
+            .exec()
+            .unwrap();
+        // The queued command travels with the script until the app drains it
+        let commands = script.take_commands();
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Emit { name, payload, depth }]
+                if name == "user.top" && *depth == 0 && payload == &serde_json::json!({ "n": 1 })
+        ));
+    }
+
+    #[test]
+    fn legacy_events_table_still_parses_the_four_names() {
+        let events = parse_events(
+            script_with_event_api()
+                .lua()
+                .load(
+                    r#"{ ["bell"] = function(ctx) end, ["title-changed"] = function(ctx, title) end, ["shell-exit"] = function(ctx) end, ["config-reloaded"] = function(ctx) end }"#,
+                )
+                .eval()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut script = Script::new().unwrap();
+        script.set_events(events);
+        for kind in [
+            EventKind::Bell,
+            EventKind::TitleChanged,
+            EventKind::ShellExit,
+            EventKind::ConfigReloaded,
+        ] {
+            assert!(script.has_handler(kind), "{kind:?} still parses");
+        }
     }
 }

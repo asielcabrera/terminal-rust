@@ -32,6 +32,9 @@ fn main() {
             );
             unreachable!("the gateway serves until it is killed");
         }
+        Some("emit") => {
+            app::cli_emit(&args[2..]);
+        }
         Some("ls") => {
             app::cli_ls();
         }
@@ -48,7 +51,7 @@ fn main() {
         // server, the gateway and the automation CLI
         Some(other) => {
             eprintln!(
-                "unknown subcommand {other:?}; usage: terminal [server|gateway|ls|send|capture|attach]"
+                "unknown subcommand {other:?}; usage: terminal [server|gateway|ls|send|capture|attach|emit]"
             );
             std::process::exit(2);
         }

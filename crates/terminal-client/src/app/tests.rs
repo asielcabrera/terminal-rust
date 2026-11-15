@@ -34,3 +34,23 @@ fn the_ls_table_is_sorted_and_reports_state() {
     assert_eq!(lines[3], "12    12     80x24  dead");
     assert_eq!(lines.len(), 4, "no trailing rows");
 }
+
+#[test]
+fn terminal_happenings_map_to_well_known_wire_emits() {
+    // A bell broadcasts as a well-known event with the pane that rang it
+    let op = well_known_emit(PaneId(3), &LuaEvent::Bell).unwrap();
+    assert!(matches!(
+        op,
+        wire::WireOp::Emit { name, payload, depth }
+            if name == "bell" && depth == 0 && payload == serde_json::json!({ "pane": 3 })
+    ));
+    // A title change carries the pane and the title
+    let op = well_known_emit(PaneId(1), &LuaEvent::TitleChanged("editor".to_string())).unwrap();
+    assert!(matches!(
+        op,
+        wire::WireOp::Emit { name, payload, depth }
+            if name == "title-changed"
+                && depth == 0
+                && payload == serde_json::json!({ "pane": 1, "title": "editor" })
+    ));
+}

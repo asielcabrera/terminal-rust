@@ -67,6 +67,10 @@ pub enum LayoutEvent {
     PaneOutput(PaneId),
     /// A pane's program exited
     PaneExited(PaneId),
+    /// A well-known happening broadcast as a generic event-bus `Event` (T10): emitted at
+    /// the natural points alongside the typed machinery above, which stays as-is (it
+    /// carries block data, not notifications)
+    Event(WireEventKind),
 }
 
 /// "Split this pane in `dir` and start `shell` in the new one"

@@ -12,7 +12,7 @@ use libghostty_vt::key::{Action as KeyAction, Encoder, Event as GhosttyKeyEvent,
 use libghostty_vt::paste;
 use libghostty_vt::terminal::{Mode, ScrollViewport};
 use mlua::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -52,6 +52,24 @@ pub(crate) enum UserEvent {
     Layout(WireEventKind),
     /// The configuration file changed on disk
     ConfigChanged,
+}
+
+/// The well-known event-bus emission (T10) for a terminal happening during `vt_write`:
+/// the typed machinery stays, the happening also reaches every session under its
+/// well-known name, and the emitter's own `terminal.on` handlers fire on the echo
+fn well_known_emit(id: PaneId, event: &LuaEvent) -> Option<wire::WireOp> {
+    let (name, payload) = match event {
+        LuaEvent::TitleChanged(title) => (
+            "title-changed",
+            serde_json::json!({ "pane": id.0, "title": title }),
+        ),
+        LuaEvent::Bell => ("bell", serde_json::json!({ "pane": id.0 })),
+    };
+    Some(wire::WireOp::Emit {
+        name: name.to_string(),
+        payload,
+        depth: 0,
+    })
 }
 
 /// Something that happened inside a terminal during `vt_write` that Lua hooks may care about.
@@ -168,6 +186,9 @@ pub struct App {
     /// Panes the attach reply reported as exited while this window was detached; processed
     /// once the event loop runs (drain, hook, close-or-hold)
     pub(crate) attach_exited: Vec<PaneId>,
+    /// Wire `Event`s that arrived while a handler was dispatching (T10): queued here and
+    /// run once the hook's commands finished, in arrival order
+    pub(crate) pending_events: VecDeque<(String, serde_json::Value, u8)>,
 }
 
 /// How often a starting window retries the server connection after spawning (and spawning) it
@@ -731,9 +752,57 @@ impl App {
                 Command::SendText(text) => self.write_to_pty(text.as_bytes()),
                 Command::Log(message) => eprintln!("[lua] {message}"),
                 Command::Perform(action) => self.perform(event_loop, action),
+                Command::Emit {
+                    name,
+                    payload,
+                    depth,
+                } => {
+                    self.conn.send_op(wire::WireOp::Emit {
+                        name,
+                        payload,
+                        depth,
+                    });
+                }
             }
         }
         self.in_hook = false;
+        // Events that arrived while a handler was dispatching run now, in arrival order
+        while let Some((name, payload, depth)) = self.pending_events.pop_front() {
+            self.dispatch_wire_event(event_loop, name, payload, depth);
+        }
+    }
+
+    /// A wire `Event` arrived (T10): the loop guard drops too-deep chains, events arriving
+    /// during a handler dispatch queue up, and the registered `terminal.on` handler runs
+    /// via the existing commands path (full actions, send_text and emit — viewer mutations
+    /// drop server-side per the S4 gating, which is the protection)
+    pub(crate) fn handle_wire_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        name: String,
+        payload: serde_json::Value,
+        depth: u8,
+    ) {
+        if depth >= wire::MAX_EVENT_DEPTH {
+            eprintln!("[events] dropping event {name:?} at depth {depth} (event loop guard)");
+            return;
+        }
+        if self.in_hook {
+            self.pending_events.push_back((name, payload, depth));
+            return;
+        }
+        self.dispatch_wire_event(event_loop, name, payload, depth);
+    }
+
+    fn dispatch_wire_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        name: String,
+        payload: serde_json::Value,
+        depth: u8,
+    ) {
+        let commands = self.script.fire_wire_event(&name, &payload, depth);
+        self.run_commands(event_loop, commands);
     }
 
     /// Calls an event's hook, if the configuration defines it
@@ -753,7 +822,7 @@ impl App {
     /// Dispatches what happened inside the terminals during `vt_write`
     pub(crate) fn dispatch_terminal_events(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok((id, event)) = self.lua_events.try_recv() {
-            match event {
+            match &event {
                 LuaEvent::TitleChanged(title) => {
                     // Usual terminal behavior: the window shows the title set by the focused pane's
                     // program, unless config.lua fixes one with `window.title`
@@ -761,12 +830,17 @@ impl App {
                         && id == self.layout.focus()
                         && let Some(window) = &self.window
                     {
-                        window.set_title(&title);
+                        window.set_title(title);
                     }
-                    let args = vec![self.script.text(&title)];
+                    let args = vec![self.script.text(title)];
                     self.fire_event(event_loop, EventKind::TitleChanged, args);
                 }
                 LuaEvent::Bell => self.fire_event(event_loop, EventKind::Bell, Vec::new()),
+            }
+            // The happening also rides the event bus (T10): the well-known name reaches
+            // every session, and the emitter's own `terminal.on` handlers fire on the echo
+            if let Some(op) = well_known_emit(id, &event) {
+                self.conn.send_op(op);
             }
         }
     }
@@ -855,6 +929,11 @@ impl App {
             Ok(()) => {
                 eprintln!("[config] reloaded");
                 self.fire_event(event_loop, EventKind::ConfigReloaded, Vec::new());
+                self.conn.send_op(wire::WireOp::Emit {
+                    name: "config-reloaded".to_string(),
+                    payload: serde_json::json!({}),
+                    depth: 0,
+                });
             }
             Err(error) => {
                 eprintln!("[config] {error} (keeping the previous configuration)");
@@ -1058,6 +1137,11 @@ impl App {
         // The last thing the shell wrote before exiting
         self.drain_pty(event_loop, id);
         self.fire_event(event_loop, EventKind::ShellExit, Vec::new());
+        self.conn.send_op(wire::WireOp::Emit {
+            name: "shell-exit".to_string(),
+            payload: serde_json::json!({ "pane": id.0 }),
+            depth: 0,
+        });
         match self.config.on_shell_exit {
             crate::config::ShellExit::Close => self.close_pane(id),
             crate::config::ShellExit::Hold => {
@@ -1223,6 +1307,15 @@ impl ApplicationHandler<UserEvent> for App {
             // Gating is server-side: a viewer's mutating ops are dropped there, so there is
             // nothing to change locally (it keeps rendering and sending ops)
             UserEvent::Layout(WireEventKind::DriverChanged { .. }) => {}
+            // The event bus (T10): a user-defined emission or a well-known happening — the
+            // registered `terminal.on` handler runs, driver or viewer alike (client-side)
+            UserEvent::Layout(WireEventKind::Event {
+                name,
+                payload,
+                depth,
+            }) => {
+                self.handle_wire_event(event_loop, name, payload, depth);
+            }
             // A gateway-only notice (another remote client holds the single remote slot): a
             // window never receives one, so there is nothing to do
             UserEvent::Layout(WireEventKind::Busy) => {}
@@ -1464,9 +1557,26 @@ pub fn run_window() {
         server: OpSender::new(conn),
         proxy,
         attach_exited,
+        pending_events: VecDeque::new(),
     };
 
     // 5. Main event loop
+    // Top-level `terminal.emit` calls during config evaluation queued commands: send them
+    // now (only emits can be queued outside a function call)
+    for command in app.script.take_commands() {
+        if let Command::Emit {
+            name,
+            payload,
+            depth,
+        } = command
+        {
+            app.conn.send_op(wire::WireOp::Emit {
+                name,
+                payload,
+                depth,
+            });
+        }
+    }
     let _ = event_loop.run_app(&mut app);
 }
 
@@ -1572,6 +1682,47 @@ pub fn cli_capture(args: &[String]) {
         });
         let _ = std::io::stdout().write_all(text.as_bytes());
     }
+}
+
+/// `terminal emit <name> [json-payload]`: emits a user event on the event bus. Fire-and-
+/// forget: the server broadcasts the event to every session (a CLI has no handlers, so its
+/// own echo is simply dropped) and no reply comes back. The payload must parse as JSON.
+pub fn cli_emit(args: &[String]) {
+    let (name, payload_text) = match args {
+        [name] => (name.clone(), "{}".to_string()),
+        [name, payload] => (name.clone(), payload.clone()),
+        _ => {
+            eprintln!("usage: terminal emit <name> [json-payload]");
+            std::process::exit(2);
+        }
+    };
+    if let Err(reason) = wire::validate_event_name(&name) {
+        eprintln!("terminal emit: {reason}");
+        std::process::exit(2);
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&payload_text) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("terminal emit: the payload is not valid JSON: {error}");
+            std::process::exit(2);
+        }
+    };
+    let size = serde_json::to_vec(&payload)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if size > wire::MAX_EVENT_PAYLOAD {
+        eprintln!(
+            "terminal emit: the payload is larger than {} bytes",
+            wire::MAX_EVENT_PAYLOAD
+        );
+        std::process::exit(2);
+    }
+    let conn = cli_conn();
+    conn.send_op(wire::WireOp::Emit {
+        name,
+        payload,
+        depth: 0,
+    });
 }
 
 /// `terminal attach <pane>`: subscribes the pane's block data channel (snapshot served first),

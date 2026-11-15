@@ -446,6 +446,10 @@ impl Server {
         match self.spawn_pane_block(pane, shell, false, cols, rows, scrollback) {
             Ok((block, notice)) => {
                 self.pane_grids.insert(pane, (cols, rows));
+                self.notify(
+                    "pane-created",
+                    serde_json::json!({ "pane": pane.0, "kind": "tiled" }),
+                );
                 let state = self.layout.as_ref().unwrap().state();
                 Ok((
                     state,
@@ -531,8 +535,15 @@ impl Server {
         let Some(layout) = self.layout.as_mut() else {
             return;
         };
+        let focus_before = layout.focus();
         if mutate(layout) {
             let state = layout.state();
+            // A focus change is a well-known happening too (T10): every focus path runs
+            // through here (set-focus, focus-dir, focus-cycle)
+            let focus = layout.focus();
+            if focus != focus_before {
+                self.notify("pane-focused", serde_json::json!({ "pane": focus.0 }));
+            }
             self.broadcast(state, None);
         }
     }
@@ -575,6 +586,12 @@ impl Server {
                         notice,
                     }),
                 );
+                self.notify(
+                    "pane-created",
+                    serde_json::json!({ "pane": pane.0, "kind": "tiled" }),
+                );
+                self.notify("split", serde_json::json!({ "pane": pane.0 }));
+                self.notify("pane-focused", serde_json::json!({ "pane": pane.0 }));
             }
             Err(error) => self.rollback_spawn(pane, error),
         }
@@ -610,6 +627,12 @@ impl Server {
                         notice,
                     }),
                 );
+                self.notify(
+                    "pane-created",
+                    serde_json::json!({ "pane": pane.0, "kind": "float" }),
+                );
+                self.notify("float-created", serde_json::json!({ "pane": pane.0 }));
+                self.notify("pane-focused", serde_json::json!({ "pane": pane.0 }));
             }
             Err(error) => self.rollback_spawn(pane, error),
         }
@@ -630,6 +653,8 @@ impl Server {
         let Some(layout) = self.layout.as_mut() else {
             return;
         };
+        // Read before the close: the float a subtree leaf belonged to disappears with it (T9)
+        let float = layout.float_of(pane);
         match layout.close(pane) {
             Closed::LastTiled => {
                 for block in self.blocks.values_mut() {
@@ -640,6 +665,7 @@ impl Server {
                 self.pane_grids.clear();
                 self.layout = None;
                 // A session that attaches after this gets a fresh server: the old one is gone
+                self.notify("last-pane-closed", serde_json::json!({}));
                 let _ = self.events.send(LayoutEvent::LastPaneClosed);
             }
             Closed::Pane => {
@@ -651,6 +677,12 @@ impl Server {
                 }
                 let state = layout.state();
                 self.broadcast(state, None);
+                self.notify("pane-closed", serde_json::json!({ "pane": pane.0 }));
+                // Closing the last pane of a float's subtree removes the whole float (T9):
+                // the well-known event names the float that ended
+                if let Some(float) = float {
+                    self.notify("float-closed", serde_json::json!({ "pane": float.0 }));
+                }
             }
             Closed::Unknown => {}
         }
@@ -658,7 +690,29 @@ impl Server {
 
     /// One state event per applied mutation
     fn broadcast(&self, state: LayoutState, created: Option<CreatedPane>) {
-        let _ = self.events.send(LayoutEvent::State(state, created));
+        let _ = self.events.send(LayoutEvent::State(state.clone(), created));
+        // Every applied mutation is also a well-known happening on the event bus (T10)
+        self.notify(
+            "layout-changed",
+            serde_json::json!({
+                "panes": state
+                    .pane_ids()
+                    .into_iter()
+                    .map(|pane| pane.0)
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    /// Broadcasts a well-known happening as a generic event-bus `Event` (T10): emitted at
+    /// the natural points alongside the typed machinery. Server-originated events are
+    /// fresh (depth 0), like a top-level emission.
+    fn notify(&self, name: &str, payload: serde_json::Value) {
+        let _ = self.events.send(LayoutEvent::Event(WireEventKind::Event {
+            name: name.to_string(),
+            payload,
+            depth: 0,
+        }));
     }
 
     /// Moves a block's output from its PTY to its client, feeding the server-side terminal on the
@@ -1298,6 +1352,10 @@ impl Session {
                     v: WIRE_VERSION,
                     event: WireEventKind::DriverChanged { is_driver: true },
                 }));
+                // The same happening rides the event bus (T10)
+                let _ = entry
+                    .msgs
+                    .send(SessionMsg::Event(driver_changed_event(true)));
             }
         }
     }
@@ -1451,6 +1509,49 @@ impl Session {
                         self.writer
                             .push_control(control_frame(&WireReply::automation_subscribed(rid)));
                     }
+                }
+                true
+            }
+            WireOp::Emit {
+                name,
+                payload,
+                depth,
+            } => {
+                // The event bus (T10): a notification, not a mutation — any session may
+                // emit, and the server is a pure router. The broadcast goes to every
+                // session, the emitter included: its own handlers fire on the echo.
+                if let Err(reason) = wire::validate_event_name(&name) {
+                    eprintln!("[server] dropped an emit: {reason}");
+                    return true;
+                }
+                let size = serde_json::to_vec(&payload)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(usize::MAX);
+                if size > wire::MAX_EVENT_PAYLOAD {
+                    eprintln!(
+                        "[server] dropped an emit of {name:?}: the payload is larger than {} bytes",
+                        wire::MAX_EVENT_PAYLOAD
+                    );
+                    return true;
+                }
+                if depth > wire::MAX_EVENT_DEPTH {
+                    eprintln!(
+                        "[server] dropped an emit of {name:?}: depth {depth} exceeds {}",
+                        wire::MAX_EVENT_DEPTH
+                    );
+                    return true;
+                }
+                let event = WireEvent {
+                    v: WIRE_VERSION,
+                    event: WireEventKind::Event {
+                        name,
+                        payload,
+                        depth: depth + 1,
+                    },
+                };
+                let sessions = self.shared.sessions.lock().unwrap();
+                for entry in sessions.values() {
+                    let _ = entry.msgs.send(SessionMsg::Event(event.clone()));
                 }
                 true
             }
@@ -1627,10 +1728,18 @@ impl Session {
             if entry.driver {
                 entry.driver = false;
                 let _ = entry.msgs.send(SessionMsg::Event(demoted.clone()));
+                // The same happening rides the event bus (T10), addressed to the session
+                // whose role changed
+                let _ = entry
+                    .msgs
+                    .send(SessionMsg::Event(driver_changed_event(false)));
             }
         }
         if let Some(entry) = sessions.get_mut(&self.conn) {
             entry.driver = true;
+            let _ = entry
+                .msgs
+                .send(SessionMsg::Event(driver_changed_event(true)));
         }
         drop(sessions);
         *self.shared.driver_area.lock().unwrap() = None;
@@ -1660,6 +1769,18 @@ impl Session {
     }
 }
 
+/// The event-bus form of a driver change (T10): the payload is the receiver's own role
+fn driver_changed_event(is_driver: bool) -> WireEvent {
+    WireEvent {
+        v: WIRE_VERSION,
+        event: WireEventKind::Event {
+            name: "driver-changed".to_string(),
+            payload: serde_json::json!({ "is_driver": is_driver }),
+            depth: 0,
+        },
+    }
+}
+
 /// Reads the server's layout events for the whole process. It fans every event out to the
 /// registry's sessions, owns the block views for the whole process — a creation parks its
 /// block there, and this router is the one reader of every block's output channel, so the
@@ -1669,6 +1790,10 @@ fn route_events(events: Receiver<LayoutEvent>, shared: Arc<ProcessShared>) {
     while let Ok(event) = events.recv() {
         let wire_event =
             wire::WireEvent::from_layout_event(&event).expect("every layout event travels");
+        let exited_pane = match &event {
+            LayoutEvent::PaneExited(pane) => Some(*pane),
+            _ => None,
+        };
         match event {
             LayoutEvent::State(state, created) => {
                 // A creation parks its block with the router: the block's output channel has
@@ -1706,11 +1831,28 @@ fn route_events(events: Receiver<LayoutEvent>, shared: Arc<ProcessShared>) {
                 // event too, and a later one marks the pane dead on attach
                 shared.exited.lock().unwrap().push(pane);
             }
-            LayoutEvent::Error(_) => {}
+            LayoutEvent::Event(_) | LayoutEvent::Error(_) => {}
         }
         let sessions = shared.sessions.lock().unwrap();
         for entry in sessions.values() {
             let _ = entry.msgs.send(SessionMsg::Event(wire_event.clone()));
+        }
+        drop(sessions);
+        // A pane's program exiting is also a well-known happening (T10): shell-exit rides
+        // the event bus right behind the typed notice
+        if let Some(pane) = exited_pane {
+            let shell_exit = WireEvent {
+                v: WIRE_VERSION,
+                event: WireEventKind::Event {
+                    name: "shell-exit".to_string(),
+                    payload: serde_json::json!({ "pane": pane.0 }),
+                    depth: 0,
+                },
+            };
+            let sessions = shared.sessions.lock().unwrap();
+            for entry in sessions.values() {
+                let _ = entry.msgs.send(SessionMsg::Event(shell_exit.clone()));
+            }
         }
     }
 }

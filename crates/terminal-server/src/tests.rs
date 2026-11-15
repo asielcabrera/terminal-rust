@@ -89,7 +89,9 @@ fn wait_layout(events: &Receiver<LayoutEvent>) -> LayoutEvent {
     let deadline = Instant::now() + Duration::from_secs(10);
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match events.recv_timeout(left) {
-            Ok(LayoutEvent::PaneOutput(_) | LayoutEvent::PaneExited(_)) => continue,
+            Ok(LayoutEvent::PaneOutput(_) | LayoutEvent::PaneExited(_) | LayoutEvent::Event(_)) => {
+                continue;
+            }
             Ok(event) => return event,
             Err(_) => break,
         }
@@ -2152,6 +2154,204 @@ fn resize_op(pane: PaneId, area: Rect) -> WireOp {
             min_h: 60,
         },
     }
+}
+
+// ---- The event bus (T10) ------------------------------------------------------------------
+
+/// Waits for a generic `Event` with the wanted name, skipping every other event
+#[cfg(unix)]
+fn wait_event(events: &Receiver<WireEventKind>, name: &str) -> (serde_json::Value, u8) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match events.recv_timeout(left) {
+            Ok(WireEventKind::Event {
+                name: got,
+                payload,
+                depth,
+            }) if got == name => {
+                return (payload, depth);
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    panic!("no event {name:?} arrived");
+}
+
+/// Fails if an `Event` with `name` arrives within the window; every other event is skipped
+#[cfg(unix)]
+fn assert_no_event(events: &Receiver<WireEventKind>, name: &str, window: Duration) {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok(WireEventKind::Event { name: got, .. }) if got == name => {
+                panic!("a rejected emit must not broadcast, but {name:?} arrived")
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn an_emit_broadcasts_to_every_session_including_the_emitter() {
+    let harness = Harness::start();
+    let (driver, driver_events) = harness.client();
+    attach_fresh(&driver);
+    let (viewer, viewer_events) = harness.client();
+    attach_existing(&viewer);
+
+    // Emitting is a notification, not a mutation: any session may emit (not driver-gated)
+    viewer.send_op(wire::WireOp::Emit {
+        name: "user.joined".to_string(),
+        payload: serde_json::json!({ "who": "viewer" }),
+        depth: 0,
+    });
+    let (payload, depth) = wait_event(&driver_events, "user.joined");
+    assert_eq!(payload, serde_json::json!({ "who": "viewer" }));
+    assert_eq!(depth, 1, "the server stamps the echo one level deeper");
+    let (payload, depth) = wait_event(&viewer_events, "user.joined");
+    assert_eq!(payload, serde_json::json!({ "who": "viewer" }));
+    assert_eq!(
+        depth, 1,
+        "the emitter hears its own echo (its handlers fire on it)"
+    );
+
+    // And a driver's emit reaches the viewer too
+    driver.send_op(wire::WireOp::Emit {
+        name: "user.ping".to_string(),
+        payload: serde_json::json!(null),
+        depth: 0,
+    });
+    wait_event(&driver_events, "user.ping");
+    wait_event(&viewer_events, "user.ping");
+    driver.close();
+    viewer.close();
+    harness.wait_no_sessions();
+}
+
+#[test]
+#[cfg(unix)]
+fn invalid_emits_are_dropped_without_a_broadcast() {
+    let harness = Harness::start();
+    let (client, events) = harness.client();
+    attach_fresh(&client);
+
+    let rejected = [
+        wire::WireOp::Emit {
+            name: String::new(),
+            payload: serde_json::json!({}),
+            depth: 0,
+        },
+        wire::WireOp::Emit {
+            name: "a".repeat(65),
+            payload: serde_json::json!({}),
+            depth: 0,
+        },
+        wire::WireOp::Emit {
+            name: "bad name".to_string(),
+            payload: serde_json::json!({}),
+            depth: 0,
+        },
+        wire::WireOp::Emit {
+            name: "bad/name".to_string(),
+            payload: serde_json::json!({}),
+            depth: 0,
+        },
+        wire::WireOp::Emit {
+            name: "user.ok".to_string(),
+            payload: serde_json::json!({ "blob": "x".repeat(64 * 1024) }),
+            depth: 0,
+        },
+        wire::WireOp::Emit {
+            name: "user.ok".to_string(),
+            payload: serde_json::json!({}),
+            depth: 17,
+        },
+    ];
+    for op in rejected {
+        client.send_op(op);
+    }
+    assert_no_event(&events, "user.ok", Duration::from_millis(500));
+    client.close();
+    harness.wait_no_sessions();
+}
+
+#[test]
+#[cfg(unix)]
+fn well_known_happenings_broadcast_as_generic_events() {
+    let harness = Harness::start();
+    let (driver, events) = harness.client();
+    let created = attach_fresh(&driver);
+
+    // A split announces the creation, the split, the focus, and the layout change
+    driver.send_op(wire::WireOp::Split {
+        pane: created.pane,
+        dir: terminal_protocol::layout::Dir::Right,
+        shell: wire::WireShell::from_config(&waiting()),
+        explicit: false,
+        cols: 40,
+        rows: 20,
+        scrollback: 1000,
+        area: Rect::new(0, 0, 800, 600),
+        limits: Limits {
+            min_w: 80,
+            min_h: 60,
+        },
+    });
+    let (payload, depth) = wait_event(&events, "layout-changed");
+    assert_eq!(depth, 0, "server-originated events are fresh");
+    let panes = payload
+        .get("panes")
+        .and_then(|panes| panes.as_array())
+        .expect("panes");
+    assert_eq!(panes.len(), 2, "both panes are listed: {panes:?}");
+    let (payload, _) = wait_event(&events, "pane-created");
+    assert_eq!(payload, serde_json::json!({ "pane": 1, "kind": "tiled" }));
+    let (payload, _) = wait_event(&events, "split");
+    assert_eq!(payload, serde_json::json!({ "pane": 1 }));
+    let (payload, _) = wait_event(&events, "pane-focused");
+    assert_eq!(
+        payload,
+        serde_json::json!({ "pane": 1 }),
+        "the split focused the new pane"
+    );
+
+    // A floating pane announces its kind and its own event
+    driver.send_op(wire::WireOp::AddFloat {
+        shell: wire::WireShell::from_config(&waiting()),
+        explicit: false,
+        env: Default::default(),
+        width: 0.5,
+        height: 0.5,
+        cols: 40,
+        rows: 20,
+        scrollback: 1000,
+    });
+    let (payload, _) = wait_event(&events, "pane-created");
+    assert_eq!(payload, serde_json::json!({ "pane": 2, "kind": "float" }));
+    let (payload, _) = wait_event(&events, "float-created");
+    assert_eq!(payload, serde_json::json!({ "pane": 2 }));
+
+    // Closing announces the pane, and a float's end announces the float (pane-closed first,
+    // matching the emission order — wait_event consumes what it skips)
+    driver.send_op(wire::WireOp::Close { pane: PaneId(2) });
+    let (payload, _) = wait_event(&events, "pane-closed");
+    assert_eq!(payload, serde_json::json!({ "pane": 2 }));
+    let (payload, _) = wait_event(&events, "float-closed");
+    assert_eq!(payload, serde_json::json!({ "pane": 2 }));
+
+    // Closing the last tiled pane announces the end of the layout
+    driver.send_op(wire::WireOp::Close { pane: PaneId(1) });
+    wait_event(&events, "pane-closed");
+    driver.send_op(wire::WireOp::Close { pane: PaneId(0) });
+    let (_, _) = wait_event(&events, "last-pane-closed");
+    driver.close();
+    harness.wait_no_sessions();
 }
 
 #[test]

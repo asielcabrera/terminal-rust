@@ -24,6 +24,37 @@ pub const WIRE_VERSION: u32 = 1;
 /// with room to spare; anything larger is a corrupt length prefix, never a message.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+/// Largest serialized payload of an event-bus event (T10): a rejected emit is dropped
+/// with a log, never broadcast.
+pub const MAX_EVENT_PAYLOAD: usize = 64 * 1024;
+
+/// Deepest emit accepted (T10's loop guard): the server drops deeper emits, and stamps
+/// one level deeper into every broadcast so a handler chain dies out.
+pub const MAX_EVENT_DEPTH: u8 = 16;
+
+/// Whether `name` may travel as an event-bus event name: non-empty, at most 64 characters,
+/// and only letters, digits, `.`, `_` and `-`.
+pub fn validate_event_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("the event name is empty".to_string());
+    }
+    if name.len() > 64 {
+        return Err(format!(
+            "the event name is longer than 64 characters ({})",
+            name.len()
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "the event name {name:?} may only use letters, digits, '.', '_' and '-'"
+        ));
+    }
+    Ok(())
+}
+
 /// One request. A session (or a window) sends exactly one of these per wire op; attach is
 /// the one the wire adds: a fresh server runs init, an attached one hands over its state
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +179,19 @@ pub enum WireOp {
     /// snapshot is queued first, then the session starts receiving live bytes
     AutomationSubscribe {
         block: BlockId,
+    },
+    /// An event-bus emission (`terminal.emit` in Lua, `terminal emit` on the CLI, and the
+    /// client's well-known happenings): fire-and-forget, no rid. The server is a pure
+    /// router: it validates and broadcasts one `Event` to every session, the emitter
+    /// included — its own handlers fire on the echo. Not driver-gated: a notification is
+    /// not a mutation (T10 design, locked 2026-11-12)
+    Emit {
+        name: String,
+        payload: serde_json::Value,
+        /// Loop-guard stamp: a handler's `ctx.emit` sends its own event's depth + 1, a
+        /// top-level emit sends 0. Additive: old JSON without the field reads as 0.
+        #[serde(default)]
+        depth: u8,
     },
 }
 
@@ -393,7 +437,8 @@ impl WireOp {
             Self::AutomationList {}
             | Self::Send { .. }
             | Self::Capture { .. }
-            | Self::AutomationSubscribe { .. } => return None,
+            | Self::AutomationSubscribe { .. }
+            | Self::Emit { .. } => return None,
         };
         Some(request)
     }
@@ -618,6 +663,7 @@ impl WireEvent {
             },
             LayoutEvent::PaneOutput(pane) => WireEventKind::PaneOutput { pane: *pane },
             LayoutEvent::PaneExited(pane) => WireEventKind::PaneExited { pane: *pane },
+            LayoutEvent::Event(event) => event.clone(),
         };
         Some(Self {
             v: WIRE_VERSION,
@@ -653,6 +699,16 @@ pub enum WireEventKind {
     /// the gateway's single remote slot, and the connection closes right after. A window
     /// never receives one.
     Busy,
+    /// An event-bus event (T10): a user-defined emission or a well-known happening
+    /// (`pane-created`, `bell`, ...), broadcast to every session — the emitter included,
+    /// whose own handlers fire on the echo. `depth` is the loop-guard stamp; additive,
+    /// old JSON without it reads as 0.
+    Event {
+        name: String,
+        payload: serde_json::Value,
+        #[serde(default)]
+        depth: u8,
+    },
 }
 
 /// What decoding a frame can answer with
@@ -735,3 +791,73 @@ pub fn deframe_json<T: serde::de::DeserializeOwned>(
 
 /// The WebSocket transport the gateway serves remote clients over
 pub mod ws;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emit_ops_round_trip_and_load_without_depth() {
+        let op = WireOp::Emit {
+            name: "user.joined".to_string(),
+            payload: serde_json::json!({ "who": "cli" }),
+            depth: 2,
+        };
+        let bytes = serde_json::to_vec(&op).unwrap();
+        let round: WireOp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(round, op);
+        // Additive: old JSON without the depth field reads as depth 0
+        let old: WireOp =
+            serde_json::from_str(r#"{"op":"emit","name":"user.joined","payload":{}}"#).unwrap();
+        assert_eq!(
+            old,
+            WireOp::Emit {
+                name: "user.joined".to_string(),
+                payload: serde_json::json!({}),
+                depth: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn event_kinds_round_trip_and_load_without_depth() {
+        let event = WireEventKind::Event {
+            name: "bell".to_string(),
+            payload: serde_json::json!({ "pane": 3 }),
+            depth: 1,
+        };
+        let bytes = serde_json::to_vec(&event).unwrap();
+        let round: WireEventKind = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(round, event);
+        // Additive: old JSON without the depth field reads as depth 0
+        let old: WireEventKind =
+            serde_json::from_str(r#"{"event":"event","name":"bell","payload":{}}"#).unwrap();
+        assert_eq!(
+            old,
+            WireEventKind::Event {
+                name: "bell".to_string(),
+                payload: serde_json::json!({}),
+                depth: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn event_names_are_validated() {
+        assert_eq!(validate_event_name("user.joined_x-2"), Ok(()));
+        assert_eq!(validate_event_name(&"a".repeat(64)), Ok(()));
+        assert!(validate_event_name("").is_err(), "empty names are refused");
+        assert!(
+            validate_event_name(&"a".repeat(65)).is_err(),
+            "names longer than 64 characters are refused"
+        );
+        assert!(
+            validate_event_name("bad name").is_err(),
+            "spaces are refused"
+        );
+        assert!(
+            validate_event_name("bad/name").is_err(),
+            "slashes are refused"
+        );
+    }
+}
