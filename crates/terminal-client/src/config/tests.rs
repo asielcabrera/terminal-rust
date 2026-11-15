@@ -1256,8 +1256,13 @@ fn init_lua_is_preferred_over_the_legacy_config_lua() {
     )
     .unwrap();
 
-    // SAFETY: test-only env mutation; no other threads read the env during this test
+    // SAFETY: test-only env mutation; no other threads read the env during this test.
+    // config_path() resolves from APPDATA on Windows and XDG_CONFIG_HOME elsewhere — set
+    // the one each platform reads (and clear TERMINAL_CONFIG, which overrides both).
     unsafe {
+        #[cfg(windows)]
+        std::env::set_var("APPDATA", &dir);
+        #[cfg(not(windows))]
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         std::env::remove_var("TERMINAL_CONFIG");
     }
@@ -1271,6 +1276,9 @@ fn init_lua_is_preferred_over_the_legacy_config_lua() {
     std::fs::remove_file(base.join("init.lua")).unwrap();
     // SAFETY: test-only env mutation
     unsafe {
+        #[cfg(windows)]
+        std::env::set_var("APPDATA", &dir);
+        #[cfg(not(windows))]
         std::env::set_var("XDG_CONFIG_HOME", &dir);
     }
     let path = config_path().expect("the legacy path resolves");
