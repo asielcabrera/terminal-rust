@@ -850,7 +850,9 @@ fn the_exit_is_notified_after_all_the_output_was_forwarded() {
 // tests pin the JSON round trip so stage 3 can reuse the mapping without behavior drift.
 
 use serde::{Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::HashMap;
 use terminal_protocol::layout::Axis;
 use wire::{
     Deframed, IpcCreatedPane, WIRE_VERSION, WireEvent, WireEventKind, WireOp, WireReply,

@@ -16,7 +16,8 @@
 //! The server-side terminal never answers the program's queries: the client's terminal does,
 //! through [`PaneIo::write`], exactly as with a local PTY.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
