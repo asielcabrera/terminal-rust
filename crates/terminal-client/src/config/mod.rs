@@ -1,4 +1,4 @@
-//! Lua configuration loading: `config.lua` to [`Config`], plus the [`Script`] (keys, hooks,
+//! Lua configuration loading: `init.lua` (or the legacy `config.lua`) to [`Config`], plus the [`Script`] (keys, hooks,
 //! and the Lua interpreter) that travels with it.
 //!
 //! The configuration *structures* live in `terminal-protocol` (both the window and the server
@@ -22,8 +22,9 @@ pub struct Loaded {
     pub path: Option<PathBuf>,
 }
 
-/// `TERMINAL_CONFIG`, or `%APPDATA%\terminal\config.lua` on Windows, or
-/// `$XDG_CONFIG_HOME`/`~/.config` + `terminal/config.lua` elsewhere.
+/// `TERMINAL_CONFIG`, or `terminal/init.lua` (a Lua module: it can `require` other files in
+/// its folder) under `%APPDATA%` on Windows or `$XDG_CONFIG_HOME`/`~/.config` elsewhere,
+/// falling back to the legacy `terminal/config.lua` when no `init.lua` exists.
 pub fn config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("TERMINAL_CONFIG") {
         return Some(PathBuf::from(path));
@@ -34,7 +35,13 @@ pub fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    base.map(|base| base.join("terminal").join("config.lua"))
+    let base = base?.join("terminal");
+    let init = base.join("init.lua");
+    if init.exists() {
+        return Some(init);
+    }
+    let legacy = base.join("config.lua");
+    legacy.exists().then_some(legacy)
 }
 
 pub fn load() -> Loaded {
@@ -62,7 +69,7 @@ pub fn load() -> Loaded {
     }
 }
 
-/// The factory configuration (that of a file returning an empty table): including its
+/// The factory configuration (a file returning an empty table): including its
 /// default keys and its leader
 fn default_script() -> Result<(Config, Script), String> {
     parse_script("return {}", "config.lua", None)
@@ -89,7 +96,7 @@ pub fn parse(source: &str, chunk_name: &str, dir: Option<&Path>) -> Result<Confi
     parse_script(source, chunk_name, dir).map(|(config, _script)| config)
 }
 
-/// Evaluates `source` (the contents of config.lua) and turns it into [`Config`] plus the [`Script`]
+/// Evaluates `source` (the contents of the config file) and turns it into [`Config`] plus the [`Script`]
 /// with its keys and hooks. `dir` is the folder `require` searches for modules.
 pub fn parse_script(
     source: &str,
@@ -150,7 +157,7 @@ pub fn parse_script(
     Ok((config, script))
 }
 
-/// Native actions bound to a key from config.lua (`terminal.action.Paste`...). They are
+/// Native actions bound to a key from the config (`terminal.action.Paste`...). They are
 /// tables with an `action` key, which `actions::parse_action` turns into [`actions::Action`].
 const ACTION_PRELUDE: &str = r#"
 local action = {}

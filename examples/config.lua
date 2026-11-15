@@ -1,7 +1,8 @@
 -- Example configuration. Copy it to:
---   Windows : %APPDATA%\terminal\config.lua
---   Others  : ~/.config/terminal/config.lua  (or $XDG_CONFIG_HOME/terminal/config.lua)
+--   Windows : %APPDATA%\terminal\init.lua
+--   Others  : ~/.config/terminal/init.lua  (or $XDG_CONFIG_HOME/terminal/init.lua)
 -- or point to another file with the TERMINAL_CONFIG environment variable.
+-- The legacy name config.lua still works if no init.lua exists.
 --
 -- The file is watched: saving it live-reloads the font, size, padding, colors, cursor, title,
 -- keys and hooks. If it has an error, the previous configuration is kept and the window title

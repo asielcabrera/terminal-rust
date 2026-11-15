@@ -1239,3 +1239,48 @@ fn the_kitty_storage_limit_defaults_to_512_mebibytes_and_is_read_from_the_config
     let error = parse_str("return { gruaphics = {} }").unwrap_err();
     assert!(error.contains("gruaphics"), "{error}");
 }
+
+#[test]
+fn init_lua_is_preferred_over_the_legacy_config_lua() {
+    let dir = std::env::temp_dir().join(format!("t-config-resolve-{}", std::process::id()));
+    let base = dir.join("terminal");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("config.lua"),
+        "return { window = { title = \"legacy\" } }",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("init.lua"),
+        "return { window = { title = \"init\" } }",
+    )
+    .unwrap();
+
+    // SAFETY: test-only env mutation; no other threads read the env during this test
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::remove_var("TERMINAL_CONFIG");
+    }
+    let path = config_path().expect("the config path resolves");
+    assert_eq!(path, base.join("init.lua"));
+    let loaded = load();
+    assert_eq!(loaded.path, Some(base.join("init.lua")));
+    assert_eq!(loaded.config.window.title.as_deref(), Some("init"));
+
+    // Without init.lua the legacy config.lua is the fallback
+    std::fs::remove_file(base.join("init.lua")).unwrap();
+    // SAFETY: test-only env mutation
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+    }
+    let path = config_path().expect("the legacy path resolves");
+    assert_eq!(path, base.join("config.lua"));
+    let loaded = load();
+    assert_eq!(loaded.config.window.title.as_deref(), Some("legacy"));
+
+    // SAFETY: test-only env cleanup
+    unsafe {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
