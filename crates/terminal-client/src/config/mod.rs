@@ -97,7 +97,13 @@ pub fn parse_script(
     dir: Option<&Path>,
 ) -> Result<(Config, Script), String> {
     let mut script = Script::new().map_err(|e| lua_message(&e))?;
-    prepare(script.lua(), dir, &script.commands_handle()).map_err(|e| lua_message(&e))?;
+    prepare(
+        script.lua(),
+        dir,
+        &script.event_registry_handle(),
+        &script.commands_handle(),
+    )
+    .map_err(|e| lua_message(&e))?;
 
     let value: Value = script
         .lua()
@@ -170,11 +176,13 @@ end
 return action
 "#;
 
-/// What `config.lua` has at hand besides the Lua standard library. `commands` is the
-/// script's command queue: `terminal.emit` queues onto it like the ctx methods.
+/// What `config.lua` has at hand besides the Lua standard library. `registry` is the
+/// `terminal.on` registration list and `commands` the script's command queue: both queue
+/// onto handles the script owns, like the ctx methods do.
 fn prepare(
     lua: &Lua,
     dir: Option<&Path>,
+    registry: &crate::actions::EventRegistry,
     commands: &std::rc::Rc<std::cell::RefCell<Vec<crate::actions::Command>>>,
 ) -> mlua::Result<()> {
     let terminal = lua.create_table()?;
@@ -192,8 +200,8 @@ fn prepare(
             Ok(())
         })?,
     )?;
-    // The event bus (T10): `terminal.on` and `terminal.emit`
-    crate::actions::install_event_api(lua, &terminal, commands)?;
+    // The event bus (T10): `terminal.on` and `terminal.emit`; patterns + priority are T11
+    crate::actions::install_event_api(lua, &terminal, registry, commands)?;
 
     if let Some(dir) = dir {
         let dir = dir.display().to_string().replace('\\', "/");

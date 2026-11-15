@@ -773,9 +773,10 @@ impl App {
     }
 
     /// A wire `Event` arrived (T10): the loop guard drops too-deep chains, events arriving
-    /// during a handler dispatch queue up, and the registered `terminal.on` handler runs
-    /// via the existing commands path (full actions, send_text and emit — viewer mutations
-    /// drop server-side per the S4 gating, which is the protection)
+    /// during a handler dispatch queue up, and every `terminal.on` handler whose pattern
+    /// matches (priority ascending, ties in registration order — T11) runs via the existing
+    /// commands path (full actions, send_text and emit — viewer mutations drop server-side
+    /// per the S4 gating, which is the protection)
     pub(crate) fn handle_wire_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -801,6 +802,8 @@ impl App {
         payload: serde_json::Value,
         depth: u8,
     ) {
+        // fire_wire_event sorts the matching handlers (priority, then registration order)
+        // and returns all their commands; run_commands executes them in that order
         let commands = self.script.fire_wire_event(&name, &payload, depth);
         self.run_commands(event_loop, commands);
     }

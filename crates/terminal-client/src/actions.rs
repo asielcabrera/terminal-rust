@@ -139,10 +139,54 @@ pub enum Command {
     },
 }
 
-/// Where the `terminal.on` registry lives: a Lua table in the interpreter's globals,
-/// keyed by event name. Handlers are Lua functions, so the registry is Lua-side; the
-/// dispatch path reads it back through [`Script::event_handler`].
-const EVENT_HANDLERS: &str = "__terminal_event_handlers";
+/// Where the `terminal.on` registry lives: a shared vector of registrations (T11). Handlers
+/// are Lua functions, so the registry lives with the script on the UI thread; the `on`
+/// closure installed by [`install_event_api`] and the dispatch path ([`Script::fire_wire_event`])
+/// share it through this handle, exactly like the command queue.
+#[derive(Clone, Default)]
+pub(crate) struct EventRegistry(Rc<RefCell<Vec<EventRegistration>>>);
+
+/// One `terminal.on` registration: a glob `pattern` over event names (exact names are their
+/// own exact match), the handler function, its dispatch priority (lower runs first), and
+/// the registration sequence (ties in priority fire in registration order).
+struct EventRegistration {
+    pattern: String,
+    function: Function,
+    priority: i64,
+    seq: u64,
+}
+
+/// Glob matching over event names, nvim-autocmd style: `*` matches any run of zero or more
+/// characters (dots included, so `deploy.*.done` spans segments), `?` matches exactly one
+/// character. A pattern without glob characters matches exactly. Backtracking is the classic
+/// star loop: on mismatch, the last `*` swallows one more character and retries.
+pub(crate) fn pattern_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_n = 0usize;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            star_n = n;
+            p += 1;
+        } else if let Some(star_p) = star {
+            p = star_p + 1;
+            star_n += 1;
+            n = star_n;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
 
 /// Turns a Lua payload into JSON for the wire. `nil` is an empty payload.
 fn payload_to_json(lua: &Lua, value: Value) -> mlua::Result<serde_json::Value> {
@@ -161,27 +205,58 @@ fn payload_to_json(lua: &Lua, value: Value) -> mlua::Result<serde_json::Value> {
     }
 }
 
-/// Installs the event-bus API on the `terminal` table (T10): `terminal.on(name, fn)`
-/// registers a handler for an exact event name (replacing any prior one; `nil`
-/// unregisters), and `terminal.emit(name, payload_table)` emits with depth 0. Called from
-/// config loading, with the same command queue the ctx methods use.
+/// Installs the event-bus API on the `terminal` table (T10): `terminal.on(pattern, fn)`
+/// registers a handler (replacing any prior one with the same pattern in place, keeping its
+/// registration order; `nil` unregisters), and `terminal.emit(name, payload_table)` emits
+/// with depth 0. The priority amendment (T11): an optional third integer argument, default
+/// 0 — handlers dispatch sorted by priority ascending, ties by registration order.
 pub(crate) fn install_event_api(
     lua: &Lua,
     terminal: &Table,
+    registry: &EventRegistry,
     commands: &Rc<RefCell<Vec<Command>>>,
 ) -> mlua::Result<()> {
-    let handlers = lua.create_table()?;
-    lua.globals().set(EVENT_HANDLERS, handlers.clone())?;
+    let registry = registry.clone();
     terminal.set(
         "on",
         lua.create_function(
-            move |_, (name, handler): (String, Value)| -> mlua::Result<()> {
+            move |_, (pattern, handler, priority): (String, Value, Value)| -> mlua::Result<()> {
+                let priority = match priority {
+                    Value::Nil => 0,
+                    Value::Integer(number) => number,
+                    Value::Number(number) if number.fract() == 0.0 => number as i64,
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "terminal.on priority must be an integer (got {})",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let mut registry = registry.0.borrow_mut();
                 match handler {
                     Value::Nil => {
-                        handlers.set(name, Value::Nil)?;
+                        registry.retain(|entry| entry.pattern != pattern);
                     }
                     Value::Function(function) => {
-                        handlers.set(name, function)?;
+                        if let Some(existing) =
+                            registry.iter_mut().find(|entry| entry.pattern == pattern)
+                        {
+                            // Replaces the handler (and priority) in place: the original
+                            // registration order is kept, so ties stay stable across reloads
+                            // of the same pattern
+                            existing.function = function;
+                            existing.priority = priority;
+                        } else {
+                            let seq = registry
+                                .last()
+                                .map_or(0, |entry| entry.seq.saturating_add(1));
+                            registry.push(EventRegistration {
+                                pattern,
+                                function,
+                                priority,
+                                seq,
+                            });
+                        }
                     }
                     other => {
                         return Err(mlua::Error::runtime(format!(
@@ -702,6 +777,7 @@ pub struct Script {
     events: Events,
     ctx: Table,
     commands: Rc<RefCell<Vec<Command>>>,
+    event_registry: EventRegistry,
     deadline: Rc<Cell<Instant>>,
 }
 
@@ -738,6 +814,7 @@ impl Script {
             events: Events::default(),
             ctx,
             commands,
+            event_registry: EventRegistry::default(),
             deadline,
         })
     }
@@ -826,34 +903,54 @@ impl Script {
         self.commands.clone()
     }
 
+    /// The handle on the `terminal.on` registry, for the config loader to install `terminal.on`
+    /// with (the registry lives as long as the script)
+    pub(crate) fn event_registry_handle(&self) -> EventRegistry {
+        self.event_registry.clone()
+    }
+
     /// What queued since the last drain (top-level `terminal.emit` calls during config
     /// evaluation queue here)
     pub fn take_commands(&self) -> Vec<Command> {
         self.commands.borrow_mut().drain(..).collect()
     }
 
-    /// Whether a `terminal.on` handler is registered for the event name
+    /// Whether any `terminal.on` registration's pattern matches the event name
     pub fn has_event_handler(&self, name: &str) -> bool {
-        self.event_handler(name).is_some()
+        self.event_registry
+            .0
+            .borrow()
+            .iter()
+            .any(|entry| pattern_matches(&entry.pattern, name))
     }
 
-    /// The handler registered with `terminal.on` for an event name, if any
-    pub fn event_handler(&self, name: &str) -> Option<Function> {
-        let handlers: Table = self.lua.globals().get(EVENT_HANDLERS).ok()?;
-        handlers.get(name).ok()
-    }
-
-    /// Calls the `terminal.on` handler for a wire `Event` (T10): the payload becomes a Lua
-    /// table, `ctx` gains the event's coordinates (`ctx.event.name`, `ctx.event.payload`,
-    /// `ctx.depth`), and the payload travels as the second argument. A handler's commands
-    /// run like any hook's (`run_commands`); emits chain one level deeper via `ctx.emit`.
+    /// Fires a wire `Event` (T10/T11): every handler whose pattern matches the event name
+    /// runs — exact handlers and pattern handlers coexist — sorted by priority ascending
+    /// (lower first), ties in registration order. The payload becomes a Lua table, `ctx`
+    /// gains the event's coordinates (`ctx.event.name`, `ctx.event.payload`, `ctx.depth`),
+    /// and the payload travels as the second argument. Handlers' commands run like any
+    /// hook's (`run_commands`), in dispatch order; emits chain one level deeper via `ctx.emit`.
+    ///
+    /// The sort happens HERE, at dispatch time, not at registration time: an event that
+    /// queued during another handler's dispatch (`App::pending_events`) is matched and
+    /// sorted against the registry as it stands when it actually runs, so a handler
+    /// registered since keeps its slot in the ordering.
     pub fn fire_wire_event(
         &self,
         name: &str,
         payload: &serde_json::Value,
         depth: u8,
     ) -> Vec<Command> {
-        let Some(handler) = self.event_handler(name) else {
+        let handlers: Vec<Function> = {
+            let registry = self.event_registry.0.borrow();
+            let mut matched: Vec<&EventRegistration> = registry
+                .iter()
+                .filter(|entry| pattern_matches(&entry.pattern, name))
+                .collect();
+            matched.sort_by_key(|entry| (entry.priority, entry.seq));
+            matched.iter().map(|entry| entry.function.clone()).collect()
+        };
+        if handlers.is_empty() {
             return Vec::new();
         };
         let payload_value = match self.lua.to_value(payload) {
@@ -869,7 +966,11 @@ impl Script {
             let _ = self.ctx.set("event", event);
         }
         let _ = self.ctx.set("depth", depth);
-        self.call(&handler, vec![payload_value])
+        let mut commands = Vec::new();
+        for handler in &handlers {
+            commands.extend(self.call(handler, vec![payload_value.clone()]));
+        }
+        commands
     }
 
     /// A string as a Lua value, to pass as an argument to a hook
@@ -1093,7 +1194,13 @@ mod tests {
     fn script_with_event_api() -> Script {
         let script = Script::new().unwrap();
         let terminal = script.lua().create_table().unwrap();
-        install_event_api(script.lua(), &terminal, &script.commands_handle()).unwrap();
+        install_event_api(
+            script.lua(),
+            &terminal,
+            &script.event_registry_handle(),
+            &script.commands_handle(),
+        )
+        .unwrap();
         script.lua().globals().set("terminal", terminal).unwrap();
         script
     }
@@ -1175,6 +1282,192 @@ mod tests {
             [Command::Emit { name, payload, depth }]
                 if name == "user.top" && *depth == 0 && payload == &serde_json::json!({ "n": 1 })
         ));
+    }
+
+    // ---- The event patterns + priority amendment (T11) -----------------------------------
+
+    #[test]
+    fn the_glob_matches_exact_prefix_star_suffix_star_and_middle_star() {
+        // `*` matches any run of zero or more characters (dots included); a pattern without
+        // glob characters matches exactly
+        let cases = [
+            // Exact matches, and near misses
+            ("user.deploy", "user.deploy", true),
+            ("user.deploy", "user.deployx", false),
+            ("user.deploy", "user", false),
+            ("user.deploy", "", false),
+            // Prefix star
+            ("user.*", "user.deploy", true),
+            ("user.*", "user.build", true),
+            ("user.*", "user.other", true),
+            ("user.*", "user.", true),
+            ("user.*", "user", false),
+            ("user.*", "userx.y", false),
+            // Suffix star
+            ("*.done", "deploy.build.done", true),
+            ("*.done", ".done", true),
+            ("*.done", "done", false),
+            // Middle star (crosses dot segments)
+            ("deploy.*.done", "deploy.build.done", true),
+            ("deploy.*.done", "deploy..done", true),
+            ("deploy.*.done", "deploy.build.test.done", true),
+            ("deploy.*.done", "deploy.done", false),
+            ("deploy.*.done", "deploy.build.done2", false),
+            // Star-only
+            ("*", "anything", true),
+            ("*", "user.deploy", true),
+            ("*", "", true),
+        ];
+        for (pattern, name, expected) in cases {
+            assert_eq!(
+                pattern_matches(pattern, name),
+                expected,
+                "pattern {pattern:?} vs name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_glob_question_mark_matches_exactly_one_character() {
+        let cases = [
+            ("user.?", "user.a", true),
+            ("user.?", "user.9", true),
+            ("user.?", "user.", false),
+            ("user.?", "user.ab", false),
+            ("user.?", "user", false),
+            ("user.?x", "user.ax", true),
+            ("??", "ab", true),
+            ("??", "abc", false),
+            ("??", "a", false),
+            ("?", "", false),
+            ("a?c", "abc", true),
+            ("a?c", "ac", false),
+            ("a?c", "axxc", false),
+            // Stars and question marks combine
+            ("user.*.?", "user.deploy.a", true),
+            ("user.*.?", "user.a", false),
+            ("a*b?", "axb", false),
+            ("a*b?", "axbc", true),
+        ];
+        for (pattern, name, expected) in cases {
+            assert_eq!(
+                pattern_matches(pattern, name),
+                expected,
+                "pattern {pattern:?} vs name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_patterns_and_names_behave_as_exact_matches() {
+        assert!(pattern_matches("", ""));
+        assert!(!pattern_matches("", "x"));
+        assert!(!pattern_matches("x", ""));
+        // Consecutive stars collapse to one
+        assert!(pattern_matches("a**b", "axb"));
+        assert!(pattern_matches("a**b", "ab"));
+    }
+
+    /// Collects the `ctx:log` tags in dispatch order from a fire's commands
+    fn log_tags(commands: &[Command]) -> Vec<&str> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Log(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_exact_handler_and_a_pattern_handler_both_fire_in_registration_order() {
+        let script = script_with_event_api();
+        script
+            .lua()
+            .load(
+                r#"
+                terminal.on("user.x", function(ctx) ctx:log("exact") end)
+                terminal.on("user.*", function(ctx) ctx:log("pattern") end)
+                terminal.on("user.y", function(ctx) ctx:log("other-exact") end)
+            "#,
+            )
+            .exec()
+            .unwrap();
+        // The event matches the exact handler AND the pattern handler: both fire,
+        // registration order; the unrelated exact handler does not
+        let commands = script.fire_wire_event("user.x", &serde_json::json!({}), 0);
+        assert_eq!(log_tags(&commands), vec!["exact", "pattern"]);
+        // An event matching nothing fires nothing
+        let commands = script.fire_wire_event("other.thing", &serde_json::json!({}), 0);
+        assert!(commands.is_empty());
+        // The pattern handler sees through the glob; has_event_handler follows it too
+        let commands = script.fire_wire_event("user.z", &serde_json::json!({}), 0);
+        assert_eq!(log_tags(&commands), vec!["pattern"]);
+        assert!(script.has_event_handler("user.z"));
+    }
+
+    #[test]
+    fn lower_priority_handlers_fire_first_and_ties_keep_registration_order() {
+        let script = script_with_event_api();
+        script
+            .lua()
+            .load(
+                r#"
+                terminal.on("user.x", function(ctx) ctx:log("late") end, 10)
+                terminal.on("user.?", function(ctx) ctx:log("early") end, 0)
+                terminal.on("user.*", function(ctx) ctx:log("default") end)
+            "#,
+            )
+            .exec()
+            .unwrap();
+        // Priority ascending: 0 before 10; "early" (pattern user.?) and "default" (user.*)
+        // tie at priority 0 and keep their registration order
+        let commands = script.fire_wire_event("user.x", &serde_json::json!({}), 0);
+        assert_eq!(log_tags(&commands), vec!["early", "default", "late"]);
+    }
+
+    #[test]
+    fn priorities_can_be_negative_and_reregistering_replaces_pattern_and_priority_in_place() {
+        let script = script_with_event_api();
+        script
+            .lua()
+            .load(
+                r#"
+                terminal.on("user.x", function(ctx) ctx:log("zero") end)
+                terminal.on("user.*", function(ctx) ctx:log("negative") end, -5)
+            "#,
+            )
+            .exec()
+            .unwrap();
+        // -5 runs before the default 0
+        let commands = script.fire_wire_event("user.x", &serde_json::json!({}), 0);
+        assert_eq!(log_tags(&commands), vec!["negative", "zero"]);
+
+        // Re-registering the same pattern replaces the handler in place: the new handler
+        // keeps the old registration slot but takes the new priority (5)
+        script
+            .lua()
+            .load(
+                r#"
+                terminal.on("user.*", function(ctx) ctx:log("replaced") end, 5)
+            "#,
+            )
+            .exec()
+            .unwrap();
+        let commands = script.fire_wire_event("user.x", &serde_json::json!({}), 0);
+        assert_eq!(log_tags(&commands), vec!["zero", "replaced"]);
+    }
+
+    #[test]
+    fn a_non_integer_priority_is_a_lua_error() {
+        let script = script_with_event_api();
+        let result = script
+            .lua()
+            .load("terminal.on('user.x', function() end, 2.5)")
+            .exec();
+        let error = lua_message(&result.unwrap_err());
+        assert!(error.contains("integer"), "{error}");
+        assert!(!script.has_event_handler("user.x"), "nothing registered");
     }
 
     #[test]
