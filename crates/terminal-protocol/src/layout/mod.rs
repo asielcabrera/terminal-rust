@@ -88,9 +88,13 @@ pub struct Edge {
 pub type Path = Vec<bool>;
 
 /// Line separating a split's two children. `pos` is the boundary coordinate on the split's
-/// axis and `start..start + len` is its extent on the other axis.
+/// axis and `start..start + len` is its extent on the other axis. A divider can belong to a
+/// floating pane's subtree (`float` names it; its `path` is relative to that subtree's root)
+/// or to the tiling (`float` is `None`, `path` relative to the tiling's root).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Divider {
+    /// The floating pane whose subtree holds this divider; `None` for a tiled divider
+    pub float: Option<PaneId>,
     pub path: Path,
     pub axis: Axis,
     pub pos: u32,
@@ -112,7 +116,8 @@ impl Divider {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
     Pane(PaneId),
-    Divider(Path, Axis),
+    /// A divider between tiled panes, or inside a floating pane's subtree (`float` names it)
+    Divider(Path, Axis, Option<PaneId>),
     /// The padding ring of a floating pane: dragging it moves the pane
     FloatMove(PaneId),
     FloatResize(PaneId, Edge),
@@ -146,6 +151,18 @@ fn split_sizes(total: u32, ratio: f32) -> (u32, u32) {
     let first = (total as f32 * ratio).round() as u32;
     let first = first.clamp(1, total.saturating_sub(1).max(1)).min(total);
     (first, total - first)
+}
+
+/// Whether a divider is under the point `(x, y)`, within `zone` of its line and inside its
+/// extent on the other axis
+fn divider_under_point(divider: &Divider, x: f64, y: f64, zone: f64) -> bool {
+    let (along, across) = match divider.axis {
+        Axis::Horizontal => (y, x),
+        Axis::Vertical => (x, y),
+    };
+    along >= f64::from(divider.start)
+        && along < f64::from(divider.start + divider.len)
+        && (across - f64::from(divider.pos)).abs() <= zone
 }
 
 impl Node {
@@ -187,6 +204,7 @@ impl Node {
         path: &mut Path,
         rects: &mut Vec<(PaneId, Rect)>,
         dividers: &mut Vec<Divider>,
+        float: Option<PaneId>,
     ) {
         match self {
             Node::Leaf(id) => rects.push((*id, area)),
@@ -200,6 +218,7 @@ impl Node {
                         Rect::new(area.x, area.y, first, area.h),
                         Rect::new(area.x + first, area.y, second, area.h),
                         Divider {
+                            float,
                             path: path.clone(),
                             axis: *axis,
                             pos: area.x + first,
@@ -211,6 +230,7 @@ impl Node {
                         Rect::new(area.x, area.y, area.w, first),
                         Rect::new(area.x, area.y + first, area.w, second),
                         Divider {
+                            float,
                             path: path.clone(),
                             axis: *axis,
                             pos: area.y + first,
@@ -221,10 +241,10 @@ impl Node {
                 };
                 dividers.push(divider);
                 path.push(false);
-                a.layout(area_a, path, rects, dividers);
+                a.layout(area_a, path, rects, dividers, float);
                 path.pop();
                 path.push(true);
-                b.layout(area_b, path, rects, dividers);
+                b.layout(area_b, path, rects, dividers, float);
                 path.pop();
             }
         }
@@ -306,7 +326,10 @@ impl Node {
     }
 }
 
-/// A floating pane, in window fractions, so it stays in place when the window resizes
+/// A floating pane, in window fractions, so it stays in place when the window resizes. `tree`
+/// is the split tree INSIDE the float, laid out over the float's rect; `None` when the float
+/// is a single pane (`id`). A tree's root leaf is `id` itself — the pane the float was opened
+/// with — and `id` stays the float's identity even after that leaf closes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Float {
     pub id: PaneId,
@@ -314,6 +337,10 @@ pub struct Float {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    /// The split subtree inside the float, if it was split. Additive on the wire: old JSON
+    /// without the field reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<Node>,
 }
 
 /// The whole layout as plain data. The server owns the authoritative layout and sends this to
@@ -332,11 +359,16 @@ pub struct LayoutState {
 }
 
 impl LayoutState {
-    /// Every pane in the state, tiled and floating
+    /// Every pane in the state, tiled and floating (a float's subtree leaves included)
     pub fn pane_ids(&self) -> Vec<PaneId> {
         let mut ids = Vec::new();
         self.root.leaves(&mut ids);
-        ids.extend(self.floats.iter().map(|pane| pane.id));
+        for float in &self.floats {
+            match &float.tree {
+                None => ids.push(float.id),
+                Some(tree) => tree.leaves(&mut ids),
+            }
+        }
         ids
     }
 }
@@ -445,12 +477,33 @@ impl Layout {
         !self.floats.is_empty()
     }
 
+    /// Whether `id` names a floating pane's own pane (not a pane of its subtree)
     pub fn is_float(&self, id: PaneId) -> bool {
         self.floats.iter().any(|float| float.id == id)
     }
 
+    /// The floating pane `id` belongs to: its own pane, or any leaf of its subtree
+    pub fn float_of(&self, id: PaneId) -> Option<PaneId> {
+        self.floats
+            .iter()
+            .find(|float| match &float.tree {
+                None => float.id == id,
+                Some(tree) => tree.contains(id),
+            })
+            .map(|float| float.id)
+    }
+
+    /// Whether `id` names any pane of a floating subtree (the float's own pane included)
+    pub fn is_float_pane(&self, id: PaneId) -> bool {
+        self.float_of(id).is_some()
+    }
+
     pub fn contains(&self, id: PaneId) -> bool {
-        self.root.contains(id) || self.is_float(id)
+        self.root.contains(id)
+            || self.floats.iter().any(|float| match &float.tree {
+                None => float.id == id,
+                Some(tree) => tree.contains(id),
+            })
     }
 
     /// Tiled panes, in tree traversal order
@@ -464,7 +517,28 @@ impl Layout {
     #[cfg(test)]
     pub fn all_ids(&self) -> Vec<PaneId> {
         let mut ids = self.tiled_ids();
-        ids.extend(self.floats.iter().map(|float| float.id));
+        for float in &self.floats {
+            match &float.tree {
+                None => ids.push(float.id),
+                Some(tree) => tree.leaves(&mut ids),
+            }
+        }
+        ids
+    }
+
+    /// The panes of the visible floating panes, in draw order (a subtree's leaves, or the
+    /// float's own pane when it has no tree)
+    fn visible_float_panes(&self) -> Vec<PaneId> {
+        if !self.floats_visible {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        for float in &self.floats {
+            match &float.tree {
+                None => ids.push(float.id),
+                Some(tree) => tree.leaves(&mut ids),
+            }
+        }
         ids
     }
 
@@ -475,9 +549,7 @@ impl Layout {
             Some(zoomed) => vec![zoomed],
             None => self.tiled_ids(),
         };
-        if self.floats_visible {
-            ids.extend(self.floats.iter().map(|float| float.id));
-        }
+        ids.extend(self.visible_float_panes());
         ids
     }
 
@@ -501,16 +573,16 @@ impl Layout {
             .map_or(-1, |index| index as i64)
     }
 
-    /// Gives focus to a pane. A floating pane is raised to the front; moving to another tiled pane
-    /// clears zoom; focusing a hidden floating pane shows them all.
+    /// Gives focus to a pane. A pane of a floating subtree raises its float to the front;
+    /// moving to another tiled pane clears zoom; focusing a hidden floating pane shows them all.
     pub fn set_focus(&mut self, id: PaneId) -> bool {
         self.assert_authoritative();
         if !self.contains(id) {
             return false;
         }
-        if self.is_float(id) {
+        if let Some(float_id) = self.float_of(id) {
             self.floats_visible = true;
-            self.raise(id);
+            self.raise(float_id);
         } else if self.zoomed.is_some_and(|zoomed| zoomed != id) {
             self.zoomed = None;
         }
@@ -538,18 +610,15 @@ impl Layout {
 
     // ---- Tiling ----------------------------------------------------------------------------
 
-    /// Tiled pane a split applies to: the focused one or, if focus is on a floating pane,
-    /// the last tiled pane that had it
+    /// The pane a split applies to: the focused one. A focused floating pane splits inside
+    /// its own subtree, rooted at the float's rect.
     pub fn split_target(&self) -> PaneId {
-        if self.is_float(self.focus) {
-            self.last_tiled()
-        } else {
-            self.focus
-        }
+        self.focus
     }
 
-    /// Splits tiled pane `target` in two and focuses the new one. `false` if `target` is not
-    /// tiled or if both halves would fall below the minimum size.
+    /// Splits pane `target` in two and focuses the new one. A pane of a floating subtree
+    /// (or a float's own pane) splits inside that float. `false` if `target` does not exist
+    /// or if both halves would fall below the minimum size.
     pub fn split(
         &mut self,
         target: PaneId,
@@ -560,29 +629,52 @@ impl Layout {
     ) -> bool {
         self.assert_authoritative();
         let before = self.zoomed.take();
-        let Some((_, rect)) = self.rects(area).into_iter().find(|(id, _)| *id == target) else {
-            self.zoomed = before;
-            return false;
-        };
-        // With zoom on, `rects` only returned the zoomed pane: recompute without zoom
-        let rect = if before.is_some() {
-            self.rects(area)
-                .into_iter()
-                .find(|(id, _)| *id == target)
-                .map_or(rect, |(_, r)| r)
-        } else {
-            rect
+        // A floating subtree's geometry is rooted at the float's rect and ignores zoom
+        let rect = match self.float_subtree_rect_of(target, area) {
+            Some(rect) => rect,
+            None => {
+                let Some((_, rect)) = self.rects(area).into_iter().find(|(id, _)| *id == target)
+                else {
+                    self.zoomed = before;
+                    return false;
+                };
+                // With zoom on, `rects` only returned the zoomed pane: recompute without zoom
+                if before.is_some() {
+                    self.rects(area)
+                        .into_iter()
+                        .find(|(id, _)| *id == target)
+                        .map_or(rect, |(_, r)| r)
+                } else {
+                    rect
+                }
+            }
         };
         let fits = match axis {
             Axis::Horizontal => rect.w / 2 >= limits.min_w,
             Axis::Vertical => rect.h / 2 >= limits.min_h,
         };
-        if !fits || !self.root.split_leaf(target, axis, new_id) {
+        if !fits || !self.split_node(target, axis, new_id) {
             self.zoomed = before;
             return false;
         }
         self.set_focus(new_id);
         true
+    }
+
+    /// Splits the node holding `target`: inside its float's subtree when it belongs to one
+    /// (seeding the tree with the float's own pane first), otherwise in the tiling
+    fn split_node(&mut self, target: PaneId, axis: Axis, new_id: PaneId) -> bool {
+        match self.float_of(target) {
+            Some(float_id) => {
+                let Some(float) = self.floats.iter_mut().find(|float| float.id == float_id) else {
+                    return false;
+                };
+                // Seed: the float's own pane becomes the root of its subtree
+                let tree = float.tree.get_or_insert(Node::Leaf(target));
+                tree.split_leaf(target, axis, new_id)
+            }
+            None => self.root.split_leaf(target, axis, new_id),
+        }
     }
 
     /// Rectangle a new pane would occupy if `target` were split in two along `axis`, without
@@ -596,13 +688,19 @@ impl Layout {
         area: Rect,
         limits: Limits,
     ) -> Option<Rect> {
-        // When zoomed, `rects` only covers the zoomed pane: look at the tiling underneath
-        let rects = if self.zoomed.is_some() {
-            self.tiled_rects(area)
-        } else {
-            self.rects(area)
+        // A floating subtree's geometry is rooted at the float's rect and ignores zoom
+        let rect = match self.float_subtree_rect_of(target, area) {
+            Some(rect) => rect,
+            None => {
+                // When zoomed, `rects` only covers the zoomed pane: look at the tiling underneath
+                let rects = if self.zoomed.is_some() {
+                    self.tiled_rects(area)
+                } else {
+                    self.rects(area)
+                };
+                rects.into_iter().find(|(id, _)| *id == target)?.1
+            }
         };
-        let (_, rect) = rects.into_iter().find(|(id, _)| *id == target)?;
         let fits = match axis {
             Axis::Horizontal => rect.w / 2 >= limits.min_w,
             Axis::Vertical => rect.h / 2 >= limits.min_h,
@@ -623,12 +721,30 @@ impl Layout {
         })
     }
 
-    /// Closes a pane. Closing the last tiled pane changes nothing and reports it so the window
-    /// can close.
+    /// Closes a pane. Closing the last pane of a floating subtree removes the whole float;
+    /// closing the last tiled pane changes nothing and reports it so the window can close.
     pub fn close(&mut self, id: PaneId) -> Closed {
         self.assert_authoritative();
-        if let Some(index) = self.floats.iter().position(|float| float.id == id) {
-            self.floats.remove(index);
+        let float_index = self.floats.iter().position(|float| match &float.tree {
+            None => float.id == id,
+            Some(tree) => tree.contains(id),
+        });
+        if let Some(index) = float_index {
+            let removed_last = match self.floats[index].tree.take() {
+                // The float's own pane, and no subtree: the float goes with it
+                None => true,
+                Some(tree) => match tree.remove(id) {
+                    // The subtree's last leaf: the float goes with it
+                    None => true,
+                    Some(remaining) => {
+                        self.floats[index].tree = Some(remaining);
+                        false
+                    }
+                },
+            };
+            if removed_last {
+                self.floats.remove(index);
+            }
             self.forget(id);
             return Closed::Pane;
         }
@@ -659,7 +775,9 @@ impl Layout {
             .iter()
             .rev()
             .copied()
-            .find(|&other| self.contains(other) && (self.floats_visible || !self.is_float(other)))
+            .find(|&other| {
+                self.contains(other) && (self.floats_visible || !self.is_float_pane(other))
+            })
             .unwrap_or_else(|| self.tiled_ids()[0]);
         self.focus = next;
         self.remember(next);
@@ -678,31 +796,34 @@ impl Layout {
         let mut rects = Vec::new();
         let mut dividers = Vec::new();
         self.root
-            .layout(area, &mut Vec::new(), &mut rects, &mut dividers);
+            .layout(area, &mut Vec::new(), &mut rects, &mut dividers, None);
         rects
     }
 
-    /// Tiled dividers (none when zoomed)
+    /// Dividers of the tiling (none when zoomed), then the visible floating subtrees' own
+    /// dividers, which stay grabbable and rendered while a tile is zoomed
     pub fn dividers(&self, area: Rect) -> Vec<Divider> {
-        if self.zoomed.is_some() {
-            return Vec::new();
-        }
-        let mut rects = Vec::new();
         let mut dividers = Vec::new();
-        self.root
-            .layout(area, &mut Vec::new(), &mut rects, &mut dividers);
+        if self.zoomed.is_none() {
+            let mut rects = Vec::new();
+            self.root
+                .layout(area, &mut Vec::new(), &mut rects, &mut dividers, None);
+        }
+        if self.floats_visible {
+            for float in &self.floats {
+                dividers.extend(self.float_subtree_layout(float, area).1);
+            }
+        }
         dividers
     }
 
-    /// Moves focus to the neighboring pane in that direction (within the tiling). Clears zoom.
-    /// `false` if focus is on a floating pane or there is no neighbor.
+    /// Moves focus to the neighboring pane in that direction, within the tiling and the
+    /// visible floating subtrees. Clears zoom. `false` if there is no neighbor.
     pub fn focus_dir(&mut self, dir: Dir, area: Rect) -> bool {
         self.assert_authoritative();
-        if self.is_float(self.focus) {
-            return false;
-        }
         self.zoomed = None;
-        let rects = self.rects(area);
+        let mut rects = self.rects(area);
+        rects.extend(self.float_subtree_rects(area));
         let Some(&(_, current)) = rects.iter().find(|(id, _)| *id == self.focus) else {
             return false;
         };
@@ -746,13 +867,11 @@ impl Layout {
         }
     }
 
-    /// Next (or previous) pane: tiled panes first, then visible floating panes
+    /// Next (or previous) pane: tiled panes first, then the visible floating subtrees' panes
     pub fn focus_cycle(&mut self, forward: bool) -> bool {
         self.assert_authoritative();
         let mut order = self.tiled_ids();
-        if self.floats_visible {
-            order.extend(self.floats.iter().map(|float| float.id));
-        }
+        order.extend(self.visible_float_panes());
         let Some(index) = order.iter().position(|&id| id == self.focus) else {
             return false;
         };
@@ -779,6 +898,7 @@ impl Layout {
             };
             return self.resize_float_by(id, dw, dh, area, limits);
         }
+        // A pane inside a floating subtree has no keyboard resize (yet): only the tiling does
         let mut path = Vec::new();
         if self.zoomed.is_some() || !self.root.path_to(id, &mut path) {
             return false;
@@ -822,9 +942,15 @@ impl Layout {
         self.set_first_size(split_path, target, area, limits)
     }
 
-    /// Rectangle occupied by the node `path` leads to
+    /// Rectangle occupied by the node `path` leads to, within the tiling
     fn node_rect(&self, area: Rect, path: &[bool]) -> Option<Rect> {
-        let mut node = &self.root;
+        Self::node_rect_in(&self.root, area, path)
+    }
+
+    /// Rectangle occupied by the node `path` leads to, rooted at `area` in `root`'s own
+    /// coordinate space (a float's subtree is rooted at the float's rect)
+    fn node_rect_in(root: &Node, area: Rect, path: &[bool]) -> Option<Rect> {
+        let mut node = root;
         let mut rect = area;
         for &second in path {
             let Node::Split { axis, ratio, a, b } = node else {
@@ -848,10 +974,22 @@ impl Layout {
     /// Sets how many pixels the first child of the split at `path` takes, respecting the minimum
     /// of both subtrees
     fn set_first_size(&mut self, path: &[bool], wanted: i64, area: Rect, limits: Limits) -> bool {
-        let Some(rect) = self.node_rect(area, path) else {
+        Self::set_first_size_in(&mut self.root, path, wanted, area, limits)
+    }
+
+    /// [`Self::set_first_size`] on any root, so a floating subtree's dividers move with the
+    /// same minimum rules the tiling has
+    fn set_first_size_in(
+        root: &mut Node,
+        path: &[bool],
+        wanted: i64,
+        area: Rect,
+        limits: Limits,
+    ) -> bool {
+        let Some(rect) = Self::node_rect_in(root, area, path) else {
             return false;
         };
-        let Some(Node::Split { axis, ratio, a, b }) = self.root.node_at_mut(path) else {
+        let Some(Node::Split { axis, ratio, a, b }) = root.node_at_mut(path) else {
             return false;
         };
         let (total, min_a, min_b) = match axis {
@@ -868,15 +1006,51 @@ impl Layout {
         changed
     }
 
-    /// Mouse drag of a divider: moves the boundary to coordinate `boundary`
+    /// Mouse drag of a divider: moves the boundary to coordinate `boundary`. `float` addresses
+    /// a divider inside that floating pane's subtree (the boundary in window coordinates, the
+    /// path relative to the subtree's root); `None` is a tiled divider.
     pub fn set_divider(
         &mut self,
+        float: Option<PaneId>,
         path: &[bool],
         boundary: i64,
         area: Rect,
         limits: Limits,
     ) -> bool {
         self.assert_authoritative();
+        let Some(root_rect) = (match float {
+            None => Some(area),
+            Some(id) => self.float_rect(id, area),
+        }) else {
+            return false;
+        };
+        if let Some(id) = float
+            && let Some(float) = self.floats.iter_mut().find(|float| float.id == id)
+        {
+            let Some(tree) = float.tree.as_mut() else {
+                return false;
+            };
+            let Some(split_rect) = Self::node_rect_in(tree, root_rect, path) else {
+                return false;
+            };
+            let Some(Node::Split { axis, .. }) = tree.node_at(path) else {
+                return false;
+            };
+            let origin = match axis {
+                Axis::Horizontal => split_rect.x,
+                Axis::Vertical => split_rect.y,
+            };
+            return Self::set_first_size_in(
+                tree,
+                path,
+                boundary - i64::from(origin),
+                root_rect,
+                limits,
+            );
+        }
+        if float.is_some() {
+            return false;
+        }
         let Some(rect) = self.node_rect(area, path) else {
             return false;
         };
@@ -898,7 +1072,7 @@ impl Layout {
             self.zoomed = None;
             return true;
         }
-        if self.is_float(self.focus) || self.tiled_ids().len() < 2 {
+        if self.float_of(self.focus).is_some() || self.tiled_ids().len() < 2 {
             return false;
         }
         self.zoomed = Some(self.focus);
@@ -923,7 +1097,14 @@ impl Layout {
     pub fn add_float(&mut self, id: PaneId, width: f32, height: f32) {
         self.assert_authoritative();
         let (x, y, w, h) = self.float_placement(width, height);
-        self.floats.push(Float { id, x, y, w, h });
+        self.floats.push(Float {
+            id,
+            x,
+            y,
+            w,
+            h,
+            tree: None,
+        });
         self.floats_visible = true;
         self.set_focus(id);
     }
@@ -939,6 +1120,7 @@ impl Layout {
                 y,
                 w,
                 h,
+                tree: None,
             },
             window,
         )
@@ -953,7 +1135,7 @@ impl Layout {
         }
         if self.floats_visible {
             self.floats_visible = false;
-            if self.is_float(self.focus) {
+            if self.is_float_pane(self.focus) {
                 let back = self.last_tiled();
                 self.focus = back;
                 self.remember(back);
@@ -965,7 +1147,7 @@ impl Layout {
                 .iter()
                 .rev()
                 .copied()
-                .find(|&id| self.is_float(id))
+                .find(|&id| self.is_float_pane(id))
                 .or_else(|| self.floats.last().map(|float| float.id));
             if let Some(id) = last {
                 self.set_focus(id);
@@ -987,6 +1169,56 @@ impl Layout {
             .iter()
             .find(|float| float.id == id)
             .map(|float| self.float_px(float, window))
+    }
+
+    /// The panes and dividers of a floating pane's subtree, laid out inside the float's pixel
+    /// rect (dividers tagged with the float's id). Without a tree the float's own pane fills it.
+    fn float_subtree_layout(
+        &self,
+        float: &Float,
+        window: Rect,
+    ) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
+        let rect = self.float_px(float, window);
+        let mut rects = Vec::new();
+        let mut dividers = Vec::new();
+        match &float.tree {
+            None => rects.push((float.id, rect)),
+            Some(tree) => tree.layout(
+                rect,
+                &mut Vec::new(),
+                &mut rects,
+                &mut dividers,
+                Some(float.id),
+            ),
+        }
+        (rects, dividers)
+    }
+
+    /// The rect of one pane of a floating subtree, without changing anything. `None` when the
+    /// pane is not part of a float (or does not exist).
+    fn float_subtree_rect_of(&self, id: PaneId, window: Rect) -> Option<Rect> {
+        let float = self.floats.iter().find(|float| match &float.tree {
+            None => float.id == id,
+            Some(tree) => tree.contains(id),
+        })?;
+        self.float_subtree_layout(float, window)
+            .0
+            .into_iter()
+            .find(|(pane, _)| *pane == id)
+            .map(|(_, rect)| rect)
+    }
+
+    /// Pixel rects of every pane of the visible floating panes' subtrees (each float's own
+    /// pane included), bottom-most float first. The window's relayout merges them as a third
+    /// rect source, after the tiling and the float rects.
+    pub fn float_subtree_rects(&self, window: Rect) -> Vec<(PaneId, Rect)> {
+        if !self.floats_visible {
+            return Vec::new();
+        }
+        self.floats
+            .iter()
+            .flat_map(|float| self.float_subtree_layout(float, window).0)
+            .collect()
     }
 
     /// Visible floating panes, from bottom-most to top-most
@@ -1110,8 +1342,9 @@ impl Layout {
 
     // ---- What is under a point -------------------------------------------------------------
 
-    /// What is at `(x, y)`: first the visible floating panes (top to bottom), then the dividers
-    /// and finally the tiled panes
+    /// What is at `(x, y)`: first the visible floating panes (top to bottom; inside one, its
+    /// subtree's dividers then panes, with the float's own move ring and edge band kept to the
+    /// border band), then the dividers and finally the tiled panes
     pub fn hit_test(&self, x: f64, y: f64, window: Rect, params: HitParams) -> Hit {
         for (id, rect) in self.float_rects(window).into_iter().rev() {
             if !rect.contains(x, y) {
@@ -1131,21 +1364,28 @@ impl Layout {
                 || f64::from(rect.right()) - x <= ring
                 || y - f64::from(rect.y) < ring
                 || f64::from(rect.bottom()) - y <= ring;
-            return if in_ring {
-                Hit::FloatMove(id)
-            } else {
-                Hit::Pane(id)
-            };
+            if in_ring {
+                return Hit::FloatMove(id);
+            }
+            // The interior belongs to the float's subtree: its dividers, then its panes
+            if let Some(float) = self.floats.iter().find(|float| float.id == id) {
+                let (panes, dividers) = self.float_subtree_layout(float, window);
+                for divider in dividers {
+                    if divider_under_point(&divider, x, y, params.divider_zone) {
+                        return Hit::Divider(divider.path, divider.axis, Some(id));
+                    }
+                }
+                for (pane, pane_rect) in panes {
+                    if pane_rect.contains(x, y) {
+                        return Hit::Pane(pane);
+                    }
+                }
+            }
+            return Hit::Pane(id);
         }
         for divider in self.dividers(window) {
-            let (along, across) = match divider.axis {
-                Axis::Horizontal => (y, x),
-                Axis::Vertical => (x, y),
-            };
-            let inside =
-                along >= f64::from(divider.start) && along < f64::from(divider.start + divider.len);
-            if inside && (across - f64::from(divider.pos)).abs() <= params.divider_zone {
-                return Hit::Divider(divider.path, divider.axis);
+            if divider_under_point(&divider, x, y, params.divider_zone) {
+                return Hit::Divider(divider.path, divider.axis, None);
             }
         }
         match self

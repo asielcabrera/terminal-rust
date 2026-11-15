@@ -230,11 +230,11 @@ fn nested_minimums_are_respected_when_moving_a_divider() {
 fn dragging_a_divider_follows_the_pointer_and_clamps() {
     let mut layout = two_columns();
     let path = layout.dividers(WINDOW)[0].path.clone();
-    assert!(layout.set_divider(&path, 300, WINDOW, LIMITS));
+    assert!(layout.set_divider(None, &path, 300, WINDOW, LIMITS));
     assert_eq!(rect_of(&layout, 1).w, 300);
-    assert!(layout.set_divider(&path, -50, WINDOW, LIMITS));
+    assert!(layout.set_divider(None, &path, -50, WINDOW, LIMITS));
     assert_eq!(rect_of(&layout, 1).w, LIMITS.min_w);
-    assert!(layout.set_divider(&path, 5000, WINDOW, LIMITS));
+    assert!(layout.set_divider(None, &path, 5000, WINDOW, LIMITS));
     assert_eq!(rect_of(&layout, 2).w, LIMITS.min_w);
 }
 
@@ -402,16 +402,242 @@ fn closing_a_float_gives_the_focus_back() {
     assert!(!layout.has_floats());
 }
 
+/// A float opened with pane 3 and split into panes 3 | 4 inside it
+fn float_with_subtree() -> Layout {
+    let mut layout = Layout::new(id(1));
+    layout.add_float(id(3), 0.5, 0.5);
+    assert!(layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS));
+    layout
+}
+
+fn subtree_rect_of(layout: &Layout, pane: u32) -> Rect {
+    layout
+        .float_subtree_rects(WINDOW)
+        .into_iter()
+        .find(|(candidate, _)| *candidate == id(pane))
+        .unwrap()
+        .1
+}
+
 #[test]
-fn splits_from_a_float_go_to_the_last_tiled_pane() {
+fn a_split_on_a_focused_float_seeds_its_own_subtree() {
     let mut layout = two_columns();
     layout.set_focus(id(1));
     layout.add_float(id(3), 0.5, 0.5);
-    assert_eq!(layout.split_target(), id(1));
-    assert!(
-        !layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS),
-        "a floating pane cannot be split"
+    assert_eq!(
+        layout.split_target(),
+        id(3),
+        "the float pane itself is split"
     );
+    assert!(layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS));
+    assert_eq!(layout.focus(), id(4));
+
+    // The two subtree panes tile the float's rect exactly
+    let float = layout.float_rect(id(3), WINDOW).unwrap();
+    let (a, b) = (subtree_rect_of(&layout, 3), subtree_rect_of(&layout, 4));
+    assert_eq!(a.w + b.w, float.w);
+    assert_eq!(b.x, a.right());
+    assert_eq!((a.x, a.y, a.h), (float.x, float.y, float.h));
+    // The tiling is untouched
+    assert_eq!(layout.rects(WINDOW), two_columns().rects(WINDOW));
+    // Both subtree panes are visible, floating panes of the layout
+    assert_eq!(layout.visible_ids(), vec![id(1), id(2), id(3), id(4)]);
+    assert_eq!(layout.state().pane_ids(), vec![id(1), id(2), id(3), id(4)]);
+}
+
+#[test]
+fn a_split_inside_a_float_previews_exactly_what_it_does() {
+    let mut layout = Layout::new(id(1));
+    layout.add_float(id(2), 0.5, 0.5);
+    let preview = layout
+        .split_preview(id(2), Axis::Vertical, WINDOW, LIMITS)
+        .expect("the float is big enough to split");
+    assert!(layout.split(id(2), Axis::Vertical, id(3), WINDOW, LIMITS));
+    assert_eq!(subtree_rect_of(&layout, 3), preview);
+}
+
+#[test]
+fn closing_a_subtree_pane_grows_its_sibling_inside_the_float() {
+    let mut layout = float_with_subtree();
+    assert_eq!(layout.close(id(4)), Closed::Pane);
+    assert!(layout.has_floats(), "the float survives with its last pane");
+    assert_eq!(
+        subtree_rect_of(&layout, 3),
+        layout.float_rect(id(3), WINDOW).unwrap()
+    );
+    assert_eq!(layout.focus(), id(3));
+    // Closing the float's own pane now, the subtree's last one: the float goes with it
+    assert_eq!(layout.close(id(3)), Closed::Pane);
+    assert!(!layout.has_floats());
+    assert!(!layout.contains(id(3)));
+    assert!(!layout.contains(id(4)));
+    assert_eq!(layout.focus(), id(1), "focus falls back to the tiling");
+}
+
+#[test]
+fn closing_the_floats_root_leaf_leaves_the_rest_of_the_subtree() {
+    let mut layout = float_with_subtree();
+    assert_eq!(layout.close(id(3)), Closed::Pane);
+    assert!(layout.has_floats());
+    assert_eq!(layout.focus(), id(4));
+    assert_eq!(
+        subtree_rect_of(&layout, 4),
+        layout.float_rect(id(3), WINDOW).unwrap()
+    );
+    // The closed root's id is no longer a pane of the layout
+    assert!(!layout.contains(id(3)));
+    assert!(!layout.set_focus(id(3)));
+}
+
+#[test]
+fn inside_a_float_subtree_child_panes_beat_the_move_ring() {
+    let layout = float_with_subtree();
+    let float = layout.float_rect(id(3), WINDOW).unwrap();
+    let a = subtree_rect_of(&layout, 3);
+    let cy = f64::from(a.y + a.h / 2);
+    let cx = f64::from(a.x + a.w / 2);
+    assert_eq!(layout.hit_test(cx, cy, WINDOW, PARAMS), Hit::Pane(id(3)));
+    assert_eq!(
+        layout.hit_test(f64::from(a.x) + PARAMS.move_ring + 2.0, cy, WINDOW, PARAMS),
+        Hit::Pane(id(3)),
+        "beyond the ring the child pane wins"
+    );
+    // The border band still moves and resizes the whole float
+    assert_eq!(
+        layout.hit_test(f64::from(float.x) + 8.0, cy, WINDOW, PARAMS),
+        Hit::FloatMove(id(3))
+    );
+    assert_eq!(
+        layout.hit_test(f64::from(float.x) + 2.0, cy, WINDOW, PARAMS),
+        Hit::FloatResize(
+            id(3),
+            Edge {
+                left: true,
+                ..Edge::default()
+            }
+        )
+    );
+}
+
+#[test]
+fn a_divider_inside_a_float_carries_the_float_context() {
+    let layout = float_with_subtree();
+    let float = layout.float_rect(id(3), WINDOW).unwrap();
+    let inside = layout
+        .dividers(WINDOW)
+        .into_iter()
+        .find(|divider| divider.float == Some(id(3)))
+        .expect("the subtree divider");
+    assert_eq!(inside.axis, Axis::Horizontal);
+    assert_eq!(inside.start, float.y);
+    assert_eq!(inside.len, float.h);
+    // Grabbing it reports the float it belongs to
+    let (x, y) = (f64::from(inside.pos), f64::from(float.y + float.h / 2));
+    assert_eq!(
+        layout.hit_test(x, y, WINDOW, PARAMS),
+        Hit::Divider(inside.path.clone(), inside.axis, Some(id(3)))
+    );
+}
+
+#[test]
+fn a_tiled_divider_keeps_carrying_no_float_context() {
+    let mut layout = two_columns();
+    layout.add_float(id(3), 0.2, 0.2);
+    let x = f64::from(rect_of(&layout, 1).right());
+    let float = layout.float_rect(id(3), WINDOW).unwrap();
+    // Below the float, so the float pass does not take the point first
+    let y = f64::from(float.bottom()) + 50.0;
+    assert_eq!(
+        layout.hit_test(x, y, WINDOW, PARAMS),
+        Hit::Divider(vec![], Axis::Horizontal, None)
+    );
+}
+
+#[test]
+fn dragging_a_divider_inside_a_float_moves_the_subtree_boundary() {
+    let mut layout = float_with_subtree();
+    let float = layout.float_rect(id(3), WINDOW).unwrap();
+    let divider = layout
+        .dividers(WINDOW)
+        .into_iter()
+        .find(|divider| divider.float == Some(id(3)))
+        .unwrap();
+    assert!(layout.set_divider(
+        Some(id(3)),
+        &divider.path,
+        i64::from(float.x) + 100,
+        WINDOW,
+        LIMITS
+    ));
+    assert_eq!(subtree_rect_of(&layout, 3).right(), float.x + 100);
+    // Clamped to the subtree's own minimum
+    assert!(layout.set_divider(
+        Some(id(3)),
+        &divider.path,
+        i64::from(float.x) + 5,
+        WINDOW,
+        LIMITS
+    ));
+    assert_eq!(subtree_rect_of(&layout, 3).w, LIMITS.min_w);
+    // An unknown float, and a tiled pane that is not a float, refuse
+    assert!(!layout.set_divider(Some(id(9)), &divider.path, 100, WINDOW, LIMITS));
+    assert!(!layout.set_divider(Some(id(1)), &[false], 100, WINDOW, LIMITS));
+}
+
+#[test]
+fn focus_direction_traverses_float_subtrees() {
+    let mut layout = float_with_subtree();
+    // Within the subtree focus moves between the two panes
+    assert!(layout.focus_dir(Dir::Left, WINDOW));
+    assert_eq!(layout.focus(), id(3));
+    assert!(layout.focus_dir(Dir::Right, WINDOW));
+    assert_eq!(layout.focus(), id(4));
+    // Cycling carries focus through the subtree and back into the tiling
+    assert!(layout.focus_cycle(true));
+    assert_eq!(layout.focus(), id(1));
+}
+
+#[test]
+fn a_subtree_pane_cannot_zoom() {
+    let mut layout = two_columns();
+    layout.add_float(id(3), 0.5, 0.5);
+    assert!(layout.split(id(3), Axis::Horizontal, id(4), WINDOW, LIMITS));
+    assert!(!layout.toggle_zoom(), "a pane inside a float cannot zoom");
+    // Zoom stays available for the tiling
+    layout.set_focus(id(1));
+    assert!(layout.toggle_zoom());
+}
+
+#[test]
+fn a_float_tree_survives_the_state_round_trip() {
+    let layout = float_with_subtree();
+    let state = layout.state();
+    let json = serde_json::to_string(&state).expect("serializes");
+    let back: LayoutState = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(back, state, "the tree round trips field for field");
+    let rebuilt = Layout::from_state(back);
+    assert_eq!(
+        rebuilt.float_subtree_rects(WINDOW),
+        layout.float_subtree_rects(WINDOW)
+    );
+}
+
+#[test]
+fn an_old_state_without_float_trees_still_loads() {
+    let layout = float_with_subtree();
+    let json = serde_json::to_string(&layout.state()).expect("serializes");
+    // An old server never wrote the tree field: strip it and the state still loads
+    let mut value: serde_json::Value = serde_json::from_str(&json).expect("the JSON parses");
+    for float in value["floats"].as_array_mut().expect("floats is an array") {
+        float
+            .as_object_mut()
+            .expect("a float is an object")
+            .remove("tree");
+    }
+    let state: LayoutState =
+        serde_json::from_str(&value.to_string()).expect("the old JSON still loads");
+    assert!(state.floats.iter().all(|float| float.tree.is_none()));
+    assert_eq!(state.root, layout.state().root);
 }
 
 #[test]
@@ -452,7 +678,7 @@ fn hit_testing_prefers_floats_then_dividers_then_panes() {
     let divider_x = f64::from(rect_of(&layout, 1).right());
     assert_eq!(
         layout.hit_test(divider_x + 2.0, 100.0, WINDOW, PARAMS),
-        Hit::Divider(vec![], Axis::Horizontal)
+        Hit::Divider(vec![], Axis::Horizontal, None)
     );
     assert_eq!(
         layout.hit_test(divider_x - 100.0, 100.0, WINDOW, PARAMS),
@@ -512,7 +738,7 @@ fn hit_testing_prefers_floats_then_dividers_then_panes() {
     layout.toggle_floats();
     assert_eq!(
         layout.hit_test(divider_x, cy, WINDOW, PARAMS),
-        Hit::Divider(vec![], Axis::Horizontal)
+        Hit::Divider(vec![], Axis::Horizontal, None)
     );
 }
 

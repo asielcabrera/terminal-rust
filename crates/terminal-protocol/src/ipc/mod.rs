@@ -110,8 +110,11 @@ pub struct ResizeOp {
     pub limits: Limits,
 }
 
-/// "Move the divider at `path` to `boundary"`
+/// "Move the divider at `path` to `boundary`". `float` addresses a divider inside that
+/// floating pane's subtree (the path relative to the subtree's root); `None` is a tiled
+/// divider.
 pub struct SetDividerOp {
+    pub float: Option<PaneId>,
     pub path: Path,
     pub boundary: i64,
     pub area: Rect,

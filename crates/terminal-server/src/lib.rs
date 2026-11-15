@@ -227,9 +227,9 @@ impl Server {
             Request::LayoutResize(op) => {
                 self.apply(|layout| layout.resize(op.pane, op.dir, op.delta, op.area, op.limits))
             }
-            Request::LayoutSetDivider(op) => {
-                self.apply(|layout| layout.set_divider(&op.path, op.boundary, op.area, op.limits))
-            }
+            Request::LayoutSetDivider(op) => self.apply(|layout| {
+                layout.set_divider(op.float, &op.path, op.boundary, op.area, op.limits)
+            }),
             Request::LayoutToggleZoom => self.apply(Layout::toggle_zoom),
             Request::LayoutAddFloat(op) => self.add_float(op),
             Request::LayoutToggleFloats => self.apply(Layout::toggle_floats),
