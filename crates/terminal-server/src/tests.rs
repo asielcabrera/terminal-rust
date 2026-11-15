@@ -627,7 +627,7 @@ fn the_exit_is_notified_after_all_the_output_was_forwarded() {
 // tests pin the JSON round trip so stage 3 can reuse the mapping without behavior drift.
 
 use serde::{Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use terminal_protocol::layout::Axis;
 use wire::{
     Deframed, IpcCreatedPane, WIRE_VERSION, WireEvent, WireEventKind, WireOp, WireReply,
@@ -2800,5 +2800,180 @@ fn attach_streams_the_snapshot_then_live_bytes() {
     read_until_marker(&mut win_block, "echo-live");
     cli.close();
     window.close();
+    harness.wait_no_sessions();
+}
+
+/// Connects WITHOUT the client reader thread: the raw socket halves, as a foreign wire client
+/// (the python probe) sees them. Requests go out through the connection's writer; frames are
+/// read raw, typed bytes included.
+#[cfg(unix)]
+fn raw_client(path: &std::path::Path) -> (IpcConn, Box<dyn Read + Send>) {
+    IpcConn::connect(&IpcEndpoint::Socket(path.to_path_buf())).expect("the raw client connects")
+}
+
+/// Reads raw frames on a thread until the connection ends, tallying the snapshot frames per
+/// block token (control frames are dropped: a raw client correlates by order, not content).
+/// A clone of the tally is returned for polling without blocking the read.
+#[cfg(unix)]
+type SnapshotTally = (
+    Arc<Mutex<HashMap<BlockId, Vec<Vec<u8>>>>>,
+    thread::JoinHandle<()>,
+);
+
+#[cfg(unix)]
+fn tally_snapshots(read: Box<dyn Read + Send>) -> SnapshotTally {
+    let snapshots: Arc<Mutex<HashMap<BlockId, Vec<Vec<u8>>>>> = Default::default();
+    let tally = snapshots.clone();
+    let reader = thread::spawn(move || {
+        let mut read = read;
+        loop {
+            match read_typed_frame(&mut *read) {
+                Ok(WireFrame::Snapshot(token, bytes)) => {
+                    tally
+                        .lock()
+                        .unwrap()
+                        .entry(BlockId(u64::from(token)))
+                        .or_default()
+                        .push(bytes);
+                }
+                Ok(_) => {}
+                Err(_) => return, // the connection ended
+            }
+        }
+    });
+    (snapshots, reader)
+}
+
+/// The invariant a session must hold: a block's snapshot is queued exactly once per session at
+/// attach (an existing pane's; a fresh pane has none), and only live chunks follow. A raw wire
+/// client used to receive the same 127-byte zsh-prompt snapshot every ~500 ms, forever — the
+/// flood starved the control channel until no reply or event made it through in time.
+#[test]
+#[cfg(unix)]
+fn a_session_receives_its_attach_snapshots_once_and_only_live_data_after() {
+    let harness = Harness::start();
+
+    // A raw client attaches to the fresh server: no snapshot exists yet, so only the init
+    // reply and the shell's earliest output may arrive
+    let (first, first_read) = raw_client(&harness.path);
+    let (first_flood, first_reader) = tally_snapshots(first_read);
+    first.send_op(wire::WireOp::Attach {
+        shell: wire::WireShell::from_config(&waiting()),
+        cols: 80,
+        rows: 24,
+        scrollback: 1000,
+    });
+    thread::sleep(Duration::from_secs(2));
+    let flood = first_flood.lock().unwrap().clone();
+    assert!(
+        flood.is_empty(),
+        "a fresh attach queues no snapshot, yet tokens {flood:?} were flooded"
+    );
+
+    // A second raw client attaches to the existing layout: its snapshot for the live pane is
+    // queued exactly once, and nothing re-queues it afterwards
+    let (second, second_read) = raw_client(&harness.path);
+    let (snapshots, second_reader) = tally_snapshots(second_read);
+    second.send_op(wire::WireOp::Attach {
+        shell: wire::WireShell::from_config(&waiting()),
+        cols: 80,
+        rows: 24,
+        scrollback: 1000,
+    });
+    thread::sleep(Duration::from_secs(2));
+    let taken = snapshots.lock().unwrap().clone();
+    let counts: Vec<_> = taken
+        .iter()
+        .map(|(token, bytes)| (*token, bytes.len()))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![(BlockId(0), 1)],
+        "the existing pane's snapshot is queued exactly once, got {taken:?}"
+    );
+
+    // Keep reading: only live data may follow, no new snapshot frames
+    let before = taken.get(&BlockId(0)).map_or(0, Vec::len);
+    thread::sleep(Duration::from_secs(1));
+    let after = snapshots.lock().unwrap().clone();
+    let grew = after
+        .iter()
+        .any(|(token, bytes)| bytes.len() > before.max(1) || !taken.contains_key(token));
+    assert!(!grew, "no new snapshot frames after the attach: {after:?}");
+    first.close();
+    second.close();
+    let _ = (first_reader.join(), second_reader.join());
+    harness.wait_no_sessions();
+}
+
+/// A session that already attached must not re-run the attach when a request repeats on its
+/// connection (a client retrying a request it believes went unanswered used to receive the
+/// whole snapshot set again per retry — the same 127-byte screen, over and over, until the
+/// control channel drowned). A repeat Init/Attach answers with the state only.
+#[test]
+#[cfg(unix)]
+fn an_already_attached_session_does_not_requeue_its_snapshots() {
+    let harness = Harness::start();
+    let (conn, read) = raw_client(&harness.path);
+    let (snapshots, reader) = tally_snapshots(read);
+    let attach = || {
+        conn.send_op(wire::WireOp::Attach {
+            shell: wire::WireShell::from_config(&waiting()),
+            cols: 80,
+            rows: 24,
+            scrollback: 1000,
+        });
+    };
+    attach(); // fresh: init, no snapshot
+    thread::sleep(Duration::from_millis(300));
+    attach(); // the layout exists now: this is the repeat that used to flood
+    thread::sleep(Duration::from_millis(300));
+    attach(); // and once more, for good measure
+    thread::sleep(Duration::from_secs(1));
+
+    let taken = snapshots.lock().unwrap().clone();
+    assert!(
+        taken.is_empty(),
+        "an already-attached session never re-queues snapshots, got {taken:?}"
+    );
+    conn.close();
+    let _ = reader.join();
+    harness.wait_no_sessions();
+}
+
+/// A session subscribed to a block receives that block's snapshot exactly once, no matter how
+/// many times the subscribe request repeats
+#[test]
+#[cfg(unix)]
+fn a_subscribed_block_snapshots_exactly_once_per_session() {
+    let harness = Harness::start();
+    let (window, _window_events) = harness.client();
+    let pane = attach_fresh(&window);
+    let mut win_block = open_feed(&window, pane.block);
+    win_block.write(b"seed-screen\n");
+    read_until_marker(&mut win_block, "seed-screen");
+
+    let (cli, read) = raw_client(&harness.path);
+    let (snapshots, reader) = tally_snapshots(read);
+    cli.send_op(wire::WireOp::AutomationSubscribe { block: pane.block });
+    thread::sleep(Duration::from_millis(300));
+    cli.send_op(wire::WireOp::AutomationSubscribe { block: pane.block });
+    thread::sleep(Duration::from_secs(1));
+
+    let taken = snapshots.lock().unwrap().clone();
+    let counts: Vec<_> = taken
+        .iter()
+        .map(|(token, bytes)| (*token, bytes.len()))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![(pane.block, 1)],
+        "the subscribed block snapshots exactly once per session, got {taken:?}"
+    );
+    win_block.write(b"after-subscribe\n");
+    read_until_marker(&mut win_block, "after-subscribe");
+    cli.close();
+    window.close();
+    let _ = reader.join();
     harness.wait_no_sessions();
 }
