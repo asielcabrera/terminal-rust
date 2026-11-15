@@ -219,7 +219,12 @@ fn prepare(
         package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua;{current}"))?;
     }
 
-    lua.globals().set("terminal", terminal)?;
+    lua.globals().set("terminal", terminal.clone())?;
+    // The config is a module: `local terminal = require("terminal")` like wezterm does — the LSP
+    // reads the stub file for completion, the runtime serves the injected table from package.loaded
+    let package: Table = lua.globals().get("package")?;
+    let loaded: Table = package.get("loaded")?;
+    loaded.set("terminal", terminal)?;
     Ok(())
 }
 

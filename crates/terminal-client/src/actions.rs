@@ -1201,7 +1201,21 @@ mod tests {
             &script.commands_handle(),
         )
         .unwrap();
-        script.lua().globals().set("terminal", terminal).unwrap();
+        script
+            .lua()
+            .globals()
+            .set("terminal", terminal.clone())
+            .unwrap();
+        // The terminal is also a module: `local terminal = require("terminal")` in config.lua,
+        // so the LSP can offer completion against a typed stub
+        let loaded: mlua::Table = script
+            .lua()
+            .globals()
+            .get::<mlua::Table>("package")
+            .expect("the package table exists")
+            .get("loaded")
+            .expect("the loaded table exists");
+        loaded.set("terminal", terminal).unwrap();
         script
     }
 
