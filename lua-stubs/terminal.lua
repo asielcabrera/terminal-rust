@@ -40,8 +40,16 @@
 ---@field DecreaseFontSize table
 ---@field ResetFontSize table
 
+---@class terminal-mouse
+---@field copy_on_select boolean selecting with the mouse copies on release
+---@field right_click '"paste"'|'"none"'
+---@field scroll_lines integer lines per wheel notch (1..100)
+---@field smooth_scroll boolean sub-line wheel animation (default true)
+---@field rectangle_modifiers string modifiers for rectangle selection
+
 ---@class terminal
 ---@field os terminal-os
+---@field mouse terminal-mouse
 ---@field config_dir string
 ---@field log fun(message: string)
 ---@field action terminal-action

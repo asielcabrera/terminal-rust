@@ -126,6 +126,9 @@ return {
     right_click = "paste",
     -- Lines per wheel notch (1..100). Touchpads scroll in pixels.
     scroll_lines = 3,
+    -- Smooth scrolling: wheel/touchpad scrolling animates sub-line (the content glides);
+    -- output arriving snaps the view back to the whole-line viewport instantly.
+    smooth_scroll = true,
     -- Dragging with these modifiers selects a rectangle instead of whole lines.
     -- Cannot be empty (dragging without modifiers already selects).
     rectangle_modifiers = "CTRL|ALT",
