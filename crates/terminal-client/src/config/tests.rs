@@ -757,6 +757,27 @@ fn mouse_and_window_options_are_read() {
 }
 
 #[test]
+fn smooth_scrolling_is_on_by_default_and_can_be_turned_off() {
+    assert!(
+        Config::default().mouse.smooth_scroll,
+        "the animation is the feature: on without configuration"
+    );
+    assert!(
+        parse_str("return { mouse = { smooth_scroll = true } }")
+            .unwrap()
+            .mouse
+            .smooth_scroll
+    );
+    assert!(
+        !parse_str("return { mouse = { smooth_scroll = false } }")
+            .unwrap()
+            .mouse
+            .smooth_scroll,
+        "the knob returns to today's whole-line jumps"
+    );
+}
+
+#[test]
 fn bad_mouse_and_window_options_explain_themselves() {
     let error = parse_str(r#"return { window = { decorations = "border" } }"#).unwrap_err();
     assert!(

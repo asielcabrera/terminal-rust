@@ -17,6 +17,7 @@ use winit::window::Window;
 use crate::config::Config;
 use crate::glyphs::{GlyphCache, GlyphKey};
 use crate::layout::Rect;
+use crate::pane::{GhostCell, GhostRow, GhostSide};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -27,10 +28,10 @@ struct RectInstance {
 }
 
 impl RectInstance {
-    fn new(x: u32, y: u32, width: u32, height: u32, color: RgbColor) -> Self {
+    fn new(x: f32, y: f32, width: f32, height: f32, color: RgbColor) -> Self {
         Self {
-            pos: [x as f32, y as f32],
-            size: [width as f32, height as f32],
+            pos: [x, y],
+            size: [width, height],
             color: rgba(color),
         }
     }
@@ -1033,13 +1034,20 @@ pub struct PaneView<'a> {
     pub floating: bool,
     /// Grid the terminal is currently sized at (columns, rows), for clipping image placements
     pub grid: (u16, u16),
+    /// Smooth-scroll animation offset (T12): pixels the content is drawn away from the
+    /// settled whole-line viewport (positive = drawn lower). Zero at rest: grid-aligned.
+    pub(crate) scroll_offset_px: f32,
+    /// The captured edge row sliding out during the animation, with the side of the grid it
+    /// slides out on (a fraction that pushed the offset past zero must not draw it on the
+    /// wrong side, so the side travels with the ghost)
+    pub(crate) ghost: Option<(GhostSide, &'a GhostRow)>,
 }
 
 /// Colors for selected text (`None` = invert the screen colors)
 #[derive(Clone, Copy, Default)]
-struct SelectionColors {
-    foreground: Option<RgbColor>,
-    background: Option<RgbColor>,
+pub(crate) struct SelectionColors {
+    pub(crate) foreground: Option<RgbColor>,
+    pub(crate) background: Option<RgbColor>,
 }
 
 impl From<&Config> for SelectionColors {
@@ -1404,6 +1412,9 @@ impl Renderer {
             frame: Option<RgbColor>,
             floating: bool,
             images: PaneImages,
+            grid: (u16, u16),
+            scroll_offset_px: f32,
+            ghost: Option<(GhostSide, &'s GhostRow)>,
         }
 
         self.ledger.advance_frame();
@@ -1505,6 +1516,9 @@ impl Renderer {
                 frame,
                 floating: view.floating,
                 images,
+                grid: view.grid,
+                scroll_offset_px: view.scroll_offset_px,
+                ghost: view.ghost,
             });
         }
         let Some((background, foreground)) = prepared
@@ -1529,10 +1543,10 @@ impl Renderer {
                 let start = self.frame.lengths();
                 for rect in dividers {
                     self.frame.backgrounds.push(RectInstance::new(
-                        rect.x,
-                        rect.y,
-                        rect.w,
-                        rect.h,
+                        rect.x as f32,
+                        rect.y as f32,
+                        rect.w as f32,
+                        rect.h as f32,
                         divider_color,
                     ));
                 }
@@ -1552,14 +1566,14 @@ impl Renderer {
                 if pane.floating {
                     let r = pane.rect;
                     self.frame.backgrounds.push(RectInstance::new(
-                        r.x,
-                        r.y,
-                        r.w,
-                        r.h,
+                        r.x as f32,
+                        r.y as f32,
+                        r.w as f32,
+                        r.h as f32,
                         pane.colors.background,
                     ));
                 }
-                let origin = (pane.rect.x + self.padding, pane.rect.y + self.padding);
+                let origin = pane_content_origin(pane.rect, self.padding, pane.scroll_offset_px);
                 build_frame(
                     &pane.snapshot,
                     &mut self.row_iter,
@@ -1587,13 +1601,46 @@ impl Renderer {
                     pane.images.below.extend(runs_below);
                     pane.images.above.extend(runs_above);
                 }
+                // The ghost row slides out just beyond the grid edge while the offset decays
+                // (T12); it only draws while the offset's sign matches its side
+                if pane.scroll_offset_px != 0.0
+                    && let Some((side, ghost)) = pane.ghost
+                    && match side {
+                        GhostSide::Below => pane.scroll_offset_px < 0.0,
+                        GhostSide::Above => pane.scroll_offset_px > 0.0,
+                    }
+                {
+                    push_ghost_row(
+                        &mut self.frame,
+                        &mut self.cache,
+                        ghost,
+                        origin.0,
+                        origin.1 - pane.scroll_offset_px,
+                        pane.grid.1,
+                        pane.scroll_offset_px,
+                        pane.colors.background,
+                        pane.dim,
+                    );
+                }
                 if let Some(color) = pane.frame {
-                    let (r, t) = (pane.rect, frame_thickness);
+                    let (r, t) = (pane.rect, frame_thickness as f32);
                     self.frame.overlays.extend([
-                        RectInstance::new(r.x, r.y, r.w, t, color),
-                        RectInstance::new(r.x, (r.y + r.h).saturating_sub(t), r.w, t, color),
-                        RectInstance::new(r.x, r.y, t, r.h, color),
-                        RectInstance::new((r.x + r.w).saturating_sub(t), r.y, t, r.h, color),
+                        RectInstance::new(r.x as f32, r.y as f32, r.w as f32, t, color),
+                        RectInstance::new(
+                            r.x as f32,
+                            (r.y + r.h).saturating_sub(frame_thickness) as f32,
+                            r.w as f32,
+                            t,
+                            color,
+                        ),
+                        RectInstance::new(r.x as f32, r.y as f32, t, r.h as f32, color),
+                        RectInstance::new(
+                            (r.x + r.w).saturating_sub(frame_thickness) as f32,
+                            r.y as f32,
+                            t,
+                            r.h as f32,
+                            color,
+                        ),
                     ]);
                 }
                 let image_start = self.frame.images.len() as u32;
@@ -1601,10 +1648,7 @@ impl Renderer {
                     for draw in draws {
                         let quad = &draw.quad;
                         frame.images.push(ImageInstance {
-                            pos: [
-                                origin.0 as f32 + quad.x as f32,
-                                origin.1 as f32 + quad.y as f32,
-                            ],
+                            pos: [origin.0 + quad.x as f32, origin.1 + quad.y as f32],
                             size: [quad.w as f32, quad.h as f32],
                             uv_origin: quad.uv_origin,
                             uv_size: quad.uv_size,
@@ -1958,7 +2002,7 @@ fn build_frame(
     colors: &Colors,
     cursor: Option<Cursor>,
     selection: SelectionColors,
-    origin: (u32, u32),
+    origin: (f32, f32),
     batch_start: usize,
     dim: f32,
 ) {
@@ -1980,7 +2024,7 @@ fn build_frame(
             .ok()
             .and_then(|raw| raw.has_kitty_virtual_placeholder().ok())
             .unwrap_or(false);
-        let y = origin.1 + u32::from(this_row) * cell_h;
+        let y = origin.1 + (u32::from(this_row) * cell_h) as f32;
         // Selected columns in this row (inclusive); `None` if the selection does not touch it
         let selected_columns = row
             .selection()
@@ -1997,7 +2041,7 @@ fn build_frame(
         while let Some(cell) = cells.next() {
             let this_col = col;
             col += 1;
-            let x = origin.0 + u32::from(this_col) * cell_w;
+            let x = origin.0 + (u32::from(this_col) * cell_w) as f32;
 
             let style = cell.style().unwrap_or_default();
             let wide = cell
@@ -2057,14 +2101,18 @@ fn build_frame(
                     Some(last)
                         if can_merge
                             && last.color == color
-                            && last.pos[1] == y as f32
-                            && last.pos[0] + last.size[0] == x as f32 =>
+                            && last.pos[1] == y
+                            && last.pos[0] + last.size[0] == x =>
                     {
                         last.size[0] += cell_w as f32;
                     }
-                    _ => frame
-                        .backgrounds
-                        .push(RectInstance::new(x, y, cell_w, cell_h, bg)),
+                    _ => frame.backgrounds.push(RectInstance::new(
+                        x,
+                        y,
+                        cell_w as f32,
+                        cell_h as f32,
+                        bg,
+                    )),
                 }
             }
 
@@ -2084,7 +2132,7 @@ fn build_frame(
                         };
                         if let Some(glyph) = cache.glyph(key) {
                             frame.glyphs.push(GlyphInstance {
-                                pos: [(x as i32 + glyph.x) as f32, (y as i32 + glyph.y) as f32],
+                                pos: [x + glyph.x as f32, y + glyph.y as f32],
                                 size: [glyph.width as f32, glyph.height as f32],
                                 atlas: [glyph.atlas_x as f32, glyph.atlas_y as f32],
                                 color: rgba(fg),
@@ -2096,48 +2144,48 @@ fn build_frame(
 
             // Decorations. "Spacer" cells draw nothing: the wide cell already covers both.
             if !is_spacer {
-                let width = cell_w * span;
+                let width = (cell_w * span) as f32;
                 let decoration = resolve_style_color(style.underline_color, colors).unwrap_or(fg);
                 match style.underline {
                     Underline::None => {}
                     Underline::Double => {
                         frame.overlays.push(RectInstance::new(
                             x,
-                            y + cache.underline_y,
+                            y + cache.underline_y as f32,
                             width,
-                            thickness,
+                            thickness as f32,
                             decoration,
                         ));
                         frame.overlays.push(RectInstance::new(
                             x,
-                            y + cache.underline_y.saturating_sub(2 * thickness),
+                            y + cache.underline_y.saturating_sub(2 * thickness) as f32,
                             width,
-                            thickness,
+                            thickness as f32,
                             decoration,
                         ));
                     }
                     // Wavy, dotted, and dashed are approximated with a single line
                     _ => frame.overlays.push(RectInstance::new(
                         x,
-                        y + cache.underline_y,
+                        y + cache.underline_y as f32,
                         width,
-                        thickness,
+                        thickness as f32,
                         decoration,
                     )),
                 }
                 if style.strikethrough {
                     frame.overlays.push(RectInstance::new(
                         x,
-                        y + cache.strikethrough_y,
+                        y + cache.strikethrough_y as f32,
                         width,
-                        thickness,
+                        thickness as f32,
                         fg,
                     ));
                 }
                 if style.overline {
                     frame
                         .overlays
-                        .push(RectInstance::new(x, y, width, thickness, fg));
+                        .push(RectInstance::new(x, y, width, thickness as f32, fg));
                 }
 
                 // The block cursor was already painted as a background; the rest are rectangles
@@ -2150,24 +2198,30 @@ fn build_frame(
                         CursorVisualStyle::Bar => frame.overlays.push(RectInstance::new(
                             x,
                             y,
-                            thickness * 2,
-                            cell_h,
+                            (thickness * 2) as f32,
+                            cell_h as f32,
                             color,
                         )),
                         CursorVisualStyle::Underline => frame.overlays.push(RectInstance::new(
                             x,
-                            y + cell_h.saturating_sub(thickness * 2),
+                            y + cell_h.saturating_sub(thickness * 2) as f32,
                             width,
-                            thickness * 2,
+                            (thickness * 2) as f32,
                             color,
                         )),
                         CursorVisualStyle::BlockHollow => {
-                            let t = thickness;
+                            let t = thickness as f32;
                             frame.overlays.extend([
                                 RectInstance::new(x, y, width, t, color),
-                                RectInstance::new(x, y + cell_h - t, width, t, color),
-                                RectInstance::new(x, y, t, cell_h, color),
-                                RectInstance::new(x + width - t, y, t, cell_h, color),
+                                RectInstance::new(
+                                    x,
+                                    y + (cell_h - thickness) as f32,
+                                    width,
+                                    t,
+                                    color,
+                                ),
+                                RectInstance::new(x, y, t, cell_h as f32, color),
+                                RectInstance::new(x + width - t, y, t, cell_h as f32, color),
                             ]);
                         }
                         _ => {}
@@ -2176,6 +2230,213 @@ fn build_frame(
             }
         }
     }
+}
+
+/// Pixel origin (top-left of the pane's first cell) with the smooth-scroll offset applied
+/// (T12). With a zero offset this is exactly the integer grid, so resting frames render
+/// identical to before the f32 coordinates.
+fn pane_content_origin(rect: Rect, padding: u32, offset: f32) -> (f32, f32) {
+    (
+        (rect.x + padding) as f32,
+        (rect.y + padding) as f32 + offset,
+    )
+}
+
+/// Y position of the ghost row: just outside the grid on the side the content slides out of
+/// (T12). Scrolling up (offset negative) the content sits above its settled spot and the
+/// ghost slides out below the grid, starting at the settled bottom row; scrolling down
+/// (offset positive) it slides out above, starting at the old top row.
+fn ghost_row_y(origin_y: f32, rows: u16, cell_height: f32, offset: f32) -> f32 {
+    if offset < 0.0 {
+        origin_y + f32::from(rows) * cell_height + offset
+    } else {
+        origin_y + offset - cell_height
+    }
+}
+
+/// Draws a captured ghost row (T12): the edge row that slides out during a smooth scroll,
+/// mirroring `build_frame`'s per-cell loop from the cached cell data (the colors were
+/// resolved at capture time; only the inactive-pane dim is applied here). It sits at the
+/// grid edge the content leaves through, adjacent to the shifted viewport content, so
+/// text and backgrounds slide out as one block.
+#[allow(clippy::too_many_arguments)]
+fn push_ghost_row(
+    frame: &mut Frame,
+    cache: &mut GlyphCache,
+    ghost: &GhostRow,
+    origin_x: f32,
+    origin_y: f32,
+    rows: u16,
+    offset: f32,
+    background: RgbColor,
+    dim: f32,
+) {
+    let (cell_w, cell_h) = ((cache.cell_width as f32), (cache.cell_height as f32));
+    let y = ghost_row_y(origin_y, rows, cell_h, offset);
+    for (col, cell) in ghost.cells.iter().enumerate() {
+        let x = origin_x + col as f32 * cell_w;
+        let is_spacer = matches!(cell.wide, CellWide::SpacerTail | CellWide::SpacerHead);
+        let span = if cell.wide == CellWide::Wide {
+            2.0
+        } else {
+            1.0
+        };
+        // Background (per cell: the ghost is transient, adjacent same-color cells overlap
+        // harmlessly inside the pane's scissor)
+        if cell.bg != background {
+            frame
+                .backgrounds
+                .push(RectInstance::new(x, y, cell_w, cell_h, cell.bg));
+        }
+        let mut fg = cell.fg;
+        if dim > 0.0 {
+            fg = mix(fg, cell.bg, dim);
+        }
+        // Text
+        if !cell.invisible && !is_spacer && !cell.text.is_empty() {
+            for ch in cell.text.chars().filter(|&ch| !is_invisible(ch)) {
+                let key = GlyphKey {
+                    ch,
+                    bold: cell.bold,
+                    italic: cell.italic,
+                };
+                if let Some(glyph) = cache.glyph(key) {
+                    frame.glyphs.push(GlyphInstance {
+                        pos: [x + glyph.x as f32, y + glyph.y as f32],
+                        size: [glyph.width as f32, glyph.height as f32],
+                        atlas: [glyph.atlas_x as f32, glyph.atlas_y as f32],
+                        color: rgba(fg),
+                    });
+                }
+            }
+        }
+        // Decorations, same placement rules as build_frame
+        if !is_spacer {
+            let width = cell_w * span;
+            let decoration = cell.underline_color.unwrap_or(fg);
+            match cell.underline {
+                Underline::None => {}
+                Underline::Double => {
+                    frame.overlays.push(RectInstance::new(
+                        x,
+                        y + cache.underline_y as f32,
+                        width,
+                        cache.thickness as f32,
+                        decoration,
+                    ));
+                    frame.overlays.push(RectInstance::new(
+                        x,
+                        y + cache.underline_y.saturating_sub(2 * cache.thickness) as f32,
+                        width,
+                        cache.thickness as f32,
+                        decoration,
+                    ));
+                }
+                _ => frame.overlays.push(RectInstance::new(
+                    x,
+                    y + cache.underline_y as f32,
+                    width,
+                    cache.thickness as f32,
+                    decoration,
+                )),
+            }
+            if cell.strikethrough {
+                frame.overlays.push(RectInstance::new(
+                    x,
+                    y + cache.strikethrough_y as f32,
+                    width,
+                    cache.thickness as f32,
+                    fg,
+                ));
+            }
+        }
+    }
+}
+
+/// Captures a viewport row as cell data for the smooth-scroll ghost (T12), with colors
+/// resolved exactly as `build_frame` would draw them (palette, inverse, faint, selection;
+/// the cursor is not part of a captured row). `None` when the row is outside the viewport
+/// or the terminal state cannot be read.
+pub(crate) fn capture_ghost_row(
+    terminal: &Terminal<'static, 'static>,
+    state: &mut RenderState<'static>,
+    row_index: u16,
+    selection: SelectionColors,
+) -> Option<GhostRow> {
+    let snapshot = state.update(terminal).ok()?;
+    let colors = snapshot.colors().ok()?;
+    let mut row_iter = RowIterator::new().ok()?;
+    let mut rows = row_iter.update(&snapshot).ok()?;
+    let mut index = 0u16;
+    let row = loop {
+        let row = rows.next()?;
+        if index == row_index {
+            break row;
+        }
+        index += 1;
+    };
+    let selected_columns = row
+        .selection()
+        .ok()
+        .flatten()
+        .map(|range| range.start_x..=range.end_x);
+    let row_has_placeholders = row
+        .raw_row()
+        .ok()
+        .and_then(|raw| raw.has_kitty_virtual_placeholder().ok())
+        .unwrap_or(false);
+    let mut cell_iter = CellIterator::new().ok()?;
+    let mut cells = cell_iter.update(row).ok()?;
+    let mut captured = Vec::new();
+    while let Some(cell) = cells.next() {
+        let this_col = captured.len() as u16;
+        let style = cell.style().unwrap_or_default();
+        let wide = cell
+            .raw_cell()
+            .and_then(|raw| raw.wide())
+            .unwrap_or(CellWide::Narrow);
+        let is_placeholder = row_has_placeholders
+            && cell.raw_cell().ok().and_then(|raw| raw.codepoint().ok()) == Some(KITTY_PLACEHOLDER);
+        let mut fg = cell.fg_color().ok().flatten().unwrap_or(colors.foreground);
+        let mut bg = cell.bg_color().ok().flatten().unwrap_or(colors.background);
+        if style.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if style.faint {
+            fg = mix(fg, bg, 0.5);
+        }
+        if selected_columns
+            .as_ref()
+            .is_some_and(|range| range.contains(&this_col))
+        {
+            bg = selection.background.unwrap_or(colors.foreground);
+            fg = selection.foreground.unwrap_or(colors.background);
+        }
+        // Spacer, placeholder, and invisible cells carry no text (a spacer's wide cell
+        // covers both columns; a placeholder's image slice is not part of the ghost)
+        let drawable = !style.invisible
+            && !matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead)
+            && !is_placeholder;
+        let mut text = String::new();
+        if drawable && cell.graphemes_utf8(&mut text).is_ok() {
+            text.retain(|ch| !is_invisible(ch));
+        } else {
+            text.clear();
+        }
+        captured.push(GhostCell {
+            text,
+            wide,
+            fg,
+            bg,
+            underline: style.underline,
+            underline_color: resolve_style_color(style.underline_color, &colors),
+            strikethrough: style.strikethrough,
+            invisible: style.invisible,
+            bold: style.bold,
+            italic: style.italic,
+        });
+    }
+    (!captured.is_empty()).then_some(GhostRow { cells: captured })
 }
 
 #[cfg(test)]
@@ -2914,5 +3175,35 @@ mod tests {
             (8, 16),
         );
         assert!(below.is_empty() && above.is_empty(), "no cells, no runs");
+    }
+
+    // T12: the smooth-scroll origin and ghost-row placement, as pure geometry
+    #[test]
+    fn the_resting_origin_is_grid_aligned_and_the_offset_shifts_it() {
+        let rect = Rect::new(40, 30, 800, 600);
+        // With no offset the origin is exactly the integer pixel grid (offset-0 invariance)
+        assert_eq!(pane_content_origin(rect, 6, 0.0), (46.0, 36.0));
+        let (x, y) = pane_content_origin(rect, 6, -3.5);
+        assert_eq!(x, 46.0, "the offset is vertical only");
+        assert!((y - 32.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_ghost_row_draws_just_outside_the_grid_on_the_slide_out_side() {
+        // Scrolling up (offset negative): the content sits above its settled spot and the
+        // ghost slides out below the grid, starting at the settled bottom row
+        assert_eq!(ghost_row_y(100.0, 3, 20.0, -8.0), 152.0);
+        assert_eq!(
+            ghost_row_y(100.0, 3, 20.0, -20.0),
+            140.0,
+            "one line above the grid"
+        );
+        // Scrolling down (offset positive): the ghost slides out above the grid
+        assert_eq!(ghost_row_y(100.0, 3, 20.0, 8.0), 88.0);
+        assert_eq!(
+            ghost_row_y(100.0, 3, 20.0, 20.0),
+            100.0,
+            "at the old top row"
+        );
     }
 }

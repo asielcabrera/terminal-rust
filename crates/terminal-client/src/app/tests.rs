@@ -54,3 +54,33 @@ fn terminal_happenings_map_to_well_known_wire_emits() {
                 && payload == serde_json::json!({ "pane": 1, "title": "editor" })
     ));
 }
+
+// T12: which whole lines a Delta scroll actually moves, and which pre-scroll viewport row
+// slides out during the animated slide (the edge the content leaves through)
+#[test]
+fn a_delta_scroll_moves_what_the_scrollback_allows_and_slides_out_one_edge_row() {
+    // (total, offset, len) of the scrollable area: 100 history rows above a 24-row viewport
+    let bar = (124, 100, 24);
+    // Scrolling up 3 lines moves 3 rows; the slide starts with the pre-scroll bottom rows
+    // still visible, so the row that slides out is row 21 (rows 22 and 23 left with the
+    // instant part of the jump)
+    assert_eq!(smooth_slide(-3, bar, 24), Some((true, Some(21))));
+    // Scrolling down 1 line slides out the viewport's top row
+    assert_eq!(smooth_slide(1, (124, 0, 24), 24), Some((false, Some(0))));
+}
+
+#[test]
+fn a_scroll_clamped_at_a_scrollback_edge_does_not_animate() {
+    // At the top of the history there is nothing above to scroll into
+    assert_eq!(smooth_slide(-3, (124, 0, 24), 24), None);
+    // At the bottom (the resting viewport) there is nothing below
+    assert_eq!(smooth_slide(2, (124, 100, 24), 24), None);
+}
+
+#[test]
+fn a_jump_bigger_than_the_viewport_still_animates_but_has_no_ghost_row() {
+    // 30 lines up from 100 rows of room: the slide-out row would be row -6, outside the
+    // pre-scroll viewport, so no ghost is captured (the animation still runs)
+    assert_eq!(smooth_slide(-30, (124, 100, 24), 24), Some((true, None)));
+    assert_eq!(smooth_slide(30, (124, 0, 24), 24), Some((false, None)));
+}

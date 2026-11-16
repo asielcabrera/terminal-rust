@@ -7,8 +7,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use libghostty_vt::kitty::graphics;
 use libghostty_vt::mouse;
+use libghostty_vt::screen::CellWide;
 use libghostty_vt::selection::gesture::Gesture;
-use libghostty_vt::style::{Palette, PaletteIndex, RgbColor};
+use libghostty_vt::style::{Palette, PaletteIndex, RgbColor, Underline};
 use libghostty_vt::terminal::{
     ConformanceLevel, CursorStyle as VtCursorStyle, DeviceAttributeFeature, DeviceAttributes,
     DeviceType, PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
@@ -297,6 +298,119 @@ fn terminal_dir(terminal: &Terminal<'static, 'static>) -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
+/// One cell of a captured ghost row (T12): its text and the colors exactly as the renderer
+/// would draw them (palette, inverse, faint, and selection already resolved; the cursor is
+/// not part of a captured row).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GhostCell {
+    /// Grapheme cluster text; empty for spacers, kitty placeholders, and invisible runs
+    pub(crate) text: String,
+    pub(crate) wide: CellWide,
+    pub(crate) fg: RgbColor,
+    pub(crate) bg: RgbColor,
+    pub(crate) underline: Underline,
+    pub(crate) underline_color: Option<RgbColor>,
+    pub(crate) strikethrough: bool,
+    pub(crate) invisible: bool,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+}
+
+/// A viewport edge row captured as cell data BEFORE a smooth scroll moved it (T12): the row
+/// that slides out of view while the animation runs. Pure client state, never terminal state.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct GhostRow {
+    pub(crate) cells: Vec<GhostCell>,
+}
+
+/// Which side of the grid the captured ghost row slides out on. Scrolling up (into the
+/// history) the content moves down and the ghost slides out below; scrolling down, above.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum GhostSide {
+    Above,
+    Below,
+}
+
+/// Smooth-scroll animation state of a pane (T12): the pixel offset the content is drawn at
+/// away from its settled whole-line viewport (which always stays on whole lines; only the
+/// drawing slides), decaying to zero, plus the captured ghost row.
+#[derive(Debug, Default)]
+pub(crate) struct SmoothScroll {
+    /// Pixels added to the drawn Y of every quad: positive draws the content lower than the
+    /// settled viewport (scrolling down, or a fraction peeking down), negative higher. It
+    /// never leaves one line height.
+    pub(crate) offset_px: f32,
+    /// Side of the grid the captured ghost row slides out on. The ghost is only drawn while
+    /// the offset's sign matches: a fraction that pushed the offset past zero must not draw
+    /// the ghost on the wrong side.
+    pub(crate) side: Option<GhostSide>,
+    pub(crate) ghost: Option<GhostRow>,
+}
+
+impl SmoothScroll {
+    /// Accumulates a sub-line wheel fraction (lines; positive = up) as a pixel peek: the
+    /// content slides by that fraction while the viewport stays put. An up fraction draws the
+    /// content lower (the row above peeks in at the top of the grid).
+    pub(crate) fn peek(&mut self, fraction_lines: f64, cell_height: f32) {
+        if cell_height <= 0.0 {
+            return;
+        }
+        let line = f64::from(cell_height);
+        self.offset_px =
+            (self.offset_px + (fraction_lines * line) as f32).clamp(-cell_height, cell_height);
+    }
+
+    /// Starts (or restarts) the slide of a whole-line scroll: the content is drawn one line
+    /// away from the settled viewport — above it when scrolling up into the history (so it
+    /// glides down to settle, matching what was on screen before the scroll) and below it
+    /// when scrolling down — and then decays to zero.
+    pub(crate) fn slide(&mut self, up: bool, cell_height: f32) {
+        if cell_height <= 0.0 {
+            return;
+        }
+        self.offset_px = if up {
+            self.offset_px - cell_height
+        } else {
+            self.offset_px + cell_height
+        };
+        self.offset_px = self.offset_px.clamp(-cell_height, cell_height);
+        self.side = Some(if up {
+            GhostSide::Below
+        } else {
+            GhostSide::Above
+        });
+    }
+
+    /// One decay step toward zero: a fixed fraction of a line per tick (the app passes a
+    /// sixth of the line height, so a full-line slide takes six ticks). Completing drops the
+    /// ghost. Returns whether the animation is still active.
+    pub(crate) fn decay(&mut self, step: f32) -> bool {
+        if self.offset_px == 0.0 {
+            self.snap();
+            return false;
+        }
+        if self.offset_px.abs() <= step {
+            self.snap();
+            return false;
+        }
+        self.offset_px -= step * self.offset_px.signum();
+        true
+    }
+
+    /// Snap to the settled whole-line viewport: output, resizes, pane switches, Top/Bottom
+    /// scrolls, and the knob turned off all end the animation immediately (output wins).
+    pub(crate) fn snap(&mut self) {
+        self.offset_px = 0.0;
+        self.side = None;
+        self.ghost = None;
+    }
+
+    /// Is an animation running (the renderer has to shift the pane's quads)?
+    pub(crate) fn active(&self) -> bool {
+        self.offset_px != 0.0
+    }
+}
+
 pub struct Pane {
     pub id: PaneId,
     pub terminal: Terminal<'static, 'static>,
@@ -316,6 +430,8 @@ pub struct Pane {
     pub selecting: bool,
     /// Button whose press was sent to the program (motion and release go to it as well)
     pub reported: Option<mouse::Button>,
+    /// Smooth-scroll animation state (T12): the drawing offset and the captured ghost row
+    pub(crate) scroll: SmoothScroll,
 }
 
 /// What a pane is built from: the server-allocated pane id, the grid size it was spawned at,
@@ -399,6 +515,7 @@ impl Pane {
             gesture: Gesture::new().map_err(vt_error)?,
             selecting: false,
             reported: None,
+            scroll: SmoothScroll::default(),
         })
     }
 
@@ -437,6 +554,8 @@ impl Pane {
     /// Notifies the PTY and libghostty (which reflows the buffer) of the new size
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u32, cell_height: u32) {
         self.grid = (cols, rows);
+        // A grid change reflows the buffer: the captured ghost row no longer matches (T12)
+        self.scroll.snap();
         self.io.resize(cols, rows);
         let _ = self.terminal.resize(cols, rows, cell_width, cell_height);
     }
@@ -1066,6 +1185,173 @@ mod tests {
                 .decode_png(&alloc, b"not a png")
                 .is_none(),
             "invalid data is rejected (kitty answers the transmit with an error)"
+        );
+    }
+
+    // T12: the smooth-scroll animation state (pure client state, never terminal state)
+    use crate::renderer::SelectionColors;
+
+    const CELL: f32 = 20.0;
+
+    #[test]
+    fn sub_line_wheel_fractions_accumulate_as_pixels_with_direction() {
+        let mut scroll = SmoothScroll::default();
+        // 0.4 of a 20 px line, scrolling up: the content peeks down
+        scroll.peek(0.4, CELL);
+        assert!(
+            (scroll.offset_px - 8.0).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+        scroll.peek(0.4, CELL);
+        assert!(
+            (scroll.offset_px - 16.0).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+        // The direction follows the wheel: a down fraction draws the content higher
+        scroll.peek(-0.5, CELL);
+        assert!(
+            (scroll.offset_px - 6.0).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+    }
+
+    #[test]
+    fn the_offset_accumulator_never_leaves_one_line() {
+        let mut scroll = SmoothScroll::default();
+        scroll.peek(1.5, CELL);
+        assert!(
+            (scroll.offset_px - CELL).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+        scroll.peek(-3.0, CELL);
+        assert!(
+            (scroll.offset_px + CELL).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+    }
+
+    #[test]
+    fn a_whole_line_scroll_slides_one_line_in_the_scroll_direction() {
+        // Up (into the history): the content is drawn one line above its settled spot and
+        // slides down to it. A 3-line notched wheel still bridges exactly one line.
+        let mut scroll = SmoothScroll::default();
+        scroll.slide(true, CELL);
+        assert!(
+            (scroll.offset_px + CELL).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+        // Down (toward the active area): the content starts one line below and slides up
+        let mut scroll = SmoothScroll::default();
+        scroll.slide(false, CELL);
+        assert!(
+            (scroll.offset_px - CELL).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+    }
+
+    #[test]
+    fn a_sub_line_peek_continues_into_the_whole_line_slide() {
+        // 0.4 lines peeked down, then the wheel completes the line scrolling up: the slide
+        // starts where the peek left the content (0.4 - 1 = -0.6 lines)
+        let mut scroll = SmoothScroll::default();
+        scroll.peek(0.4, CELL);
+        scroll.slide(true, CELL);
+        assert!(
+            (scroll.offset_px + 12.0).abs() < 1e-4,
+            "{}",
+            scroll.offset_px
+        );
+    }
+
+    #[test]
+    fn the_offset_decays_a_sixth_of_a_line_per_tick_and_drops_the_ghost_at_zero() {
+        let mut scroll = SmoothScroll::default();
+        scroll.slide(true, CELL);
+        scroll.ghost = Some(GhostRow::default());
+        let step = CELL / 6.0;
+        let mut magnitude = CELL;
+        let mut ticks = 0;
+        while scroll.decay(step) {
+            ticks += 1;
+            assert!(ticks <= 6, "a full line decays within six ticks");
+            let next = scroll.offset_px.abs();
+            assert!(next < magnitude, "each tick steps toward zero");
+            magnitude = next;
+        }
+        assert_eq!(ticks, 6, "five full steps plus the settle");
+        assert_eq!(scroll.offset_px, 0.0);
+        assert!(scroll.ghost.is_none(), "completion drops the ghost");
+        assert!(!scroll.decay(step), "an ended animation stays ended");
+    }
+
+    #[test]
+    fn snapping_clears_the_offset_and_the_ghost() {
+        let mut scroll = SmoothScroll::default();
+        scroll.peek(0.4, CELL);
+        scroll.ghost = Some(GhostRow::default());
+        scroll.side = Some(GhostSide::Below);
+        scroll.snap();
+        assert_eq!(scroll.offset_px, 0.0);
+        assert!(scroll.ghost.is_none());
+        assert!(scroll.side.is_none());
+        assert!(!scroll.active());
+    }
+
+    #[test]
+    fn the_ghost_row_captures_the_sliding_out_edge_cells() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 10,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        terminal.vt_write(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9");
+        let mut state = RenderState::new().unwrap();
+        // Scrolling up slides out the viewport's bottom row; scrolling down, its row 0
+        let bottom = crate::renderer::capture_ghost_row(
+            &terminal,
+            &mut state,
+            9,
+            SelectionColors::default(),
+        )
+        .unwrap();
+        assert_eq!(bottom.cells.len(), 40, "one entry per column");
+        assert_eq!(bottom.cells[0].text, "L");
+        assert_eq!(bottom.cells[1].text, "9");
+        let top = crate::renderer::capture_ghost_row(
+            &terminal,
+            &mut state,
+            0,
+            SelectionColors::default(),
+        )
+        .unwrap();
+        assert_eq!(top.cells[0].text, "L");
+        assert_eq!(top.cells[1].text, "0");
+        assert_eq!(
+            top.cells[0].fg,
+            RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            },
+            "factory foreground"
+        );
+        // A row past the viewport captures nothing
+        assert!(
+            crate::renderer::capture_ghost_row(
+                &terminal,
+                &mut state,
+                10,
+                SelectionColors::default()
+            )
+            .is_none()
         );
     }
 }

@@ -252,6 +252,21 @@ pub fn wheel_lines(
     whole as i32
 }
 
+/// Whole lines of a wheel event (see [`wheel_lines`]) plus the event's own signed
+/// displacement in lines (positive = up): the sub-line part beyond the whole lines, which the
+/// smooth-scroll offset accumulator feeds as a pixel peek (T12). Whole lines still go to
+/// `scroll_viewport` unchanged; only the fraction was previously dropped.
+fn wheel_event_lines(
+    delta: MouseScrollDelta,
+    scroll_lines: u16,
+    cell_height: u32,
+    remainder: &mut f64,
+) -> (i32, f64) {
+    let before = *remainder;
+    let lines = wheel_lines(delta, scroll_lines, cell_height, remainder);
+    (lines, *remainder - before + f64::from(lines))
+}
+
 impl App {
     pub(crate) fn undecorated(&self) -> bool {
         self.config.window.decorations == Decorations::None
@@ -647,13 +662,22 @@ impl App {
         };
         let (_, cell_height) = renderer.cell_size();
         let scroll_lines = self.config.mouse.scroll_lines;
-        let lines = wheel_lines(
+        let smooth = self.config.mouse.smooth_scroll;
+        let (lines, event_lines) = wheel_event_lines(
             delta,
             scroll_lines,
             cell_height,
             &mut self.mouse.wheel_remainder,
         );
         if lines == 0 {
+            // Sub-line wheel event (T12): with smooth scrolling on, the fraction accumulates
+            // in the pane's pixel offset as a peek of the adjacent row; the viewport does not
+            // change and the offset decays back if no whole line ever completes
+            if smooth && let Some(pane) = self.panes.get_mut(idx) {
+                pane.scroll.peek(event_lines, cell_height as f32);
+                self.schedule_scroll_decay();
+                self.redraw();
+            }
             return;
         }
         let up = lines > 0;
@@ -1165,6 +1189,30 @@ mod tests {
         assert_eq!(wheel_lines(pixels(8.0), 3, 20, &mut rest), 1);
         assert!((rest - 0.2).abs() < 1e-9, "{rest}");
         assert_eq!(wheel_lines(pixels(-100.0), 3, 20, &mut rest), -4);
+    }
+
+    #[test]
+    fn wheel_events_report_their_own_sub_line_displacement() {
+        let pixels = |y: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
+        let mut rest = 0.0;
+        // 20 px cells: an 8 px event is 0.4 of a line, all of it fraction
+        assert_eq!(wheel_event_lines(pixels(8.0), 3, 20, &mut rest), (0, 0.4));
+        assert_eq!(wheel_event_lines(pixels(8.0), 3, 20, &mut rest), (0, 0.4));
+        // The event that completes the line reports both: one whole line scrolled, and the
+        // event's own 0.4 (the 0.2 remainder stays behind for the next event)
+        let (lines, event) = wheel_event_lines(pixels(8.0), 3, 20, &mut rest);
+        assert_eq!(lines, 1);
+        assert!((event - 0.4).abs() < 1e-9, "{event}");
+        // A notched wheel's displacement is its whole lines
+        let mut rest = 0.0;
+        assert_eq!(
+            wheel_event_lines(MouseScrollDelta::LineDelta(0.0, -1.0), 3, 20, &mut rest),
+            (-3, -3.0)
+        );
+        assert_eq!(
+            wheel_event_lines(pixels(-100.0), 3, 20, &mut rest),
+            (-5, -5.0)
+        );
     }
 
     #[test]

@@ -384,6 +384,10 @@ pub struct MouseConfig {
     pub right_click: RightClick,
     /// Lines scrolled per wheel notch
     pub scroll_lines: u16,
+    /// The wheel scrolls with a sub-line slide animation (T12): whole lines still move the
+    /// viewport, but the content glides between them. Set it to false for the instant
+    /// whole-line jumps.
+    pub smooth_scroll: bool,
     /// Modifiers that, held while dragging, make a rectangular selection
     pub rectangle_modifiers: Modifiers,
 }
@@ -394,6 +398,7 @@ impl Default for MouseConfig {
             copy_on_select: true,
             right_click: RightClick::Paste,
             scroll_lines: 3,
+            smooth_scroll: true,
             rectangle_modifiers: Modifiers(CTRL | ALT),
         }
     }

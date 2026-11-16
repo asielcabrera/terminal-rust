@@ -7,7 +7,7 @@ use crate::pane::{
     MAX_CHUNKS_PER_WAKE, Pane, PaneSeed, apply_theme, install_png_decoder, with_integration,
 };
 use crate::pane_io::{IoEvent, Notify, PaneIo};
-use crate::renderer::{PaneView, Renderer};
+use crate::renderer::{PaneView, Renderer, SelectionColors};
 use libghostty_vt::key::{Action as KeyAction, Encoder, Event as GhosttyKeyEvent, Key, Mods};
 use libghostty_vt::paste;
 use libghostty_vt::terminal::{Mode, ScrollViewport};
@@ -189,10 +189,19 @@ pub struct App {
     /// Wire `Event`s that arrived while a handler was dispatching (T10): queued here and
     /// run once the hook's commands finished, in arrival order
     pub(crate) pending_events: VecDeque<(String, serde_json::Value, u8)>,
+    /// Next smooth-scroll decay tick (T12), while any pane's offset is non-zero
+    pub(crate) scroll_anim_deadline: Option<Instant>,
 }
 
 /// How often a starting window retries the server connection after spawning (and spawning) it
 const CONNECT_RETRIES: usize = 50;
+
+/// Fixed wall-clock step of the smooth-scroll animation (T12): one decay tick per frame,
+/// chained like the cursor blink's phase changes.
+const SMOOTH_SCROLL_FRAME: Duration = Duration::from_millis(16);
+/// Fraction of a line the smooth-scroll offset decays per tick: a full-line slide takes six
+/// ticks (~96 ms), the locked T12 design's fixed `cell_height / 6` step.
+const SMOOTH_SCROLL_DECAY: f32 = 1.0 / 6.0;
 
 /// Connects to the server (starting it detached if it is not running), exactly like the
 /// window does before attaching. The gateway dials again per remote client; this only
@@ -331,6 +340,11 @@ impl App {
         if self.layout.focus() == id {
             return;
         }
+        // Switching panes ends any smooth-scroll animation (T12)
+        for pane in &mut self.panes {
+            pane.scroll.snap();
+        }
+        self.scroll_anim_deadline = None;
         self.conn.send_op(wire::WireOp::SetFocus { pane: id });
     }
 
@@ -855,8 +869,99 @@ impl App {
     }
 
     pub(crate) fn scroll_pane(&mut self, index: usize, scroll: ScrollViewport) {
-        self.panes[index].terminal.scroll_viewport(scroll);
+        // Smooth scrolling (T12): a Delta scroll that actually moves the viewport animates a
+        // one-line slide over the edge row that slides out. Everything else (Top/Bottom, the
+        // knob off) snaps to the whole-line viewport exactly as before.
+        if let ScrollViewport::Delta(delta) = scroll
+            && delta != 0
+            && self.config.mouse.smooth_scroll
+            && self.smooth_delta_scroll(index, delta)
+        {
+            return;
+        }
+        let pane = &mut self.panes[index];
+        pane.terminal.scroll_viewport(scroll);
+        pane.scroll.snap();
         self.redraw_window();
+    }
+
+    /// Animates a Delta scroll if the viewport can move: captures the edge row that will
+    /// slide out, moves the viewport, and arms the offset decay. Returns false when the
+    /// viewport cannot move (clamped at a scrollback edge, alternate screen...) or there is
+    /// no renderer yet; the caller then scrolls without animation.
+    fn smooth_delta_scroll(&mut self, index: usize, delta: isize) -> bool {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return false;
+        };
+        let cell_height = renderer.cell_size().1 as f32;
+        let pane = &mut self.panes[index];
+        let Ok(bar) = pane.terminal.scrollbar() else {
+            return false;
+        };
+        let Some((up, ghost_row)) =
+            smooth_slide(delta, (bar.total, bar.offset, bar.len), pane.grid.1)
+        else {
+            return false;
+        };
+        // The ghost is the pre-scroll edge row the content leaves through: capture it
+        // BEFORE the viewport moves
+        if let Some(row) = ghost_row {
+            let selection = SelectionColors::from(&self.config);
+            pane.scroll.ghost = crate::renderer::capture_ghost_row(
+                &pane.terminal,
+                &mut pane.render_state,
+                row,
+                selection,
+            );
+        }
+        pane.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        pane.scroll.slide(up, cell_height);
+        self.schedule_scroll_decay();
+        self.redraw_window();
+        true
+    }
+
+    /// Arms the next smooth-scroll decay tick, coalescing with a pending one
+    pub(crate) fn schedule_scroll_decay(&mut self) {
+        self.scroll_anim_deadline
+            .get_or_insert_with(|| Instant::now() + SMOOTH_SCROLL_FRAME);
+    }
+
+    /// One smooth-scroll decay tick (T12): every animating pane's offset steps toward zero
+    /// by a sixth of a line, completing drops the ghost, and the chain re-arms while any
+    /// pane still animates. Mirrors the cursor blink chain.
+    pub(crate) fn tick_smooth_scroll(&mut self, now: Instant) {
+        let Some(deadline) = self.scroll_anim_deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let step = self
+            .renderer
+            .as_ref()
+            .map(|renderer| (renderer.cell_size().1 as f32) * SMOOTH_SCROLL_DECAY)
+            .unwrap_or(0.0);
+        if step <= 0.0 {
+            // No metrics yet (or a degenerate cell): end the animation instead of spinning
+            for pane in &mut self.panes {
+                pane.scroll.snap();
+            }
+            self.scroll_anim_deadline = None;
+            return;
+        }
+        let mut any = false;
+        let mut active = false;
+        for pane in &mut self.panes {
+            if pane.scroll.active() {
+                any = true;
+                active |= pane.scroll.decay(step);
+            }
+        }
+        self.scroll_anim_deadline = active.then(|| now + SMOOTH_SCROLL_FRAME);
+        if any {
+            self.redraw_window();
+        }
     }
 
     /// Pastes the clipboard, using bracketed paste if the program enabled it. libghostty
@@ -991,6 +1096,13 @@ impl App {
             eprintln!("[config] scrollback, window.columns/rows and shell only apply at startup");
         }
         self.config = new;
+        // The knob off returns to instant whole-line jumps: any running animation snaps
+        if !self.config.mouse.smooth_scroll {
+            for pane in &mut self.panes {
+                pane.scroll.snap();
+            }
+            self.scroll_anim_deadline = None;
+        }
         // The new keys and hooks replace the previous ones (with their Lua interpreter), and
         // the font size goes back to the configured one
         self.script = script;
@@ -1032,6 +1144,8 @@ impl App {
         }
         // If the terminal's internal state changed, redraw the frame
         if chunks > 0 {
+            // Output wins over the animation (T12): snap to the whole-line viewport
+            self.panes[index].scroll.snap();
             if id == self.layout.focus() {
                 self.blink.reset(Instant::now());
             }
@@ -1116,6 +1230,8 @@ impl App {
                         render_state: &mut pane.render_state,
                         rect: pane.rect,
                         grid: pane.grid,
+                        scroll_offset_px: pane.scroll.offset_px,
+                        ghost: pane.scroll.side.zip(pane.scroll.ghost.as_ref()),
                         focused: window_focused && pane.id == focus,
                         dim: several && pane.id != focus,
                         // With the prefix pressed there is a border even with a single pane
@@ -1174,6 +1290,41 @@ fn layout_dir(direction: Direction) -> layout::Dir {
         Direction::Up => layout::Dir::Up,
         Direction::Down => layout::Dir::Down,
     }
+}
+
+/// Which whole lines a Delta scroll actually moves (clamped to the scrollback edges) and the
+/// pre-scroll viewport row of the edge that slides out during the animated slide. Scrolling
+/// up (`up`, negative delta) the content glides down and the row that slides out is the
+/// pre-scroll row `rows - lines`; scrolling down it is viewport row `lines - 1`. `None` when
+/// the viewport cannot move at all; the ghost is `None` for jumps bigger than the viewport
+/// (the slide-out row was never on screen).
+fn smooth_slide(
+    delta: isize,
+    scrollable: (u64, u64, u64),
+    rows: u16,
+) -> Option<(bool, Option<u16>)> {
+    let (total, offset, len) = scrollable;
+    let up = delta < 0;
+    let room = if up {
+        offset
+    } else {
+        total.saturating_sub(offset.saturating_add(len))
+    };
+    let lines = u32::try_from((delta.unsigned_abs() as u64).min(room)).ok()?;
+    if lines == 0 {
+        return None;
+    }
+    let ghost = if lines <= u32::from(rows) {
+        let row = if up {
+            u32::from(rows) - lines
+        } else {
+            lines - 1
+        };
+        u16::try_from(row).ok()
+    } else {
+        None
+    };
+    Some((up, ghost))
 }
 
 fn map_key(code: KeyCode) -> Key {
@@ -1268,17 +1419,20 @@ impl ApplicationHandler<UserEvent> for App {
             self.redraw_window();
         }
         self.tick_autoscroll(now);
+        self.tick_smooth_scroll(now);
     }
 
     /// With nothing to do, the loop sleeps until the next event. It only wakes earlier if
     /// a deadline is pending: the next phase change of a blinking cursor (with the window
-    /// focused) or the next step of a selection's autoscroll.
+    /// focused), the next step of a selection's autoscroll, or the next smooth-scroll decay
+    /// tick.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let blink = (self.cursor_blinks && self.focused).then(|| self.blink.deadline());
         let next = [
             blink,
             self.mouse.autoscroll_deadline,
             self.leader.deadline(),
+            self.scroll_anim_deadline,
         ]
         .into_iter()
         .flatten()
@@ -1561,6 +1715,7 @@ pub fn run_window() {
         proxy,
         attach_exited,
         pending_events: VecDeque::new(),
+        scroll_anim_deadline: None,
     };
 
     // 5. Main event loop
